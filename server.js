@@ -1,6 +1,5 @@
 // ============================================
 // STUDENT PLATFORM - COMPLETE BACKEND API
-// Using Supabase Client Library
 // ============================================
 
 const express = require('express');
