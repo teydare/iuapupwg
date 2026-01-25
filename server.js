@@ -345,7 +345,213 @@ app.post('/api/init-db', async (req, res) => {
 // ============================================
 // AUTH ROUTES - FIXED
 // ============================================
+// ============================================
+// BACKEND ADDITIONS - Add to server.js
+// ============================================
 
+// ADD THESE ROUTES TO YOUR SERVER.JS FILE
+
+// ============================================
+// STUDY GROUPS - JOIN FUNCTIONALITY
+// ============================================
+
+app.post('/api/study-groups/:id/join', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Check if group exists
+    const groupCheck = await pool.query(
+      'SELECT * FROM study_groups WHERE id = $1',
+      [id]
+    );
+    
+    if (groupCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Study group not found' });
+    }
+    
+    const group = groupCheck.rows[0];
+    
+    // Check current member count
+    const memberCount = await pool.query(
+      'SELECT COUNT(*) as count FROM study_group_members WHERE group_id = $1',
+      [id]
+    );
+    
+    if (parseInt(memberCount.rows[0].count) >= group.max_members) {
+      return res.status(400).json({ success: false, message: 'Group is full' });
+    }
+    
+    // Check if already a member
+    const alreadyMember = await pool.query(
+      'SELECT * FROM study_group_members WHERE group_id = $1 AND user_id = $2',
+      [id, req.user.userId]
+    );
+    
+    if (alreadyMember.rows.length > 0) {
+      return res.status(400).json({ success: false, message: 'Already a member of this group' });
+    }
+    
+    // Add user to group
+    await pool.query(
+      'INSERT INTO study_group_members (group_id, user_id, role) VALUES ($1, $2, $3)',
+      [id, req.user.userId, 'member']
+    );
+    
+    res.json({ success: true, message: 'Successfully joined study group' });
+  } catch (error) {
+    console.error('Error joining study group:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// TIMETABLE - DELETE ENTRY
+// ============================================
+
+app.delete('/api/timetable/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const result = await pool.query(
+      'DELETE FROM timetables WHERE id = $1 AND user_id = $2 RETURNING *',
+      [id, req.user.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Timetable entry not found' });
+    }
+    
+    res.json({ success: true, message: 'Timetable entry deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// TIMETABLE - UPDATE ENTRY
+// ============================================
+
+app.put('/api/timetable/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { title, dayOfWeek, startTime, endTime, location, courseCode, instructor, notes, color } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `UPDATE timetables 
+       SET title = $1, day_of_week = $2, start_time = $3, end_time = $4, 
+           location = $5, course_code = $6, instructor = $7, notes = $8, color = $9
+       WHERE id = $10 AND user_id = $11 
+       RETURNING *`,
+      [title, dayOfWeek, startTime, endTime, location, courseCode, instructor, notes, color, id, req.user.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Timetable entry not found' });
+    }
+    
+    res.json({ success: true, entry: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// HOMEWORK HELP - GET RESPONSES
+// ============================================
+
+app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT hr.*, u.full_name as responder_name 
+       FROM homework_responses hr 
+       JOIN users u ON hr.responder_id = u.id 
+       WHERE hr.help_request_id = $1 
+       ORDER BY hr.created_at ASC`,
+      [id]
+    );
+    
+    res.json({ success: true, responses: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// PROFILE - GET USER STATISTICS
+// ============================================
+
+app.get('/api/auth/profile/stats', authMiddleware, async (req, res) => {
+  try {
+    // Count classes joined
+    const classesResult = await pool.query(
+      'SELECT COUNT(*) as count FROM class_space_members WHERE user_id = $1',
+      [req.user.userId]
+    );
+    
+    // Count resources uploaded (class + library)
+    const classResourcesResult = await pool.query(
+      'SELECT COUNT(*) as count FROM class_resources WHERE uploader_id = $1',
+      [req.user.userId]
+    );
+    
+    const libraryResourcesResult = await pool.query(
+      'SELECT COUNT(*) as count FROM library_resources WHERE uploader_id = $1',
+      [req.user.userId]
+    );
+    
+    // Count study groups
+    const studyGroupsResult = await pool.query(
+      'SELECT COUNT(*) as count FROM study_group_members WHERE user_id = $1',
+      [req.user.userId]
+    );
+    
+    const stats = {
+      classesJoined: parseInt(classesResult.rows[0].count),
+      resourcesUploaded: parseInt(classResourcesResult.rows[0].count) + parseInt(libraryResourcesResult.rows[0].count),
+      studyGroups: parseInt(studyGroupsResult.rows[0].count)
+    };
+    
+    res.json({ success: true, stats });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// FILE DOWNLOAD - INCREMENT COUNTER
+// ============================================
+
+app.post('/api/class-spaces/:classId/resources/:resourceId/download', authMiddleware, async (req, res) => {
+  const { resourceId } = req.params;
+  
+  try {
+    await pool.query(
+      'UPDATE class_resources SET downloads = downloads + 1 WHERE id = $1',
+      [resourceId]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/library/:resourceId/download', authMiddleware, async (req, res) => {
+  const { resourceId } = req.params;
+  
+  try {
+    await pool.query(
+      'UPDATE library_resources SET downloads = downloads + 1 WHERE id = $1',
+      [resourceId]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // FIXED: Now accepts phone number during registration
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, fullName, studentId, institution, phone, isCourseRep } = req.body;
