@@ -18,14 +18,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  family: 4  // Force IPv4
-});
 // ============================================
 // MIDDLEWARE - FIXED FOR DEPLOYMENT
 // ============================================
@@ -89,10 +82,13 @@ app.use('/uploads', express.static(uploadDir));
 // DATABASE - FIXED CONNECTION
 // ============================================
 
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  connectionTimeoutMillis: 10000,
+  ssl: { rejectUnauthorized: false },
+  family: 4  // Force IPv4
 });
 
 // Better error handling
