@@ -877,6 +877,511 @@ app.get('/api/marketplace/services', authMiddleware, async (req, res) => {
   }
 });
 
+// ============================================
+// ENHANCED MARKETPLACE ROUTES
+// Add these to your server.js after existing marketplace routes
+// ============================================
+
+// Image upload configuration for marketplace
+const marketplaceUpload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per image
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (extname && mimetype) {
+      return cb(null, true);
+    }
+    cb(new Error('Only image files are allowed'));
+  }
+});
+
+// CREATE MARKETPLACE ITEM WITH IMAGES
+app.post('/api/marketplace/goods', authMiddleware, marketplaceUpload.array('images', 5), async (req, res) => {
+  const { title, description, price, category, condition, location } = req.body;
+  try {
+    const imageUrls = req.files ? req.files.map(file => `/uploads/${file.filename}`) : [];
+    
+    const result = await pool.query(
+      'INSERT INTO marketplace_goods (seller_id, title, description, price, category, condition, location, image_urls) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [req.user.userId, title, description, price, category, condition, location, imageUrls]
+    );
+    res.json({ success: true, item: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET SINGLE MARKETPLACE ITEM WITH DETAILS
+app.get('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Increment view count
+    await pool.query(
+      'UPDATE marketplace_goods SET views = views + 1 WHERE id = $1',
+      [id]
+    );
+
+    // Get item with seller info
+    const itemResult = await pool.query(
+      `SELECT mg.*, u.full_name as seller_name, u.phone as seller_phone, u.email as seller_email,
+      (SELECT AVG(rating) FROM reviews WHERE reviewed_user_id = mg.seller_id) as seller_rating,
+      (SELECT COUNT(*) FROM reviews WHERE reviewed_user_id = mg.seller_id) as seller_review_count
+      FROM marketplace_goods mg 
+      JOIN users u ON mg.seller_id = u.id 
+      WHERE mg.id = $1`,
+      [id]
+    );
+
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Item not found' });
+    }
+
+    // Get reviews for this item
+    const reviewsResult = await pool.query(
+      `SELECT r.*, u.full_name as reviewer_name
+      FROM reviews r
+      JOIN users u ON r.reviewer_id = u.id
+      WHERE r.marketplace_item_id = $1
+      ORDER BY r.created_at DESC`,
+      [id]
+    );
+
+    // Check if user has favorited
+    const favoriteResult = await pool.query(
+      'SELECT id FROM favorites WHERE user_id = $1 AND item_id = $2',
+      [req.user.userId, id]
+    );
+
+    res.json({ 
+      success: true, 
+      item: itemResult.rows[0],
+      reviews: reviewsResult.rows,
+      isFavorited: favoriteResult.rows.length > 0
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// UPDATE MARKETPLACE ITEM
+app.put('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { title, description, price, category, condition, location, status } = req.body;
+  
+  try {
+    // Verify ownership
+    const checkResult = await pool.query(
+      'SELECT seller_id FROM marketplace_goods WHERE id = $1',
+      [id]
+    );
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Item not found' });
+    }
+    
+    if (checkResult.rows[0].seller_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the seller can update this item' });
+    }
+
+    const result = await pool.query(
+      `UPDATE marketplace_goods 
+      SET title = $1, description = $2, price = $3, category = $4, condition = $5, location = $6, status = $7
+      WHERE id = $8
+      RETURNING *`,
+      [title, description, price, category, condition, location, status, id]
+    );
+    
+    res.json({ success: true, item: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// FAVORITE/UNFAVORITE ITEM
+app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Check if already favorited
+    const existing = await pool.query(
+      'SELECT id FROM favorites WHERE user_id = $1 AND item_id = $2',
+      [req.user.userId, id]
+    );
+
+    if (existing.rows.length > 0) {
+      // Unfavorite
+      await pool.query(
+        'DELETE FROM favorites WHERE user_id = $1 AND item_id = $2',
+        [req.user.userId, id]
+      );
+      res.json({ success: true, favorited: false });
+    } else {
+      // Favorite
+      await pool.query(
+        'INSERT INTO favorites (user_id, item_id) VALUES ($1, $2)',
+        [req.user.userId, id]
+      );
+      res.json({ success: true, favorited: true });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET USER'S FAVORITES
+app.get('/api/marketplace/favorites', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT mg.*, u.full_name as seller_name, f.created_at as favorited_at
+      FROM favorites f
+      JOIN marketplace_goods mg ON f.item_id = mg.id
+      JOIN users u ON mg.seller_id = u.id
+      WHERE f.user_id = $1
+      ORDER BY f.created_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, favorites: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// MAKE OFFER ON ITEM
+app.post('/api/marketplace/goods/:id/offer', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { offerAmount, message } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'INSERT INTO offers (item_id, buyer_id, offer_amount, message) VALUES ($1, $2, $3, $4) RETURNING *',
+      [id, req.user.userId, offerAmount, message]
+    );
+    res.json({ success: true, offer: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET OFFERS FOR ITEM (seller only)
+app.get('/api/marketplace/goods/:id/offers', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Verify seller
+    const itemResult = await pool.query(
+      'SELECT seller_id FROM marketplace_goods WHERE id = $1',
+      [id]
+    );
+    
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Item not found' });
+    }
+    
+    if (itemResult.rows[0].seller_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the seller can view offers' });
+    }
+
+    const offersResult = await pool.query(
+      `SELECT o.*, u.full_name as buyer_name, u.phone as buyer_phone
+      FROM offers o
+      JOIN users u ON o.buyer_id = u.id
+      WHERE o.item_id = $1
+      ORDER BY o.created_at DESC`,
+      [id]
+    );
+    
+    res.json({ success: true, offers: offersResult.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// RESPOND TO OFFER
+app.patch('/api/marketplace/offers/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body; // accepted or rejected
+  
+  try {
+    // Verify seller ownership
+    const offerResult = await pool.query(
+      `SELECT o.*, mg.seller_id
+      FROM offers o
+      JOIN marketplace_goods mg ON o.item_id = mg.id
+      WHERE o.id = $1`,
+      [id]
+    );
+    
+    if (offerResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Offer not found' });
+    }
+    
+    if (offerResult.rows[0].seller_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the seller can respond to offers' });
+    }
+
+    const result = await pool.query(
+      'UPDATE offers SET status = $1 WHERE id = $2 RETURNING *',
+      [status, id]
+    );
+    
+    res.json({ success: true, offer: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ADD REVIEW
+app.post('/api/reviews', authMiddleware, async (req, res) => {
+  const { reviewedUserId, marketplaceItemId, marketplaceServiceId, rating, comment } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'INSERT INTO reviews (reviewer_id, reviewed_user_id, marketplace_item_id, marketplace_service_id, rating, comment) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.userId, reviewedUserId, marketplaceItemId, marketplaceServiceId, rating, comment]
+    );
+    res.json({ success: true, review: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET USER REVIEWS
+app.get('/api/reviews/user/:userId', authMiddleware, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT r.*, u.full_name as reviewer_name
+      FROM reviews r
+      JOIN users u ON r.reviewer_id = u.id
+      WHERE r.reviewed_user_id = $1
+      ORDER BY r.created_at DESC`,
+      [userId]
+    );
+    res.json({ success: true, reviews: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// CHAT/MESSAGING ROUTES
+// ============================================
+
+// GET ALL CONVERSATIONS
+app.get('/api/chat/conversations', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT ON (other_user_id)
+        CASE 
+          WHEN sender_id = $1 THEN receiver_id 
+          ELSE sender_id 
+        END as other_user_id,
+        u.full_name as other_user_name,
+        u.profile_image_url as other_user_image,
+        (SELECT message FROM chat_messages cm2 
+         WHERE (cm2.sender_id = $1 AND cm2.receiver_id = other_user_id) 
+            OR (cm2.sender_id = other_user_id AND cm2.receiver_id = $1)
+         ORDER BY cm2.created_at DESC LIMIT 1) as last_message,
+        (SELECT created_at FROM chat_messages cm2 
+         WHERE (cm2.sender_id = $1 AND cm2.receiver_id = other_user_id) 
+            OR (cm2.sender_id = other_user_id AND cm2.receiver_id = $1)
+         ORDER BY cm2.created_at DESC LIMIT 1) as last_message_at,
+        (SELECT COUNT(*) FROM chat_messages 
+         WHERE sender_id = other_user_id AND receiver_id = $1 AND is_read = false) as unread_count
+      FROM chat_messages cm
+      LEFT JOIN users u ON u.id = CASE 
+        WHEN cm.sender_id = $1 THEN cm.receiver_id 
+        ELSE cm.sender_id 
+      END
+      WHERE (cm.sender_id = $1 OR cm.receiver_id = $1)
+        AND cm.group_id IS NULL
+        AND cm.class_space_id IS NULL
+      ORDER BY other_user_id, last_message_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, conversations: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET MESSAGES WITH A SPECIFIC USER
+app.get('/api/chat/messages/:userId', authMiddleware, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    // Mark messages as read
+    await pool.query(
+      'UPDATE chat_messages SET is_read = true WHERE sender_id = $1 AND receiver_id = $2',
+      [userId, req.user.userId]
+    );
+
+    // Get messages
+    const result = await pool.query(
+      `SELECT cm.*, u.full_name as sender_name, u.profile_image_url as sender_image
+      FROM chat_messages cm
+      JOIN users u ON cm.sender_id = u.id
+      WHERE ((cm.sender_id = $1 AND cm.receiver_id = $2) 
+         OR (cm.sender_id = $2 AND cm.receiver_id = $1))
+        AND cm.group_id IS NULL
+        AND cm.class_space_id IS NULL
+      ORDER BY cm.created_at ASC`,
+      [req.user.userId, userId]
+    );
+    res.json({ success: true, messages: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// SEND MESSAGE
+app.post('/api/chat/messages', authMiddleware, async (req, res) => {
+  const { receiverId, groupId, classSpaceId, message, messageType, fileUrl } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'INSERT INTO chat_messages (sender_id, receiver_id, group_id, class_space_id, message, message_type, file_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.user.userId, receiverId, groupId, classSpaceId, message, messageType || 'text', fileUrl]
+    );
+    res.json({ success: true, message: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET UNREAD MESSAGE COUNT
+app.get('/api/chat/unread-count', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT COUNT(*) FROM chat_messages WHERE receiver_id = $1 AND is_read = false',
+      [req.user.userId]
+    );
+    res.json({ success: true, count: parseInt(result.rows[0].count) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET GROUP CHAT MESSAGES
+app.get('/api/chat/group/:groupId/messages', authMiddleware, async (req, res) => {
+  const { groupId } = req.params;
+  try {
+    // Verify user is member of group
+    const memberCheck = await pool.query(
+      'SELECT id FROM study_group_members WHERE group_id = $1 AND user_id = $2',
+      [groupId, req.user.userId]
+    );
+    
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ success: false, message: 'Not a member of this group' });
+    }
+
+    const result = await pool.query(
+      `SELECT cm.*, u.full_name as sender_name, u.profile_image_url as sender_image
+      FROM chat_messages cm
+      JOIN users u ON cm.sender_id = u.id
+      WHERE cm.group_id = $1
+      ORDER BY cm.created_at ASC`,
+      [groupId]
+    );
+    res.json({ success: true, messages: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// SEND GROUP MESSAGE
+app.post('/api/chat/group/:groupId/messages', authMiddleware, async (req, res) => {
+  const { groupId } = req.params;
+  const { message, messageType, fileUrl } = req.body;
+  
+  try {
+    // Verify membership
+    const memberCheck = await pool.query(
+      'SELECT id FROM study_group_members WHERE group_id = $1 AND user_id = $2',
+      [groupId, req.user.userId]
+    );
+    
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ success: false, message: 'Not a member of this group' });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO chat_messages (sender_id, group_id, message, message_type, file_url) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [req.user.userId, groupId, message, messageType || 'text', fileUrl]
+    );
+    res.json({ success: true, message: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET CLASS CHAT MESSAGES
+app.get('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
+  const { classId } = req.params;
+  try {
+    // Verify user is member of class
+    const memberCheck = await pool.query(
+      'SELECT id FROM class_space_members WHERE class_space_id = $1 AND user_id = $2',
+      [classId, req.user.userId]
+    );
+    
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ success: false, message: 'Not a member of this class' });
+    }
+
+    const result = await pool.query(
+      `SELECT cm.*, u.full_name as sender_name, u.profile_image_url as sender_image
+      FROM chat_messages cm
+      JOIN users u ON cm.sender_id = u.id
+      WHERE cm.class_space_id = $1
+      ORDER BY cm.created_at ASC`,
+      [classId]
+    );
+    res.json({ success: true, messages: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// SEND CLASS MESSAGE
+app.post('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
+  const { classId } = req.params;
+  const { message, messageType, fileUrl } = req.body;
+  
+  try {
+    // Verify membership
+    const memberCheck = await pool.query(
+      'SELECT id FROM class_space_members WHERE class_space_id = $1 AND user_id = $2',
+      [classId, req.user.userId]
+    );
+    
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ success: false, message: 'Not a member of this class' });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO chat_messages (sender_id, class_space_id, message, message_type, file_url) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [req.user.userId, classId, message, messageType || 'text', fileUrl]
+    );
+    res.json({ success: true, message: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE MESSAGE (sender only)
+app.delete('/api/chat/messages/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query(
+      'DELETE FROM chat_messages WHERE id = $1 AND sender_id = $2',
+      [id, req.user.userId]
+    );
+    res.json({ success: true, message: 'Message deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // Continue to Part 3 for remaining routes...
 // ============================================
 // HOMEWORK HELP ROUTES
