@@ -18,11 +18,13 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Add this at the top of server.js
 const { createClient } = require('@supabase/supabase-js');
 
-// You need the API URL and Key, NOT the connection string for this part
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+// Use the Service Role Key and URL from your environment variables
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
 // ============================================
 // MIDDLEWARE - FIXED FOR DEPLOYMENT
 // ============================================
