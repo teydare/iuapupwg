@@ -832,22 +832,48 @@ app.post('/api/marketplace/goods', authMiddleware, async (req, res) => {
   }
 });
 
+// GET MARKETPLACE GOODS
 app.get('/api/marketplace/goods', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT mg.*, u.full_name as seller_name, u.phone as seller_phone, s.store_name
-      FROM marketplace_goods mg 
-      JOIN users u ON mg.seller_id = u.id 
-      LEFT JOIN stores s ON mg.store_id = s.id
-      WHERE mg.status = 'available' 
-      ORDER BY mg.created_at DESC`
-    );
-    res.json({ success: true, items: result.rows });
+    const { data: items, error } = await supabase
+      .from('marketplace_goods')
+      .select(`
+        *,
+        users!seller_id (
+          full_name,
+          phone
+        )
+      `)
+      .eq('status', 'available')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Marketplace query error:', error);
+      return res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+
+    // Format the response
+    const formattedItems = (items || []).map(item => ({
+      ...item,
+      seller_name: item.users?.full_name || 'Unknown',
+      seller_phone: item.users?.phone || null
+    }));
+
+    res.json({ 
+      success: true, 
+      items: formattedItems 
+    });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error('Marketplace error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
   }
 });
-
 app.post('/api/marketplace/services', authMiddleware, async (req, res) => {
   const { title, description, price, category, serviceCategory, duration, availability, storeId } = req.body;
   
