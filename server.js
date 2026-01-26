@@ -18,6 +18,14 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  family: 4  // Force IPv4
+});
 // ============================================
 // MIDDLEWARE - FIXED FOR DEPLOYMENT
 // ============================================
