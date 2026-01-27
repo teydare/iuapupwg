@@ -1773,7 +1773,7 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📝 API URL: http://localhost:${PORT}`);
   console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📊 Database: ${pool.options.connectionString ? 'Connected' : 'Not configured'}`);
+console.log(`📊 Database: Supabase`);
   console.log(`\n✅ Initialize database at: http://localhost:${PORT}/api/init-db`);
 });
 
