@@ -3,7 +3,7 @@
 // PART 1: Setup, Middleware, Database Schema
 // ============================================
 
-cconst express = require('express');
+const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
