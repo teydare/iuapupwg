@@ -14,6 +14,7 @@ const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
+const { Pool } = require('pg');  // ← ADD THIS if not there
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -112,33 +113,6 @@ const upload = multer({
 app.use('/uploads', express.static(uploadDir));
 
 // ============================================
-// DATABASE - FIXED CONNECTION
-// ============================================
-
-const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  family: 4  // Force IPv4
-});
-
-// Better error handling
-pool.on('error', (err) => {
-  console.error('❌ Unexpected database error:', err);
-});
-
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('❌ Database connection error:', err.message);
-    console.error('📝 Check your DATABASE_URL environment variable');
-  } else {
-    console.log('✅ Database connected:', res.rows[0].now);
-  }
-});
-
-app.locals.db = pool;
 
 // ============================================
 // DATABASE SCHEMA - INCLUDES STORES
@@ -850,18 +824,66 @@ app.post('/api/library/:resourceId/download', authMiddleware, async (req, res) =
 // ============================================
 // MARKETPLACE ROUTES
 // ============================================
+// CREATE MARKETPLACE ITEM WITH IMAGES
+// Image upload configuration
+const imageUpload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per image
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (extname && mimetype) {
+      return cb(null, true);
+    }
+    cb(new Error('Only image files are allowed'));
+  }
+});
 
-app.post('/api/marketplace/goods', authMiddleware, async (req, res) => {
-  const { title, description, price, category, condition, location, storeId } = req.body;
+             
+app.post('/api/marketplace/goods', authMiddleware, upload.array('images', 5), async (req, res) => {
+  const { title, description, price, category, condition, location } = req.body;
   
   try {
-    const result = await pool.query(
-      'INSERT INTO marketplace_goods (seller_id, store_id, title, description, price, category, condition, location) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [req.user.userId, storeId || null, title, description, price, category, condition, location]
-    );
-    res.json({ success: true, item: result.rows[0] });
+    // Get image URLs
+    const imageUrls = req.files ? req.files.map(file => `/uploads/${file.filename}`) : [];
+    
+    // Insert into Supabase
+    const { data: item, error } = await supabase
+      .from('marketplace_goods')
+      .insert([{
+        seller_id: req.user.userId,
+        title,
+        description,
+        price: parseFloat(price),
+        category,
+        condition,
+        location,
+        image_urls: imageUrls,
+        status: 'available',
+        views: 0
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Insert error:', error);
+      return res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      item 
+    });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error('Marketplace create error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
   }
 });
 
