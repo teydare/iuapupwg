@@ -3,14 +3,14 @@
 // PART 1: Setup, Middleware, Database Schema
 // ============================================
 
-const express = require('express');
+cconst express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { Pool } = require('pg');
+const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
@@ -18,13 +18,40 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const { createClient } = require('@supabase/supabase-js');
+// ============================================
+// SUPABASE CLIENT (CORRECT METHOD)
+// ============================================
 
-// Use the Service Role Key and URL from your environment variables
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const supabase = createClient(supabaseUrl, supabaseServiceKey);
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.error('❌ Missing Supabase credentials. Check your .env file.');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false
+  }
+});
+
+// Test connection
+(async () => {
+  try {
+    const { data, error } = await supabase.from('users').select('count').limit(1);
+    if (error && error.code !== 'PGRST116') {
+      console.error('❌ Database connection error:', error.message);
+    } else {
+      console.log('✅ Database connected successfully');
+    }
+  } catch (err) {
+    console.error('❌ Database connection error:', err.message);
+  }
+})();
+
+
 // ============================================
 // MIDDLEWARE - FIXED FOR DEPLOYMENT
 // ============================================
