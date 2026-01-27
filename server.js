@@ -110,7 +110,11 @@ const upload = multer({
   }
 });
 
-app.use('/uploads', express.static(uploadDir));
+app.use('/uploads', (req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET');
+  next();
+}, express.static(uploadDir));
 
 // ============================================
 
@@ -1112,16 +1116,31 @@ app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res)
 // GET USER'S FAVORITES
 app.get('/api/marketplace/favorites', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT mg.*, u.full_name as seller_name, f.created_at as favorited_at
-      FROM favorites f
-      JOIN marketplace_goods mg ON f.item_id = mg.id
-      JOIN users u ON mg.seller_id = u.id
-      WHERE f.user_id = $1
-      ORDER BY f.created_at DESC`,
-      [req.user.userId]
-    );
-    res.json({ success: true, favorites: result.rows });
+    const { data: favorites, error } = await supabase
+      .from('favorites')
+      .select(`
+        *,
+        marketplace_goods!item_id (
+          *,
+          users!seller_id (
+            full_name
+          )
+        )
+      `)
+      .eq('user_id', req.user.userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    const formattedFavorites = (favorites || []).map(fav => ({
+      ...fav.marketplace_goods,
+      seller_name: fav.marketplace_goods?.users?.full_name || 'Unknown',
+      favorited_at: fav.created_at
+    }));
+
+    res.json({ success: true, favorites: formattedFavorites });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
