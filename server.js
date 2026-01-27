@@ -430,7 +430,6 @@ app.post('/api/init-db', async (req, res) => {
 });
 
 // EXPORT for use in Part 2
-module.exports = { app, pool, authMiddleware, upload };
 
 // ============================================
 // STUDENT PLATFORM - COMPLETE BACKEND API
