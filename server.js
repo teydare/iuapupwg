@@ -67,7 +67,10 @@ async function uploadToSupabase(file, bucket, folder = '') {
 // ✅ CRITICAL FIX: Enable trust proxy for Railway's X-Forwarded-For header
 app.set('trust proxy', 1);
 
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginEmbedderPolicy: false,
+}));
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   credentials: true
