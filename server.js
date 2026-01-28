@@ -1,7 +1,9 @@
 // ============================================
-// STUDENTHUB - COMPLETE PRODUCTION BACKEND
-// With Railway support, all marketplace routes, trust proxy
+// STUDENTHUB - PRODUCTION SERVER
+// WITH SUPABASE STORAGE INTEGRATION
 // ============================================
+// This server uses Supabase Storage buckets for persistent file storage
+// Images and documents survive Railway container restarts
 
 const express = require('express');
 const cors = require('cors');
@@ -9,23 +11,61 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ============================================
-// RAILWAY FIX: TRUST PROXY (CRITICAL!)
+// SUPABASE STORAGE CLIENT
 // ============================================
-app.set('trust proxy', 1);
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY // Use service role key for server-side operations
+);
+
+// Helper function to upload files to Supabase Storage
+async function uploadToSupabase(file, bucket, folder = '') {
+  try {
+    const fileExt = path.extname(file.originalname);
+    const fileName = `${folder}${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExt}`;
+    
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .upload(fileName, file.buffer, {
+        contentType: file.mimetype,
+        cacheControl: '3600',
+        upsert: false
+      });
+
+    if (error) {
+      console.error('Supabase upload error:', error);
+      throw error;
+    }
+
+    // Get public URL
+    const { data: { publicUrl } } = supabase.storage
+      .from(bucket)
+      .getPublicUrl(fileName);
+
+    return publicUrl;
+  } catch (error) {
+    console.error('Upload to Supabase failed:', error);
+    throw error;
+  }
+}
 
 // ============================================
-// MIDDLEWARE
+// MIDDLEWARE - FIXED FOR RAILWAY DEPLOYMENT
 // ============================================
+
+// ✅ CRITICAL FIX: Enable trust proxy for Railway's X-Forwarded-For header
+app.set('trust proxy', 1);
 
 app.use(helmet());
 app.use(cors({
@@ -35,62 +75,301 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// ✅ FIXED: Rate limiter with proper proxy config
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requests per window
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
 });
 app.use('/api/', limiter);
 
-// File upload setup
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+// ============================================
+// FILE UPLOAD SETUP - MEMORY STORAGE
+// ============================================
+// Using memory storage since files go directly to Supabase Storage
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({
-  storage: storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB for images
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /pdf|doc|docx|epub|mobi|txt|jpg|jpeg|png|gif|webp/;
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
     const mimetype = allowedTypes.test(file.mimetype);
     if (extname && mimetype) {
       return cb(null, true);
     }
-    cb(new Error('Invalid file type'));
+    cb(new Error('Only image files are allowed (JPEG, PNG, GIF, WebP)'));
   }
 });
 
-app.use('/uploads', express.static(uploadDir));
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB for documents
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /pdf|doc|docx|epub|mobi|txt/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (extname && mimetype) {
+      return cb(null, true);
+    }
+    cb(new Error('Only document files are allowed (PDF, DOC, DOCX, EPUB, MOBI, TXT)'));
+  }
+});
 
 // ============================================
-// DATABASE
+// DATABASE CONNECTION
 // ============================================
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 10000,
+});
+
+pool.on('error', (err) => {
+  console.error('❌ Unexpected database error:', err);
 });
 
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
-    console.error('❌ Database connection error:', err);
+    console.error('❌ Database connection error:', err.message);
+    console.error('📝 Check your DATABASE_URL environment variable');
   } else {
     console.log('✅ Database connected:', res.rows[0].now);
   }
 });
+
+// ============================================
+// DATABASE SCHEMA
+// ============================================
+
+const createTablesSQL = `
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  full_name VARCHAR(255) NOT NULL,
+  student_id VARCHAR(100),
+  institution VARCHAR(255),
+  phone VARCHAR(50),
+  bio TEXT,
+  profile_image_url TEXT,
+  is_course_rep BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Class Spaces
+CREATE TABLE IF NOT EXISTS class_spaces (
+  id SERIAL PRIMARY KEY,
+  course_rep_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  course_code VARCHAR(50) NOT NULL,
+  course_name VARCHAR(255) NOT NULL,
+  description TEXT,
+  institution VARCHAR(255),
+  semester VARCHAR(50),
+  academic_year VARCHAR(20),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Class Space Members
+CREATE TABLE IF NOT EXISTS class_space_members (
+  id SERIAL PRIMARY KEY,
+  class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(class_space_id, user_id)
+);
+
+-- Class Resources
+CREATE TABLE IF NOT EXISTS class_resources (
+  id SERIAL PRIMARY KEY,
+  class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE,
+  uploader_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  file_url TEXT NOT NULL,
+  file_type VARCHAR(50),
+  file_size BIGINT,
+  resource_type VARCHAR(50),
+  downloads INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Library Resources
+CREATE TABLE IF NOT EXISTS library_resources (
+  id SERIAL PRIMARY KEY,
+  uploader_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  subject VARCHAR(100),
+  file_url TEXT NOT NULL,
+  file_type VARCHAR(50),
+  file_size BIGINT,
+  downloads INTEGER DEFAULT 0,
+  is_public BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Marketplace Goods (with images array)
+CREATE TABLE IF NOT EXISTS marketplace_goods (
+  id SERIAL PRIMARY KEY,
+  seller_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  price DECIMAL(10,2) NOT NULL,
+  category VARCHAR(100),
+  condition VARCHAR(50),
+  images TEXT[],
+  location VARCHAR(255),
+  stock_quantity INTEGER DEFAULT 1,
+  status VARCHAR(50) DEFAULT 'available',
+  views INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Marketplace Services
+CREATE TABLE IF NOT EXISTS marketplace_services (
+  id SERIAL PRIMARY KEY,
+  provider_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  price DECIMAL(10,2) NOT NULL,
+  category VARCHAR(100),
+  service_category VARCHAR(50) DEFAULT 'general',
+  duration VARCHAR(50),
+  availability TEXT,
+  views INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Favorites
+CREATE TABLE IF NOT EXISTS favorites (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  item_id INTEGER REFERENCES marketplace_goods(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, item_id)
+);
+
+-- Offers
+CREATE TABLE IF NOT EXISTS offers (
+  id SERIAL PRIMARY KEY,
+  item_id INTEGER REFERENCES marketplace_goods(id) ON DELETE CASCADE,
+  buyer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  offer_amount DECIMAL(10,2) NOT NULL,
+  message TEXT,
+  status VARCHAR(50) DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Study Groups
+CREATE TABLE IF NOT EXISTS study_groups (
+  id SERIAL PRIMARY KEY,
+  creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(255) NOT NULL,
+  description TEXT,
+  subject VARCHAR(100),
+  max_members INTEGER DEFAULT 50,
+  is_private BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Study Group Members
+CREATE TABLE IF NOT EXISTS study_group_members (
+  id SERIAL PRIMARY KEY,
+  group_id INTEGER REFERENCES study_groups(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  role VARCHAR(50) DEFAULT 'member',
+  joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(group_id, user_id)
+);
+
+-- Chat Messages
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id SERIAL PRIMARY KEY,
+  sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  group_id INTEGER REFERENCES study_groups(id) ON DELETE CASCADE,
+  class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE,
+  message TEXT NOT NULL,
+  message_type VARCHAR(50) DEFAULT 'text',
+  file_url TEXT,
+  is_read BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Personal Timetables
+CREATE TABLE IF NOT EXISTS timetables (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  day_of_week INTEGER,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  location VARCHAR(255),
+  course_code VARCHAR(50),
+  instructor VARCHAR(255),
+  notes TEXT,
+  color VARCHAR(7) DEFAULT '#3B82F6',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Class Timetables
+CREATE TABLE IF NOT EXISTS class_timetables (
+  id SERIAL PRIMARY KEY,
+  class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE,
+  day_of_week INTEGER NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  location_name VARCHAR(255),
+  location_address TEXT,
+  location_lat DECIMAL(10, 8),
+  location_lng DECIMAL(11, 8),
+  room_number VARCHAR(50),
+  building VARCHAR(100),
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Homework Help
+CREATE TABLE IF NOT EXISTS homework_help (
+  id SERIAL PRIMARY KEY,
+  student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  question TEXT NOT NULL,
+  subject VARCHAR(100),
+  class_space_id INTEGER REFERENCES class_spaces(id),
+  attachment_url TEXT,
+  status VARCHAR(50) DEFAULT 'open',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Homework Responses
+CREATE TABLE IF NOT EXISTS homework_responses (
+  id SERIAL PRIMARY KEY,
+  help_request_id INTEGER REFERENCES homework_help(id) ON DELETE CASCADE,
+  responder_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  response TEXT NOT NULL,
+  attachment_url TEXT,
+  is_ai_response BOOLEAN DEFAULT false,
+  helpful_count INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_class_spaces_rep ON class_spaces(course_rep_id);
+CREATE INDEX IF NOT EXISTS idx_class_resources_space ON class_resources(class_space_id);
+CREATE INDEX IF NOT EXISTS idx_marketplace_goods_seller ON marketplace_goods(seller_id);
+CREATE INDEX IF NOT EXISTS idx_marketplace_goods_status ON marketplace_goods(status);
+CREATE INDEX IF NOT EXISTS idx_marketplace_services_provider ON marketplace_services(provider_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sender ON chat_messages(sender_id);
+CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
+CREATE INDEX IF NOT EXISTS idx_offers_item ON offers(item_id);
+`;
 
 // ============================================
 // AUTH MIDDLEWARE
@@ -111,11 +390,35 @@ const authMiddleware = (req, res, next) => {
 };
 
 // ============================================
-// BASIC ROUTES
+// HEALTH & INIT ROUTES
 // ============================================
 
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'StudentHub API is running',
+    timestamp: new Date().toISOString(),
+    storage: 'Supabase Storage'
+  });
+});
+
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'StudentHub API running', timestamp: new Date() });
+  res.json({ 
+    status: 'ok', 
+    message: 'StudentHub API is healthy',
+    database: pool.totalCount > 0 ? 'connected' : 'disconnected',
+    storage: 'Supabase Storage'
+  });
+});
+
+app.post('/api/init-db', async (req, res) => {
+  try {
+    await pool.query(createTablesSQL);
+    res.json({ success: true, message: 'Database initialized successfully' });
+  } catch (error) {
+    console.error('Database init error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // ============================================
@@ -123,33 +426,40 @@ app.get('/api/health', (req, res) => {
 // ============================================
 
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, fullName, studentId, institution, isCourseRep } = req.body;
+  const { email, password, fullName, studentId, institution, phone, isCourseRep } = req.body;
+  
   try {
     const userExists = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (userExists.rows.length > 0) {
       return res.status(400).json({ success: false, message: 'Email already registered' });
     }
+    
     const passwordHash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password_hash, full_name, student_id, institution, is_course_rep) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, full_name, student_id, institution, phone, bio, is_course_rep',
-      [email, passwordHash, fullName, studentId, institution, isCourseRep || false]
+      'INSERT INTO users (email, password_hash, full_name, student_id, institution, phone, is_course_rep) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, email, full_name, student_id, institution, phone, is_course_rep',
+      [email, passwordHash, fullName, studentId, institution, phone || null, isCourseRep || false]
     );
+    
     const user = result.rows[0];
     const token = jwt.sign(
       { userId: user.id, email: user.email },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '7d' }
     );
-    res.json({ success: true, token, user: {
-      id: user.id,
-      email: user.email,
-      fullName: user.full_name,
-      studentId: user.student_id,
-      institution: user.institution,
-      phone: user.phone,
-      bio: user.bio,
-      isCourseRep: user.is_course_rep
-    }});
+    
+    res.json({ 
+      success: true, 
+      token, 
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        studentId: user.student_id,
+        institution: user.institution,
+        phone: user.phone,
+        isCourseRep: user.is_course_rep
+      }
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -157,21 +467,25 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
+  
   try {
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
+    
     const user = result.rows[0];
     const isValid = await bcrypt.compare(password, user.password_hash);
     if (!isValid) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
+    
     const token = jwt.sign(
       { userId: user.id, email: user.email },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '7d' }
     );
+    
     res.json({
       success: true,
       token,
@@ -200,18 +514,7 @@ app.get('/api/auth/profile', authMiddleware, async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
-    const user = result.rows[0];
-    res.json({ success: true, user: {
-      id: user.id,
-      email: user.email,
-      fullName: user.full_name,
-      studentId: user.student_id,
-      institution: user.institution,
-      phone: user.phone,
-      bio: user.bio,
-      profileImageUrl: user.profile_image_url,
-      isCourseRep: user.is_course_rep
-    }});
+    res.json({ success: true, user: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -219,42 +522,60 @@ app.get('/api/auth/profile', authMiddleware, async (req, res) => {
 
 app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
   const { fullName, studentId, institution, phone, bio } = req.body;
+  
   try {
     const result = await pool.query(
       `UPDATE users 
-      SET full_name = $1, student_id = $2, institution = $3, phone = $4, bio = $5, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $6
-      RETURNING id, email, full_name, student_id, institution, phone, bio, is_course_rep`,
+       SET full_name = $1, student_id = $2, institution = $3, phone = $4, bio = $5, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $6 
+       RETURNING id, email, full_name, student_id, institution, phone, bio, is_course_rep`,
       [fullName, studentId, institution, phone, bio, req.user.userId]
     );
+    
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
-    const user = result.rows[0];
-    res.json({ success: true, user: {
-      id: user.id,
-      email: user.email,
-      fullName: user.full_name,
-      studentId: user.student_id,
-      institution: user.institution,
-      phone: user.phone,
-      bio: user.bio,
-      isCourseRep: user.is_course_rep
-    }});
+    
+    res.json({ success: true, user: result.rows[0], message: 'Profile updated successfully' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ============================================
-// MARKETPLACE GOODS - COMPLETE ROUTES
+// MARKETPLACE ROUTES WITH SUPABASE STORAGE
 // ============================================
 
-// GET all items
+app.post('/api/marketplace/goods', authMiddleware, imageUpload.array('images', 5), async (req, res) => {
+  const { title, description, price, category, condition, location } = req.body;
+  
+  try {
+    let imageUrls = [];
+    
+    // Upload images to Supabase Storage
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const publicUrl = await uploadToSupabase(file, 'marketplace-images', 'goods/');
+        imageUrls.push(publicUrl);
+      }
+    }
+    
+    const result = await pool.query(
+      'INSERT INTO marketplace_goods (seller_id, title, description, price, category, condition, location, images) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [req.user.userId, title, description, price, category, condition, location, imageUrls]
+    );
+    
+    res.json({ success: true, item: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating marketplace item:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/marketplace/goods', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT mg.*, u.full_name as seller_name, u.phone as seller_phone 
+      `SELECT mg.*, u.full_name as seller_name, u.phone as seller_phone
       FROM marketplace_goods mg 
       JOIN users u ON mg.seller_id = u.id 
       WHERE mg.status = 'available' 
@@ -266,12 +587,13 @@ app.get('/api/marketplace/goods', authMiddleware, async (req, res) => {
   }
 });
 
-// GET single item with details
 app.get('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
+  
   try {
+    // Increment view count
     await pool.query('UPDATE marketplace_goods SET views = views + 1 WHERE id = $1', [id]);
-
+    
     const itemResult = await pool.query(
       `SELECT mg.*, u.full_name as seller_name, u.phone as seller_phone, u.email as seller_email
       FROM marketplace_goods mg 
@@ -279,29 +601,20 @@ app.get('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
       WHERE mg.id = $1`,
       [id]
     );
-
+    
     if (itemResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Item not found' });
     }
-
+    
+    // Check if user has favorited
     const favoriteResult = await pool.query(
       'SELECT id FROM favorites WHERE user_id = $1 AND item_id = $2',
       [req.user.userId, id]
     );
-
-    const reviewsResult = await pool.query(
-      `SELECT r.*, u.full_name as reviewer_name
-      FROM reviews r
-      JOIN users u ON r.reviewer_id = u.id
-      WHERE r.marketplace_item_id = $1
-      ORDER BY r.created_at DESC`,
-      [id]
-    );
-
+    
     res.json({ 
       success: true, 
       item: itemResult.rows[0],
-      reviews: reviewsResult.rows,
       isFavorited: favoriteResult.rows.length > 0
     });
   } catch (error) {
@@ -309,25 +622,53 @@ app.get('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// CREATE item with images
-app.post('/api/marketplace/goods', authMiddleware, upload.array('images', 5), async (req, res) => {
-  const { title, description, price, category, condition, location } = req.body;
+app.put('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { title, description, price, category, condition, location, status } = req.body;
+  
   try {
-    const imageUrls = req.files ? req.files.map(file => `/uploads/${file.filename}`) : [];
+    const checkResult = await pool.query('SELECT seller_id FROM marketplace_goods WHERE id = $1', [id]);
     
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Item not found' });
+    }
+    
+    if (checkResult.rows[0].seller_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the seller can update this item' });
+    }
+
     const result = await pool.query(
-      'INSERT INTO marketplace_goods (seller_id, title, description, price, category, condition, location, images) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [req.user.userId, title, description, price, category, condition, location, imageUrls]
+      `UPDATE marketplace_goods 
+      SET title = $1, description = $2, price = $3, category = $4, condition = $5, location = $6, status = $7
+      WHERE id = $8
+      RETURNING *`,
+      [title, description, price, category, condition, location, status, id]
     );
+    
     res.json({ success: true, item: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// TOGGLE favorite
+app.delete('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    await pool.query(
+      'DELETE FROM marketplace_goods WHERE id = $1 AND seller_id = $2',
+      [id, req.user.userId]
+    );
+    res.json({ success: true, message: 'Item deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Favorites
 app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res) => {
   const { id } = req.params;
+  
   try {
     const existing = await pool.query(
       'SELECT id FROM favorites WHERE user_id = $1 AND item_id = $2',
@@ -335,10 +676,16 @@ app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res)
     );
 
     if (existing.rows.length > 0) {
-      await pool.query('DELETE FROM favorites WHERE user_id = $1 AND item_id = $2', [req.user.userId, id]);
+      await pool.query(
+        'DELETE FROM favorites WHERE user_id = $1 AND item_id = $2',
+        [req.user.userId, id]
+      );
       res.json({ success: true, favorited: false });
     } else {
-      await pool.query('INSERT INTO favorites (user_id, item_id) VALUES ($1, $2)', [req.user.userId, id]);
+      await pool.query(
+        'INSERT INTO favorites (user_id, item_id) VALUES ($1, $2)',
+        [req.user.userId, id]
+      );
       res.json({ success: true, favorited: true });
     }
   } catch (error) {
@@ -346,11 +693,10 @@ app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res)
   }
 });
 
-// GET favorites
 app.get('/api/marketplace/favorites', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT mg.*, u.full_name as seller_name, u.phone as seller_phone, f.created_at as favorited_at
+      `SELECT mg.*, u.full_name as seller_name, f.created_at as favorited_at
       FROM favorites f
       JOIN marketplace_goods mg ON f.item_id = mg.id
       JOIN users u ON mg.seller_id = u.id
@@ -364,14 +710,15 @@ app.get('/api/marketplace/favorites', authMiddleware, async (req, res) => {
   }
 });
 
-// MAKE offer
+// Offers
 app.post('/api/marketplace/goods/:id/offer', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { offerAmount, message } = req.body;
+  
   try {
     const result = await pool.query(
-      'INSERT INTO offers (item_id, buyer_id, offer_amount, message, status) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [id, req.user.userId, offerAmount, message, 'pending']
+      'INSERT INTO offers (item_id, buyer_id, offer_amount, message) VALUES ($1, $2, $3, $4) RETURNING *',
+      [id, req.user.userId, offerAmount, message]
     );
     res.json({ success: true, offer: result.rows[0] });
   } catch (error) {
@@ -379,23 +726,111 @@ app.post('/api/marketplace/goods/:id/offer', authMiddleware, async (req, res) =>
   }
 });
 
-// CREATE review
-app.post('/api/reviews', authMiddleware, async (req, res) => {
-  const { reviewedUserId, marketplaceItemId, rating, comment } = req.body;
+app.get('/api/marketplace/goods/:id/offers', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const itemResult = await pool.query('SELECT seller_id FROM marketplace_goods WHERE id = $1', [id]);
+    
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Item not found' });
+    }
+    
+    if (itemResult.rows[0].seller_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the seller can view offers' });
+    }
+
+    const offersResult = await pool.query(
+      `SELECT o.*, u.full_name as buyer_name, u.phone as buyer_phone
+      FROM offers o
+      JOIN users u ON o.buyer_id = u.id
+      WHERE o.item_id = $1
+      ORDER BY o.created_at DESC`,
+      [id]
+    );
+    
+    res.json({ success: true, offers: offersResult.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Marketplace Services
+app.post('/api/marketplace/services', authMiddleware, async (req, res) => {
+  const { title, description, price, category, serviceCategory, duration, availability } = req.body;
+  
   try {
     const result = await pool.query(
-      'INSERT INTO reviews (reviewer_id, reviewed_user_id, marketplace_item_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.user.userId, reviewedUserId, marketplaceItemId, rating, comment]
+      'INSERT INTO marketplace_services (provider_id, title, description, price, category, service_category, duration, availability) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [req.user.userId, title, description, price, category, serviceCategory || 'general', duration, availability]
     );
-    res.json({ success: true, review: result.rows[0] });
+    res.json({ success: true, service: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/marketplace/services', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ms.*, u.full_name as provider_name, u.phone as provider_phone
+      FROM marketplace_services ms 
+      JOIN users u ON ms.provider_id = u.id 
+      ORDER BY ms.created_at DESC`
+    );
+    res.json({ success: true, services: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/marketplace/services/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    await pool.query(
+      'DELETE FROM marketplace_services WHERE id = $1 AND provider_id = $2',
+      [id, req.user.userId]
+    );
+    res.json({ success: true, message: 'Service deleted' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ============================================
-// CLASS SPACES ROUTES
+// CLASS SPACES ROUTES WITH SUPABASE STORAGE
 // ============================================
+
+app.post('/api/class-spaces', authMiddleware, async (req, res) => {
+  const { courseCode, courseName, description, institution, semester, academicYear } = req.body;
+  
+  try {
+    const userCheck = await pool.query('SELECT is_course_rep FROM users WHERE id = $1', [req.user.userId]);
+    
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    
+    if (!userCheck.rows[0].is_course_rep) {
+      return res.status(403).json({ success: false, message: 'Only course reps can create class spaces' });
+    }
+    
+    const result = await pool.query(
+      'INSERT INTO class_spaces (course_rep_id, course_code, course_name, description, institution, semester, academic_year) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.user.userId, courseCode, courseName, description, institution, semester, academicYear]
+    );
+    
+    await pool.query(
+      'INSERT INTO class_space_members (class_space_id, user_id) VALUES ($1, $2)',
+      [result.rows[0].id, req.user.userId]
+    );
+    
+    res.json({ success: true, classSpace: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 app.get('/api/class-spaces', authMiddleware, async (req, res) => {
   try {
@@ -412,34 +847,49 @@ app.get('/api/class-spaces', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/class-spaces', authMiddleware, async (req, res) => {
-  const { courseCode, courseName, description, institution, semester, academicYear } = req.body;
+app.post('/api/class-spaces/:id/join', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
   try {
-    const result = await pool.query(
-      'INSERT INTO class_spaces (course_rep_id, course_code, course_name, description, institution, semester, academic_year) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [req.user.userId, courseCode, courseName, description, institution, semester, academicYear]
+    const classExists = await pool.query('SELECT * FROM class_spaces WHERE id = $1', [id]);
+    if (classExists.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Class not found' });
+    }
+    
+    await pool.query(
+      'INSERT INTO class_space_members (class_space_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [id, req.user.userId]
     );
-    res.json({ success: true, classSpace: result.rows[0] });
+    
+    res.json({ success: true, message: 'Successfully joined class space' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.post('/api/class-spaces/:id/join', authMiddleware, async (req, res) => {
+app.post('/api/class-spaces/:id/resources', authMiddleware, documentUpload.single('file'), async (req, res) => {
   const { id } = req.params;
+  const { title, description, resourceType } = req.body;
+  
   try {
-    await pool.query(
-      'INSERT INTO class_space_members (class_space_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [id, req.user.userId]
+    // Upload to Supabase Storage
+    const fileUrl = await uploadToSupabase(req.file, 'class-resources', `class-${id}/`);
+    
+    const result = await pool.query(
+      'INSERT INTO class_resources (class_space_id, uploader_id, title, description, file_url, file_type, file_size, resource_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [id, req.user.userId, title, description, fileUrl, req.file.mimetype, req.file.size, resourceType]
     );
-    res.json({ success: true, message: 'Joined class space' });
+    
+    res.json({ success: true, resource: result.rows[0] });
   } catch (error) {
+    console.error('Error uploading class resource:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.get('/api/class-spaces/:id/resources', authMiddleware, async (req, res) => {
   const { id } = req.params;
+  
   try {
     const result = await pool.query(
       `SELECT cr.*, u.full_name as uploader_name 
@@ -455,24 +905,77 @@ app.get('/api/class-spaces/:id/resources', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/class-spaces/:id/resources', authMiddleware, upload.single('file'), async (req, res) => {
+// Class Timetable
+app.post('/api/class-spaces/:id/timetable', authMiddleware, async (req, res) => {
   const { id } = req.params;
-  const { title, description, resourceType } = req.body;
+  const { dayOfWeek, startTime, endTime, locationName, locationAddress, locationLat, locationLng, roomNumber, building, notes } = req.body;
+  
   try {
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const classCheck = await pool.query('SELECT course_rep_id FROM class_spaces WHERE id = $1', [id]);
+    if (classCheck.rows.length === 0 || classCheck.rows[0].course_rep_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the course rep can set the class timetable' });
+    }
+
     const result = await pool.query(
-      'INSERT INTO class_resources (class_space_id, uploader_id, title, description, file_url, file_type, file_size, resource_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [id, req.user.userId, title, description, fileUrl, req.file.mimetype, req.file.size, resourceType]
+      'INSERT INTO class_timetables (class_space_id, day_of_week, start_time, end_time, location_name, location_address, location_lat, location_lng, room_number, building, notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
+      [id, dayOfWeek, startTime, endTime, locationName, locationAddress, locationLat, locationLng, roomNumber, building, notes]
     );
-    res.json({ success: true, resource: result.rows[0] });
+    res.json({ success: true, entry: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/class-spaces/:id/timetable', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'SELECT * FROM class_timetables WHERE class_space_id = $1 ORDER BY day_of_week, start_time',
+      [id]
+    );
+    res.json({ success: true, entries: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/class-spaces/:classId/timetable/:entryId', authMiddleware, async (req, res) => {
+  const { classId, entryId } = req.params;
+  try {
+    const classCheck = await pool.query('SELECT course_rep_id FROM class_spaces WHERE id = $1', [classId]);
+    if (classCheck.rows.length === 0 || classCheck.rows[0].course_rep_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the course rep can delete timetable entries' });
+    }
+
+    await pool.query('DELETE FROM class_timetables WHERE id = $1 AND class_space_id = $2', [entryId, classId]);
+    res.json({ success: true, message: 'Timetable entry deleted' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ============================================
-// LIBRARY ROUTES
+// LIBRARY ROUTES WITH SUPABASE STORAGE
 // ============================================
+
+app.post('/api/library', authMiddleware, documentUpload.single('file'), async (req, res) => {
+  const { title, description, subject } = req.body;
+  
+  try {
+    // Upload to Supabase Storage
+    const fileUrl = await uploadToSupabase(req.file, 'library-resources', '');
+    
+    const result = await pool.query(
+      'INSERT INTO library_resources (uploader_id, title, description, subject, file_url, file_type, file_size) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.user.userId, title, description, subject, fileUrl, req.file.mimetype, req.file.size]
+    );
+    
+    res.json({ success: true, resource: result.rows[0] });
+  } catch (error) {
+    console.error('Error uploading library resource:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 app.get('/api/library', authMiddleware, async (req, res) => {
   try {
@@ -489,54 +992,29 @@ app.get('/api/library', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/library', authMiddleware, upload.single('file'), async (req, res) => {
-  const { title, description, subject } = req.body;
-  try {
-    const fileUrl = `/uploads/${req.file.filename}`;
-    const result = await pool.query(
-      'INSERT INTO library_resources (uploader_id, title, description, subject, file_url, file_type, file_size) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [req.user.userId, title, description, subject, fileUrl, req.file.mimetype, req.file.size]
-    );
-    res.json({ success: true, resource: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ============================================
-// MARKETPLACE SERVICES ROUTES
-// ============================================
-
-app.get('/api/marketplace/services', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT ms.*, u.full_name as provider_name, u.phone as provider_phone 
-      FROM marketplace_services ms 
-      JOIN users u ON ms.provider_id = u.id 
-      ORDER BY ms.created_at DESC`
-    );
-    res.json({ success: true, services: result.rows });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/api/marketplace/services', authMiddleware, async (req, res) => {
-  const { title, description, price, category, serviceCategory, duration, availability } = req.body;
-  try {
-    const result = await pool.query(
-      'INSERT INTO marketplace_services (provider_id, title, description, price, category, service_category, duration, availability) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [req.user.userId, title, description, price, category, serviceCategory || 'general', duration, availability]
-    );
-    res.json({ success: true, service: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // ============================================
 // STUDY GROUPS ROUTES
 // ============================================
+
+app.post('/api/study-groups', authMiddleware, async (req, res) => {
+  const { name, description, subject, maxMembers, isPrivate } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'INSERT INTO study_groups (creator_id, name, description, subject, max_members, is_private) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.userId, name, description, subject, maxMembers, isPrivate]
+    );
+    
+    await pool.query(
+      'INSERT INTO study_group_members (group_id, user_id, role) VALUES ($1, $2, $3)',
+      [result.rows[0].id, req.user.userId, 'admin']
+    );
+    
+    res.json({ success: true, group: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 app.get('/api/study-groups', authMiddleware, async (req, res) => {
   try {
@@ -554,26 +1032,23 @@ app.get('/api/study-groups', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/study-groups', authMiddleware, async (req, res) => {
-  const { name, description, subject, maxMembers, isPrivate } = req.body;
+// ============================================
+// TIMETABLE ROUTES
+// ============================================
+
+app.post('/api/timetable', authMiddleware, async (req, res) => {
+  const { title, dayOfWeek, startTime, endTime, location, courseCode, instructor, notes, color } = req.body;
+  
   try {
     const result = await pool.query(
-      'INSERT INTO study_groups (creator_id, name, description, subject, max_members, is_private) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [req.user.userId, name, description, subject, maxMembers, isPrivate]
+      'INSERT INTO timetables (user_id, title, day_of_week, start_time, end_time, location, course_code, instructor, notes, color) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
+      [req.user.userId, title, dayOfWeek, startTime, endTime, location, courseCode, instructor, notes, color]
     );
-    await pool.query(
-      'INSERT INTO study_group_members (group_id, user_id, role) VALUES ($1, $2, $3)',
-      [result.rows[0].id, req.user.userId, 'admin']
-    );
-    res.json({ success: true, group: result.rows[0] });
+    res.json({ success: true, entry: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
-// ============================================
-// TIMETABLE ROUTES
-// ============================================
 
 app.get('/api/timetable', authMiddleware, async (req, res) => {
   try {
@@ -587,14 +1062,15 @@ app.get('/api/timetable', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/timetable', authMiddleware, async (req, res) => {
-  const { title, dayOfWeek, startTime, endTime, location, courseCode, instructor, notes, color } = req.body;
+app.delete('/api/timetable/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
   try {
-    const result = await pool.query(
-      'INSERT INTO timetables (user_id, title, day_of_week, start_time, end_time, location, course_code, instructor, notes, color) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
-      [req.user.userId, title, dayOfWeek, startTime, endTime, location, courseCode, instructor, notes, color]
+    await pool.query(
+      'DELETE FROM timetables WHERE id = $1 AND user_id = $2',
+      [id, req.user.userId]
     );
-    res.json({ success: true, entry: result.rows[0] });
+    res.json({ success: true, message: 'Timetable entry deleted' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -603,6 +1079,20 @@ app.post('/api/timetable', authMiddleware, async (req, res) => {
 // ============================================
 // HOMEWORK HELP ROUTES
 // ============================================
+
+app.post('/api/homework-help', authMiddleware, async (req, res) => {
+  const { title, question, subject, classSpaceId } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'INSERT INTO homework_help (student_id, title, question, subject, class_space_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [req.user.userId, title, question, subject, classSpaceId]
+    );
+    res.json({ success: true, helpRequest: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 app.get('/api/homework-help', authMiddleware, async (req, res) => {
   try {
@@ -619,27 +1109,21 @@ app.get('/api/homework-help', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/homework-help', authMiddleware, async (req, res) => {
-  const { title, question, subject, classSpaceId } = req.body;
-  try {
-    const result = await pool.query(
-      'INSERT INTO homework_help (student_id, title, question, subject, class_space_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.user.userId, title, question, subject, classSpaceId]
-    );
-    res.json({ success: true, helpRequest: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { response } = req.body;
+  
   try {
     const result = await pool.query(
       'INSERT INTO homework_responses (help_request_id, responder_id, response) VALUES ($1, $2, $3) RETURNING *',
       [id, req.user.userId, response]
     );
+    
+    await pool.query(
+      "UPDATE homework_help SET status = 'answered' WHERE id = $1 AND status = 'open'",
+      [id]
+    );
+    
     res.json({ success: true, response: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -651,12 +1135,41 @@ app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
 // ============================================
 
 app.use((req, res) => {
-  res.status(404).json({ success: false, message: 'Route not found', path: req.path });
+  res.status(404).json({ 
+    success: false, 
+    message: 'Route not found',
+    path: req.path 
+  });
 });
 
 app.use((err, req, res, next) => {
   console.error('Error:', err);
-  res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+  
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'File too large. Maximum size: 5MB for images, 50MB for documents' 
+    });
+  }
+  
+  if (err.message && err.message.includes('Only image files')) {
+    return res.status(400).json({ 
+      success: false, 
+      message: err.message 
+    });
+  }
+  
+  if (err.message && err.message.includes('Only document files')) {
+    return res.status(400).json({ 
+      success: false, 
+      message: err.message 
+    });
+  }
+  
+  res.status(500).json({ 
+    success: false, 
+    message: err.message || 'Internal server error'
+  });
 });
 
 // ============================================
@@ -665,6 +1178,9 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📡 CORS: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+  console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`💾 Storage: Supabase Storage`);
+  console.log(`📊 Database: PostgreSQL (Supabase)`);
+  console.log(`\n✅ Initialize database at: /api/init-db`);
 });
+
