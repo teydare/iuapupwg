@@ -800,12 +800,15 @@ app.get('/api/marketplace/goods/:id/offers', authMiddleware, async (req, res) =>
 // MARKETPLACE REVIEWS API
 // ============================================
 
-// 1. Get reviews for a specific item
+// - Update the GET reviews endpoint
 app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
   const { itemId } = req.params;
   try {
+    // UPDATED QUERY: Selects profile_image_url aliased as 'reviewer_image'
     const reviews = await pool.query(
-      `SELECT r.*, u.full_name as reviewer_name 
+      `SELECT r.*, 
+              u.full_name as reviewer_name, 
+              u.profile_image_url as reviewer_image
        FROM reviews r 
        JOIN users u ON r.reviewer_id = u.id 
        WHERE r.marketplace_item_id = $1 
