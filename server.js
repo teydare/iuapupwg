@@ -621,8 +621,14 @@ app.get('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
     // Increment view count
     await pool.query('UPDATE marketplace_goods SET views = views + 1 WHERE id = $1', [id]);
     
+    // UPDATED QUERY: Includes subqueries for seller_rating and seller_review_count
     const itemResult = await pool.query(
-      `SELECT mg.*, u.full_name as seller_name, u.phone as seller_phone, u.email as seller_email
+      `SELECT mg.*, 
+              u.full_name as seller_name, 
+              u.phone as seller_phone, 
+              u.email as seller_email,
+              (SELECT AVG(rating)::numeric(10,1) FROM reviews WHERE reviewed_user_id = mg.seller_id) as seller_rating,
+              (SELECT COUNT(*) FROM reviews WHERE reviewed_user_id = mg.seller_id) as seller_review_count
       FROM marketplace_goods mg 
       JOIN users u ON mg.seller_id = u.id 
       WHERE mg.id = $1`,
@@ -633,15 +639,20 @@ app.get('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Item not found' });
     }
     
-    // Check if user has favorited
+    // Check if favorited
     const favoriteResult = await pool.query(
       'SELECT id FROM favorites WHERE user_id = $1 AND item_id = $2',
       [req.user.userId, id]
     );
     
+    // Return item with all seller stats
     res.json({ 
       success: true, 
-      item: itemResult.rows[0],
+      item: {
+        ...itemResult.rows[0],
+        seller_rating: parseFloat(itemResult.rows[0].seller_rating) || 0, // Ensure number format
+        seller_review_count: parseInt(itemResult.rows[0].seller_review_count) || 0
+      },
       isFavorited: favoriteResult.rows.length > 0
     });
   } catch (error) {
