@@ -801,13 +801,17 @@ app.get('/api/marketplace/goods/:id/offers', authMiddleware, async (req, res) =>
 // ============================================
 
 //
-// 1. Get reviews for a specific item
+// ============================================
+// MARKETPLACE REVIEWS API
+// ============================================
+
+// 1. GET REVIEWS (With User Info)
 app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
   const { itemId } = req.params;
   try {
-    // We join 'reviews' with 'users' to get the full_name and profile_image_url
-    const reviews = await pool.query(
-      `SELECT r.*, 
+    // JOIN reviews with users to get full_name and profile_image_url
+    const result = await pool.query(
+      `SELECT r.id, r.rating, r.comment, r.created_at,
               u.full_name as reviewer_name, 
               u.profile_image_url as reviewer_image
        FROM reviews r 
@@ -817,6 +821,7 @@ app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
       [itemId]
     );
 
+    // Get average stats
     const stats = await pool.query(
       `SELECT AVG(rating)::numeric(10,1) as average, COUNT(*) as count 
        FROM reviews 
@@ -826,7 +831,7 @@ app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
 
     res.json({ 
       success: true, 
-      reviews: reviews.rows,
+      reviews: result.rows,
       stats: stats.rows[0] || { average: 0, count: 0 }
     });
   } catch (error) {
@@ -835,16 +840,19 @@ app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
   }
 });
 
-// 2. Submit a new review
+// 2. SUBMIT REVIEW
 app.post('/api/reviews', authMiddleware, async (req, res) => {
+  // Note: We map 'itemId' from frontend to 'marketplace_item_id' in database
   const { itemId, rating, comment, reviewedUserId } = req.body;
+  
   try {
     const result = await pool.query(
       `INSERT INTO reviews (marketplace_item_id, reviewer_id, reviewed_user_id, rating, comment) 
        VALUES ($1, $2, $3, $4, $5) 
-       RETURNING *`,
+       RETURNING id, rating, comment, created_at`,
       [itemId, req.user.userId, reviewedUserId, rating, comment]
     );
+    
     res.json({ success: true, review: result.rows[0] });
   } catch (error) {
     console.error('Submit review error:', error);
