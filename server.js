@@ -785,32 +785,15 @@ app.get('/api/marketplace/goods/:id/offers', authMiddleware, async (req, res) =>
 // UPDATED MARKETPLACE REVIEWS ROUTES
 // ============================================
 
-// Submit a review for a physical good
-app.post('/api/reviews', authMiddleware, async (req, res) => {
-  const { itemId, rating, comment, reviewedUserId } = req.body;
-  
-  try {
-    const result = await pool.query(
-      `INSERT INTO reviews (marketplace_item_id, reviewer_id, reviewed_user_id, rating, comment) 
-       VALUES ($1, $2, $3, $4, $5) 
-       ON CONFLICT DO NOTHING -- Adjust if you want to allow updates
-       RETURNING *`,
-      [itemId, req.user.userId, reviewedUserId, rating, comment]
-    );
-    
-    res.json({ success: true, review: result.rows[0] });
-  } catch (error) {
-    console.error('Error submitting review:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+// ============================================
+// MARKETPLACE REVIEWS API
+// ============================================
 
-// Get reviews for a specific item
+// 1. Get reviews for a specific item
 app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
   const { itemId } = req.params;
-  
   try {
-    const result = await pool.query(
+    const reviews = await pool.query(
       `SELECT r.*, u.full_name as reviewer_name 
        FROM reviews r 
        JOIN users u ON r.reviewer_id = u.id 
@@ -818,18 +801,38 @@ app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
        ORDER BY r.created_at DESC`,
       [itemId]
     );
-    
+
     const stats = await pool.query(
-      'SELECT AVG(rating)::numeric(10,1) as average, COUNT(*) as count FROM reviews WHERE marketplace_item_id = $1',
+      `SELECT AVG(rating)::numeric(10,1) as average, COUNT(*) as count 
+       FROM reviews 
+       WHERE marketplace_item_id = $1`,
       [itemId]
     );
 
     res.json({ 
       success: true, 
-      reviews: result.rows,
-      stats: stats.rows[0]
+      reviews: reviews.rows,
+      stats: stats.rows[0] || { average: 0, count: 0 }
     });
   } catch (error) {
+    console.error('Fetch reviews error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2. Submit a new review
+app.post('/api/reviews', authMiddleware, async (req, res) => {
+  const { itemId, rating, comment, reviewedUserId } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO reviews (marketplace_item_id, reviewer_id, reviewed_user_id, rating, comment) 
+       VALUES ($1, $2, $3, $4, $5) 
+       RETURNING *`,
+      [itemId, req.user.userId, reviewedUserId, rating, comment]
+    );
+    res.json({ success: true, review: result.rows[0] });
+  } catch (error) {
+    console.error('Submit review error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
