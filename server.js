@@ -541,7 +541,34 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+// Add this under the existing /api/auth/profile routes
+app.get('/api/auth/stats', authMiddleware, async (req, res) => {
+  try {
+    const classesCount = await pool.query(
+      'SELECT COUNT(*) FROM class_space_members WHERE user_id = $1', 
+      [req.user.userId]
+    );
+    const resourcesCount = await pool.query(
+      'SELECT COUNT(*) FROM class_resources WHERE uploader_id = $1', 
+      [req.user.userId]
+    );
+    const groupsCount = await pool.query(
+      'SELECT COUNT(*) FROM study_group_members WHERE user_id = $1', 
+      [req.user.userId]
+    );
 
+    res.json({
+      success: true,
+      stats: {
+        classesJoined: parseInt(classesCount.rows[0].count),
+        resourcesUploaded: parseInt(resourcesCount.rows[0].count),
+        studyGroups: parseInt(groupsCount.rows[0].count)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // ============================================
 // MARKETPLACE ROUTES WITH SUPABASE STORAGE
 // ============================================
@@ -1031,7 +1058,36 @@ app.get('/api/study-groups', authMiddleware, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+// Add this after the POST /api/study-groups route
+app.post('/api/study-groups/:id/join', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const groupCheck = await pool.query('SELECT * FROM study_groups WHERE id = $1', [id]);
+    if (groupCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Group not found' });
+    }
+    
+    // Check if already a member
+    const memberCheck = await pool.query(
+      'SELECT * FROM study_group_members WHERE group_id = $1 AND user_id = $2',
+      [id, req.user.userId]
+    );
 
+    if (memberCheck.rows.length > 0) {
+      return res.status(400).json({ success: false, message: 'You are already a member of this group' });
+    }
+
+    await pool.query(
+      'INSERT INTO study_group_members (group_id, user_id) VALUES ($1, $2)',
+      [id, req.user.userId]
+    );
+    
+    res.json({ success: true, message: 'Joined study group successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // ============================================
 // TIMETABLE ROUTES
 // ============================================
@@ -1130,6 +1186,24 @@ app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
   }
 });
 
+// Add this before the POST /api/homework-help/:id/respond route
+app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT hr.*, u.full_name as responder_name
+      FROM homework_responses hr 
+      JOIN users u ON hr.responder_id = u.id 
+      WHERE hr.help_request_id = $1 
+      ORDER BY hr.created_at ASC`,
+      [id]
+    );
+    res.json({ success: true, responses: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // ============================================
 // ERROR HANDLING
 // ============================================
