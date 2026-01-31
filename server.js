@@ -994,6 +994,35 @@ app.get('/api/store/:sellerId', async (req, res) => {
   }
 });
 
+app.get('/api/store/:idOrSlug', async (req, res) => {
+  const { idOrSlug } = req.params;
+
+  const store = await pool.query(`
+    SELECT s.*, u.full_name, u.profile_image_url
+    FROM stores s
+    JOIN users u ON s.user_id = u.id
+    WHERE s.user_id::text = $1 OR s.slug = $1
+  `, [idOrSlug]);
+
+  if (!store.rows.length) {
+    return res.status(404).json({ success: false });
+  }
+
+  const items = await pool.query(`
+    SELECT *
+    FROM marketplace_goods
+    WHERE seller_id = $1
+    ORDER BY created_at DESC
+  `, [store.rows[0].user_id]);
+
+  res.json({
+    success: true,
+    store: store.rows[0],
+    items: items.rows
+  });
+});
+
+
 // Marketplace Services
 app.post('/api/marketplace/services', authMiddleware, async (req, res) => {
   const { title, description, price, category, serviceCategory, duration, availability } = req.body;
