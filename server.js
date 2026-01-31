@@ -513,6 +513,7 @@ app.post('/api/auth/login', async (req, res) => {
         phone: user.phone,
         bio: user.bio,
         isCourseRep: user.is_course_rep
+        profileImageUrl: user.profile_image_url,
       }
     });
   } catch (error) {
