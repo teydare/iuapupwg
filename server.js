@@ -1017,7 +1017,7 @@ app.get('/api/store/:sellerId', async (req,res) => {
   }
 });
 
-app.post('/api/store/:sellerId/follow', auth, async (req,res) => {
+app.post('/api/store/:sellerId/follow', authMiddleware, async (req,res) => {
   await pool.query(`
     INSERT INTO seller_followers (seller_id,follower_id)
     VALUES ($1,$2)
@@ -1027,7 +1027,7 @@ app.post('/api/store/:sellerId/follow', auth, async (req,res) => {
   res.json({success:true});
 });
 
-app.delete('/api/store/:sellerId/follow', auth, async (req,res) => {
+app.delete('/api/store/:sellerId/follow', authMiddleware, async (req,res) => {
   await pool.query(`
     DELETE FROM seller_followers
     WHERE seller_id=$1 AND follower_id=$2
@@ -1036,7 +1036,7 @@ app.delete('/api/store/:sellerId/follow', auth, async (req,res) => {
   res.json({success:true});
 });
 
-app.patch('/api/store/profile', auth, async (req,res) => {
+app.patch('/api/store/profile', authMiddleware, async (req,res) => {
   const { store_description, store_slug } = req.body;
 
   await pool.query(`
