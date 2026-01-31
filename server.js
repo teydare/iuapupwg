@@ -968,48 +968,29 @@ app.post('/api/reviews', authMiddleware, async (req, res) => {
 
 // Public seller store
 app.get('/api/store/:sellerId', async (req, res) => {
+  const { sellerId } = req.params;
+
   try {
-    const { sellerId } = req.params;
+    const seller = await pool.query(
+      `SELECT id, full_name FROM users WHERE id = $1`,
+      [sellerId]
+    );
 
-    // seller info
-    const seller = await pool.query(`
-      SELECT id, full_name, bio, profile_image_url, institution
-      FROM users
-      WHERE id = $1
-    `, [sellerId]);
-
-    if (seller.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Seller not found' });
-    }
-
-    // seller items
-    const items = await pool.query(`
-      SELECT *
-      FROM marketplace_goods
-      WHERE seller_id = $1
-      AND status = 'available'
-      ORDER BY created_at DESC
-    `, [sellerId]);
-
-    // seller rating
-    const rating = await pool.query(`
-      SELECT 
-        COUNT(*) as count,
-        COALESCE(AVG(rating),0)::numeric(10,1) as avg
-      FROM reviews
-      WHERE reviewed_user_id = $1
-    `, [sellerId]);
+    const items = await pool.query(
+      `SELECT * FROM marketplace_goods
+       WHERE seller_id = $1
+       ORDER BY created_at DESC`,
+      [sellerId]
+    );
 
     res.json({
       success: true,
       seller: seller.rows[0],
-      items: items.rows,
-      rating: rating.rows[0]
+      items: items.rows
     });
 
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    res.status(500).json({ success:false, error: err.message });
   }
 });
 
