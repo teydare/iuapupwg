@@ -971,78 +971,84 @@ app.post('/api/reviews', authMiddleware, async (req, res) => {
 // PUBLIC STORE PAGE
 // ================================
 
-app.get('/api/store/:sellerId', async (req, res) => {
+app.get('/api/store/:sellerId', async (req,res) => {
   const { sellerId } = req.params;
 
   try {
 
-    // ------------------------
-    // Seller Info + Rating
-    // ------------------------
+    await pool.query(
+      `UPDATE users SET store_views = store_views + 1 WHERE id=$1`,
+      [sellerId]
+    );
 
-    const sellerResult = await pool.query(`
+    const seller = await pool.query(`
       SELECT 
-        u.id,
-        u.full_name,
-        u.profile_image_url,
-        u.bio,
-        u.created_at,
-
-        COALESCE(AVG(r.rating),0)::numeric(10,1) as seller_rating,
-        COUNT(r.id) as seller_review_count
-
+        u.*,
+        COUNT(DISTINCT f.id) as follower_count,
+        COALESCE(AVG(r.rating),0)::numeric(10,1) as rating,
+        COUNT(DISTINCT r.id) as review_count
       FROM users u
-      LEFT JOIN reviews r 
-        ON r.reviewed_user_id = u.id
-
-      WHERE u.id = $1
+      LEFT JOIN seller_followers f ON f.seller_id=u.id
+      LEFT JOIN reviews r ON r.reviewed_user_id=u.id
+      WHERE u.id=$1
       GROUP BY u.id
-    `, [sellerId]);
+    `,[sellerId]);
 
-    if (sellerResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'Seller not found'
-      });
-    }
-
-    const seller = sellerResult.rows[0];
-
-    // ------------------------
-    // Seller Items
-    // ------------------------
-
-    const itemsResult = await pool.query(`
+    const items = await pool.query(`
       SELECT 
         g.*,
-
         COALESCE(AVG(r.rating),0)::numeric(10,1) as rating,
         COUNT(r.id) as review_count
-
       FROM marketplace_goods g
-
-      LEFT JOIN reviews r
-        ON r.marketplace_item_id = g.id
-
-      WHERE g.seller_id = $1
+      LEFT JOIN reviews r ON r.marketplace_item_id=g.id
+      WHERE g.seller_id=$1
       GROUP BY g.id
       ORDER BY g.created_at DESC
-    `, [sellerId]);
+    `,[sellerId]);
 
     res.json({
-      success: true,
-      store: seller,
-      items: itemsResult.rows
+      success:true,
+      store: seller.rows[0],
+      items: items.rows
     });
 
-  } catch (error) {
-    console.error('Store load error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+  } catch(err){
+    res.status(500).json({success:false,error:err.message});
   }
 });
+
+app.post('/api/store/:sellerId/follow', auth, async (req,res) => {
+  await pool.query(`
+    INSERT INTO seller_followers (seller_id,follower_id)
+    VALUES ($1,$2)
+    ON CONFLICT DO NOTHING
+  `,[req.params.sellerId, req.user.id]);
+
+  res.json({success:true});
+});
+
+app.delete('/api/store/:sellerId/follow', auth, async (req,res) => {
+  await pool.query(`
+    DELETE FROM seller_followers
+    WHERE seller_id=$1 AND follower_id=$2
+  `,[req.params.sellerId, req.user.id]);
+
+  res.json({success:true});
+});
+
+app.patch('/api/store/profile', auth, async (req,res) => {
+  const { store_description, store_slug } = req.body;
+
+  await pool.query(`
+    UPDATE users
+    SET store_description=$1,
+        store_slug=$2
+    WHERE id=$3
+  `,[store_description, store_slug, req.user.id]);
+
+  res.json({success:true});
+});
+
 
  
 app.get('/api/store/:idOrSlug', async (req, res) => {
