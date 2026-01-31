@@ -967,33 +967,84 @@ app.post('/api/reviews', authMiddleware, async (req, res) => {
 });
 
 // Public seller store
+// ================================
+// PUBLIC STORE PAGE
+// ================================
+
 app.get('/api/store/:sellerId', async (req, res) => {
   const { sellerId } = req.params;
 
   try {
-    const seller = await pool.query(
-      `SELECT id, full_name FROM users WHERE id = $1`,
-      [sellerId]
-    );
 
-    const items = await pool.query(
-      `SELECT * FROM marketplace_goods
-       WHERE seller_id = $1
-       ORDER BY created_at DESC`,
-      [sellerId]
-    );
+    // ------------------------
+    // Seller Info + Rating
+    // ------------------------
+
+    const sellerResult = await pool.query(`
+      SELECT 
+        u.id,
+        u.full_name,
+        u.profile_image_url,
+        u.bio,
+        u.created_at,
+
+        COALESCE(AVG(r.rating),0)::numeric(10,1) as seller_rating,
+        COUNT(r.id) as seller_review_count
+
+      FROM users u
+      LEFT JOIN reviews r 
+        ON r.reviewed_user_id = u.id
+
+      WHERE u.id = $1
+      GROUP BY u.id
+    `, [sellerId]);
+
+    if (sellerResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Seller not found'
+      });
+    }
+
+    const seller = sellerResult.rows[0];
+
+    // ------------------------
+    // Seller Items
+    // ------------------------
+
+    const itemsResult = await pool.query(`
+      SELECT 
+        g.*,
+
+        COALESCE(AVG(r.rating),0)::numeric(10,1) as rating,
+        COUNT(r.id) as review_count
+
+      FROM marketplace_goods g
+
+      LEFT JOIN reviews r
+        ON r.marketplace_item_id = g.id
+
+      WHERE g.seller_id = $1
+      GROUP BY g.id
+      ORDER BY g.created_at DESC
+    `, [sellerId]);
 
     res.json({
       success: true,
-      seller: seller.rows[0],
-      items: items.rows
+      store: seller,
+      items: itemsResult.rows
     });
 
-  } catch (err) {
-    res.status(500).json({ success:false, error: err.message });
+  } catch (error) {
+    console.error('Store load error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
+ 
 app.get('/api/store/:idOrSlug', async (req, res) => {
   const { idOrSlug } = req.params;
 
