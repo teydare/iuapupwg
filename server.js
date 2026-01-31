@@ -402,6 +402,15 @@ const authMiddleware = (req, res, next) => {
   } catch (error) {
     return res.status(401).json({ success: false, message: 'Invalid token' });
   }
+  module.exports = (req,res,next) => {
+  req.user = null;
+  next();
+};
+};
+
+module.exports = (req,res,next) => {
+  req.user = null;
+  next();
 };
 
 // ============================================
@@ -1079,6 +1088,19 @@ app.get('/api/store/:idOrSlug', async (req, res) => {
   });
 });
 
+app.get('/api/store/:id', async (req,res) => {
+  const store = await db('stores').where({ id: req.params.id }).first();
+  const items = await db('items').where({ store_id: req.params.id });
+
+  res.json({ success: true, store, items });
+});
+app.post('/api/items/:id/whatsapp', async (req,res)=>{
+  await db('item_events').insert({
+    item_id: req.params.id,
+    event_type: 'whatsapp_click'
+  });
+  res.json({ success: true });
+});
 
 // Marketplace Services
 app.post('/api/marketplace/services', authMiddleware, async (req, res) => {
