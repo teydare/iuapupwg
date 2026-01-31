@@ -965,6 +965,54 @@ app.post('/api/reviews', authMiddleware, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// Public seller store
+app.get('/api/store/:sellerId', async (req, res) => {
+  try {
+    const { sellerId } = req.params;
+
+    // seller info
+    const seller = await pool.query(`
+      SELECT id, full_name, bio, profile_image_url, institution
+      FROM users
+      WHERE id = $1
+    `, [sellerId]);
+
+    if (seller.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Seller not found' });
+    }
+
+    // seller items
+    const items = await pool.query(`
+      SELECT *
+      FROM marketplace_goods
+      WHERE seller_id = $1
+      AND status = 'available'
+      ORDER BY created_at DESC
+    `, [sellerId]);
+
+    // seller rating
+    const rating = await pool.query(`
+      SELECT 
+        COUNT(*) as count,
+        COALESCE(AVG(rating),0)::numeric(10,1) as avg
+      FROM reviews
+      WHERE reviewed_user_id = $1
+    `, [sellerId]);
+
+    res.json({
+      success: true,
+      seller: seller.rows[0],
+      items: items.rows,
+      rating: rating.rows[0]
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Marketplace Services
 app.post('/api/marketplace/services', authMiddleware, async (req, res) => {
   const { title, description, price, category, serviceCategory, duration, availability } = req.body;
