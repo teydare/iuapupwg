@@ -359,6 +359,17 @@ CREATE TABLE IF NOT EXISTS homework_responses (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS reviews (
+  id SERIAL PRIMARY KEY,
+  reviewer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  reviewed_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  marketplace_item_id INTEGER REFERENCES marketplace_goods(id) ON DELETE CASCADE,
+  marketplace_service_id INTEGER REFERENCES marketplace_services(id) ON DELETE CASCADE,
+  rating INTEGER CHECK (rating >= 1 AND rating <= 5),
+  comment TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_class_spaces_rep ON class_spaces(course_rep_id);
@@ -369,7 +380,11 @@ CREATE INDEX IF NOT EXISTS idx_marketplace_services_provider ON marketplace_serv
 CREATE INDEX IF NOT EXISTS idx_chat_sender ON chat_messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
 CREATE INDEX IF NOT EXISTS idx_offers_item ON offers(item_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_item ON reviews(marketplace_item_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(reviewed_user_id);
 `;
+
+
 
 // ============================================
 // AUTH MIDDLEWARE
@@ -544,17 +559,36 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 // Add this under the existing /api/auth/profile routes
 app.get('/api/auth/stats', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user.userId;
+
     const classesCount = await pool.query(
-      'SELECT COUNT(*) FROM class_space_members WHERE user_id = $1', 
-      [req.user.userId]
+      'SELECT COUNT(*) FROM class_space_members WHERE user_id = $1',
+      [userId]
     );
+
     const resourcesCount = await pool.query(
-      'SELECT COUNT(*) FROM class_resources WHERE uploader_id = $1', 
-      [req.user.userId]
+      'SELECT COUNT(*) FROM class_resources WHERE uploader_id = $1',
+      [userId]
     );
+
     const groupsCount = await pool.query(
-      'SELECT COUNT(*) FROM study_group_members WHERE user_id = $1', 
-      [req.user.userId]
+      'SELECT COUNT(*) FROM study_group_members WHERE user_id = $1',
+      [userId]
+    );
+
+    const itemsSold = await pool.query(
+      'SELECT COUNT(*) FROM marketplace_goods WHERE seller_id = $1',
+      [userId]
+    );
+
+    const reviewsReceived = await pool.query(
+      'SELECT COUNT(*) FROM reviews WHERE reviewed_user_id = $1',
+      [userId]
+    );
+
+    const avgRating = await pool.query(
+      'SELECT COALESCE(AVG(rating),0)::numeric(10,1) as avg FROM reviews WHERE reviewed_user_id = $1',
+      [userId]
     );
 
     res.json({
@@ -562,13 +596,45 @@ app.get('/api/auth/stats', authMiddleware, async (req, res) => {
       stats: {
         classesJoined: parseInt(classesCount.rows[0].count),
         resourcesUploaded: parseInt(resourcesCount.rows[0].count),
-        studyGroups: parseInt(groupsCount.rows[0].count)
+        studyGroups: parseInt(groupsCount.rows[0].count),
+        itemsSold: parseInt(itemsSold.rows[0].count),
+        reviewsReceived: parseInt(reviewsReceived.rows[0].count),
+        avgRating: parseFloat(avgRating.rows[0].avg)
       }
     });
+
   } catch (error) {
+    console.error(error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+
+// Upload profile avatar
+app.post('/api/auth/avatar', authMiddleware, imageUpload.single('avatar'), async (req, res) => {
+  try {
+    const publicUrl = await uploadToSupabase(
+      req.file,
+      'profile-images',
+      `user-${req.user.userId}/`
+    );
+
+    await pool.query(
+      'UPDATE users SET profile_image_url = $1 WHERE id = $2',
+      [publicUrl, req.user.userId]
+    );
+
+    res.json({
+      success: true,
+      url: publicUrl
+    });
+
+  } catch (error) {
+    console.error('Avatar upload error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ============================================
 // MARKETPLACE ROUTES WITH SUPABASE STORAGE
 // ============================================
