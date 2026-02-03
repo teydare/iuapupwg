@@ -979,64 +979,150 @@ app.post('/api/reviews', authMiddleware, async (req, res) => {
 // ================================
 // PUBLIC STORE PAGE
 // ================================
+// ==========================================
+// ✅ FIX: GET STORE (Robust Handler)
+// Handles both User ID lookup and Store Metadata
+// ==========================================
 app.get('/api/store/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
-  
-  try {
-    // Get store details
-    const storeResult = await pool.query(
-      `SELECT s.*, u.full_name as owner_name, u.email as owner_email,
-       (SELECT COUNT(*) FROM store_followers WHERE store_id = s.id) as followers_count,
-       (SELECT COUNT(*) FROM marketplace_goods WHERE store_id = s.id) as products_count
-       FROM stores s
-       JOIN users u ON s.owner_id = u.id
-       WHERE s.id = $1`,
-      [id]
-    );
 
-    if (storeResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Store not found' });
+  try {
+    // Validate ID is a number to prevent SQL injection/crashes
+    if (isNaN(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid ID format' });
     }
 
-    const store = storeResult.rows[0];
+    // 1. Fetch Basic Info (Join Users + Stores)
+    // We LEFT JOIN stores on users because every seller is a user, 
+    // but not every user has a customized 'store' entry yet.
+    const storeQuery = `
+      SELECT 
+        u.id as user_id,
+        u.full_name,
+        u.email,
+        u.phone as whatsapp_number,
+        u.profile_image_url,
+        u.bio as user_bio,
+        u.created_at,
+        u.is_course_rep,
+        s.id as store_id,
+        s.store_name,
+        s.slug,
+        s.description as store_description,
+        s.banner_url
+      FROM users u
+      LEFT JOIN stores s ON u.id = s.user_id
+      WHERE u.id = $1
+    `;
+    
+    const userResult = await pool.query(storeQuery, [id]);
 
-    // Get store products
-    const productsResult = await pool.query(
-      `SELECT mg.* FROM marketplace_goods mg
-       WHERE mg.store_id = $1 AND mg.status = 'available'
-       ORDER BY mg.created_at DESC`,
-      [id]
-    );
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Seller not found' });
+    }
 
-    // Get store services
-    const servicesResult = await pool.query(
-      `SELECT ms.* FROM marketplace_services ms
-       WHERE ms.store_id = $1
-       ORDER BY ms.created_at DESC`,
-      [id]
-    );
+    const rawData = userResult.rows[0];
 
-    // Check if current user follows this store
-    const followResult = await pool.query(
-      'SELECT id FROM store_followers WHERE store_id = $1 AND user_id = $2',
-      [id, req.user.userId]
-    );
+    // 2. Calculate Ratings from Reviews Table
+    const statsQuery = `
+      SELECT 
+        COALESCE(AVG(rating), 0)::numeric(10,1) as avg_rating,
+        COUNT(id) as total_reviews
+      FROM reviews 
+      WHERE reviewed_user_id = $1
+    `;
+    const statsResult = await pool.query(statsQuery, [id]);
+
+    // 3. Construct "Seller/Store" Object for Frontend
+    // Priority: Store Name > User Name, Store Desc > User Bio
+    const storeObj = {
+      id: rawData.user_id, // Frontend uses seller_id as the primary key
+      store_id: rawData.store_id,
+      full_name: rawData.store_name || rawData.full_name,
+      bio: rawData.store_description || rawData.user_bio,
+      profile_image_url: rawData.profile_image_url,
+      banner_url: rawData.banner_url,
+      whatsapp_number: rawData.whatsapp_number,
+      created_at: rawData.created_at,
+      location: rawData.institution || 'Campus', // Fallback if location not in table
+      seller_rating: statsResult.rows[0].avg_rating,
+      seller_review_count: statsResult.rows[0].total_reviews,
+      is_verified: rawData.is_course_rep // Example logic for verification tag
+    };
+
+    // 4. Fetch Active Products
+    const itemsQuery = `
+      SELECT * FROM marketplace_goods 
+      WHERE seller_id = $1 AND status = 'available' 
+      ORDER BY created_at DESC
+    `;
+    const itemsResult = await pool.query(itemsQuery, [id]);
 
     res.json({
       success: true,
-      store: {
-        ...store,
-        isFollowing: followResult.rows.length > 0,
-        products: productsResult.rows,
-        services: servicesResult.rows
-      }
+      store: storeObj,
+      items: itemsResult.rows
     });
+
   } catch (error) {
     console.error('Get store error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// ==========================================
+// ✅ FIX: GET REVIEWS
+// Correctly joins users table for reviewer details
+// ==========================================
+app.get('/api/reviews/user/:userId', authMiddleware, async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    if (isNaN(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid User ID' });
+    }
+
+    // Query 'reviews' table, join 'users' to get the reviewer's name/pic
+    const query = `
+      SELECT 
+        r.id, 
+        r.rating, 
+        r.comment, 
+        r.created_at,
+        r.reviewer_id,
+        u.full_name,
+        u.profile_image_url as avatar
+      FROM reviews r
+      JOIN users u ON r.reviewer_id = u.id
+      WHERE r.reviewed_user_id = $1
+      ORDER BY r.created_at DESC
+    `;
+
+    const result = await pool.query(query, [userId]);
+
+    // Map to frontend structure if necessary, or send as is
+    const formattedReviews = result.rows.map(row => ({
+      id: row.id,
+      rating: row.rating,
+      comment: row.comment,
+      created_at: row.created_at,
+      user: {
+        id: row.reviewer_id,
+        full_name: row.full_name,
+        avatar: row.avatar
+      }
+    }));
+
+    res.json({ 
+      success: true, 
+      reviews: formattedReviews 
+    });
+
+  } catch (error) {
+    console.error('Get reviews error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // Get all stores
 app.get('/api/stores', authMiddleware, async (req, res) => {
   try {
