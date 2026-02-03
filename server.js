@@ -979,6 +979,370 @@ app.post('/api/reviews', authMiddleware, async (req, res) => {
 // ================================
 // PUBLIC STORE PAGE
 // ================================
+app.get('/api/store/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Get store details
+    const storeResult = await pool.query(
+      `SELECT s.*, u.full_name as owner_name, u.email as owner_email,
+       (SELECT COUNT(*) FROM store_followers WHERE store_id = s.id) as followers_count,
+       (SELECT COUNT(*) FROM marketplace_goods WHERE store_id = s.id) as products_count
+       FROM stores s
+       JOIN users u ON s.owner_id = u.id
+       WHERE s.id = $1`,
+      [id]
+    );
+
+    if (storeResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Store not found' });
+    }
+
+    const store = storeResult.rows[0];
+
+    // Get store products
+    const productsResult = await pool.query(
+      `SELECT mg.* FROM marketplace_goods mg
+       WHERE mg.store_id = $1 AND mg.status = 'available'
+       ORDER BY mg.created_at DESC`,
+      [id]
+    );
+
+    // Get store services
+    const servicesResult = await pool.query(
+      `SELECT ms.* FROM marketplace_services ms
+       WHERE ms.store_id = $1
+       ORDER BY ms.created_at DESC`,
+      [id]
+    );
+
+    // Check if current user follows this store
+    const followResult = await pool.query(
+      'SELECT id FROM store_followers WHERE store_id = $1 AND user_id = $2',
+      [id, req.user.userId]
+    );
+
+    res.json({
+      success: true,
+      store: {
+        ...store,
+        isFollowing: followResult.rows.length > 0,
+        products: productsResult.rows,
+        services: servicesResult.rows
+      }
+    });
+  } catch (error) {
+    console.error('Get store error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get all stores
+app.get('/api/stores', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.*, u.full_name as owner_name,
+       (SELECT COUNT(*) FROM store_followers WHERE store_id = s.id) as followers_count,
+       (SELECT COUNT(*) FROM marketplace_goods WHERE store_id = s.id AND status = 'available') as products_count
+       FROM stores s
+       JOIN users u ON s.owner_id = u.id
+       WHERE s.status = 'active'
+       ORDER BY s.created_at DESC`
+    );
+
+    res.json({ success: true, stores: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create a new store
+app.post('/api/stores', authMiddleware, async (req, res) => {
+  const { storeName, description, category, location, phone, email, website } = req.body;
+  
+  try {
+    // Check if user already has a store
+    const existingStore = await pool.query(
+      'SELECT id FROM stores WHERE owner_id = $1',
+      [req.user.userId]
+    );
+
+    if (existingStore.rows.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'You already have a store. Each user can only create one store.' 
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO stores (owner_id, store_name, description, category, location, phone, email, website)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [req.user.userId, storeName, description, category, location, phone, email, website]
+    );
+
+    res.json({ success: true, store: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update store
+app.put('/api/stores/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { storeName, description, category, location, phone, email, website } = req.body;
+  
+  try {
+    // Verify ownership
+    const storeCheck = await pool.query(
+      'SELECT owner_id FROM stores WHERE id = $1',
+      [id]
+    );
+
+    if (storeCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Store not found' });
+    }
+
+    if (storeCheck.rows[0].owner_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the store owner can update this store' });
+    }
+
+    const result = await pool.query(
+      `UPDATE stores
+       SET store_name = $1, description = $2, category = $3, location = $4, 
+           phone = $5, email = $6, website = $7
+       WHERE id = $8
+       RETURNING *`,
+      [storeName, description, category, location, phone, email, website, id]
+    );
+
+    res.json({ success: true, store: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Follow/Unfollow store
+app.post('/api/stores/:id/follow', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Check if already following
+    const existing = await pool.query(
+      'SELECT id FROM store_followers WHERE store_id = $1 AND user_id = $2',
+      [id, req.user.userId]
+    );
+
+    if (existing.rows.length > 0) {
+      // Unfollow
+      await pool.query(
+        'DELETE FROM store_followers WHERE store_id = $1 AND user_id = $2',
+        [id, req.user.userId]
+      );
+      res.json({ success: true, following: false });
+    } else {
+      // Follow
+      await pool.query(
+        'INSERT INTO store_followers (store_id, user_id) VALUES ($1, $2)',
+        [id, req.user.userId]
+      );
+      res.json({ success: true, following: true });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get user's store (if they have one)
+app.get('/api/stores/my-store', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.*,
+       (SELECT COUNT(*) FROM store_followers WHERE store_id = s.id) as followers_count,
+       (SELECT COUNT(*) FROM marketplace_goods WHERE store_id = s.id) as products_count
+       FROM stores s
+       WHERE s.owner_id = $1`,
+      [req.user.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ success: true, store: null });
+    }
+
+    res.json({ success: true, store: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// REVIEW ROUTES
+// ============================================
+
+// Get reviews for a user
+app.get('/api/reviews/user/:userId', authMiddleware, async (req, res) => {
+  const { userId } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT sr.*, u.full_name as reviewer_name, s.store_name
+       FROM store_reviews sr
+       JOIN users u ON sr.reviewer_id = u.id
+       LEFT JOIN stores s ON sr.store_id = s.id
+       WHERE s.owner_id = $1
+       ORDER BY sr.created_at DESC`,
+      [userId]
+    );
+
+    // Calculate average rating
+    const avgResult = await pool.query(
+      `SELECT AVG(sr.rating) as avg_rating, COUNT(*) as total_reviews
+       FROM store_reviews sr
+       JOIN stores s ON sr.store_id = s.id
+       WHERE s.owner_id = $1`,
+      [userId]
+    );
+
+    res.json({ 
+      success: true, 
+      reviews: result.rows,
+      averageRating: parseFloat(avgResult.rows[0].avg_rating) || 0,
+      totalReviews: parseInt(avgResult.rows[0].total_reviews) || 0
+    });
+  } catch (error) {
+    console.error('Get reviews error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get reviews for a store
+app.get('/api/reviews/store/:storeId', authMiddleware, async (req, res) => {
+  const { storeId } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT sr.*, u.full_name as reviewer_name, u.profile_image_url as reviewer_image
+       FROM store_reviews sr
+       JOIN users u ON sr.reviewer_id = u.id
+       WHERE sr.store_id = $1
+       ORDER BY sr.created_at DESC`,
+      [storeId]
+    );
+
+    res.json({ success: true, reviews: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create a review
+app.post('/api/reviews', authMiddleware, async (req, res) => {
+  const { storeId, rating, reviewText } = req.body;
+  
+  try {
+    // Check if store exists
+    const storeCheck = await pool.query(
+      'SELECT id, owner_id FROM stores WHERE id = $1',
+      [storeId]
+    );
+
+    if (storeCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Store not found' });
+    }
+
+    // Prevent reviewing own store
+    if (storeCheck.rows[0].owner_id === req.user.userId) {
+      return res.status(400).json({ success: false, message: 'You cannot review your own store' });
+    }
+
+    // Check if already reviewed
+    const existingReview = await pool.query(
+      'SELECT id FROM store_reviews WHERE store_id = $1 AND reviewer_id = $2',
+      [storeId, req.user.userId]
+    );
+
+    if (existingReview.rows.length > 0) {
+      // Update existing review
+      const result = await pool.query(
+        `UPDATE store_reviews 
+         SET rating = $1, review_text = $2, created_at = CURRENT_TIMESTAMP
+         WHERE store_id = $3 AND reviewer_id = $4
+         RETURNING *`,
+        [rating, reviewText, storeId, req.user.userId]
+      );
+
+      // Update store average rating
+      await updateStoreRating(storeId);
+
+      res.json({ success: true, review: result.rows[0], message: 'Review updated' });
+    } else {
+      // Create new review
+      const result = await pool.query(
+        `INSERT INTO store_reviews (store_id, reviewer_id, rating, review_text)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [storeId, req.user.userId, rating, reviewText]
+      );
+
+      // Update store average rating
+      await updateStoreRating(storeId);
+
+      res.json({ success: true, review: result.rows[0], message: 'Review created' });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Helper function to update store rating
+async function updateStoreRating(storeId) {
+  try {
+    const avgResult = await pool.query(
+      'SELECT AVG(rating) as avg_rating FROM store_reviews WHERE store_id = $1',
+      [storeId]
+    );
+
+    const avgRating = parseFloat(avgResult.rows[0].avg_rating) || 0;
+
+    await pool.query(
+      'UPDATE stores SET rating = $1 WHERE id = $2',
+      [avgRating.toFixed(2), storeId]
+    );
+  } catch (error) {
+    console.error('Update store rating error:', error);
+  }
+}
+
+// Delete a review (reviewer only)
+app.delete('/api/reviews/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const reviewCheck = await pool.query(
+      'SELECT reviewer_id, store_id FROM store_reviews WHERE id = $1',
+      [id]
+    );
+
+    if (reviewCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Review not found' });
+    }
+
+    if (reviewCheck.rows[0].reviewer_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the reviewer can delete this review' });
+    }
+
+    const storeId = reviewCheck.rows[0].store_id;
+
+    await pool.query('DELETE FROM store_reviews WHERE id = $1', [id]);
+
+    // Update store rating
+    await updateStoreRating(storeId);
+
+    res.json({ success: true, message: 'Review deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 app.get('/api/store/:sellerId', async (req,res) => {
   const { sellerId } = req.params;
