@@ -29,6 +29,33 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY // Use service role key for server-side operations
 );
 
+// Helper to update reputation and percentile rank
+async function updateStudentRank(userId) {
+  try {
+    // 1. Calculate new reputation score
+    const scoreResult = await pool.query(
+      `SELECT (COUNT(li.id) * 10) + (SELECT COUNT(*) * 50 FROM library_resources WHERE uploader_id = $1) as total_score
+       FROM library_interactions li
+       JOIN library_resources lr ON li.resource_id = lr.id
+       WHERE lr.uploader_id = $1 AND li.interaction_type = 'upvote'`,
+      [userId]
+    );
+    
+    const newScore = scoreResult.rows[0].total_score;
+    await pool.query('UPDATE users SET reputation_score = $1 WHERE id = $2', [newScore, userId]);
+
+    // 2. Global Recalculation: Where does this student stand?
+    await pool.query(`
+      WITH ranks AS (
+        SELECT id, PERCENT_RANK() OVER (ORDER BY reputation_score DESC) as p_rank FROM users
+      )
+      UPDATE users SET rank_percentile = (1 - ranks.p_rank) * 100
+      FROM ranks WHERE users.id = ranks.id;
+    `);
+  } catch (err) {
+    console.error('Ranking update failed:', err);
+  }
+}
 // Helper function to upload files to Supabase Storage
 async function uploadToSupabase(file, bucket, folder = '') {
   try {
@@ -592,6 +619,11 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 // Add this under the existing /api/auth/profile routes
 app.get('/api/auth/stats', authMiddleware, async (req, res) => {
   try {
+    const user = await pool.query(
+      'SELECT reputation_score, rank_percentile FROM users WHERE id = $1',
+      [req.user.userId]
+    );
+    
     const userId = req.user.userId;
 
     const classesCount = await pool.query(
@@ -632,7 +664,9 @@ app.get('/api/auth/stats', authMiddleware, async (req, res) => {
         studyGroups: parseInt(groupsCount.rows[0].count),
         itemsSold: parseInt(itemsSold.rows[0].count),
         reviewsReceived: parseInt(reviewsReceived.rows[0].count),
-        avgRating: parseFloat(avgRating.rows[0].avg)
+        avgRating: parseFloat(avgRating.rows[0].avg),
+        reputation: user.rows[0].reputation_score,
+        percentile: parseFloat(user.rows[0].rank_percentile).toFixed(1)
       }
     });
 
@@ -1797,16 +1831,65 @@ app.post('/api/library', authMiddleware, documentUpload.single('file'), async (r
   }
 });
 
+// GET /api/library - Enhanced to show if current user upvoted
 app.get('/api/library', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT lr.*, u.full_name as uploader_name 
+      `SELECT lr.*, u.full_name as uploader_name,
+       (SELECT COUNT(*) FROM library_interactions WHERE resource_id = lr.id AND interaction_type = 'upvote') as current_upvotes,
+       EXISTS(SELECT 1 FROM library_interactions WHERE resource_id = lr.id AND user_id = $1 AND interaction_type = 'upvote') as has_upvoted
       FROM library_resources lr 
       JOIN users u ON lr.uploader_id = u.id 
       WHERE lr.is_public = true 
-      ORDER BY lr.created_at DESC`
+      ORDER BY lr.created_at DESC`,
+      [req.user.userId]
     );
     res.json({ success: true, resources: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/library/:id/upvote - Functional Ranking Trigger
+app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const resource = await pool.query('SELECT uploader_id FROM library_resources WHERE id = $1', [id]);
+    if (resource.rows[0].uploader_id === req.user.userId) {
+      return res.status(400).json({ success: false, message: "You can't upvote your own work!" });
+    }
+
+    const existing = await pool.query(
+      'SELECT id FROM library_interactions WHERE user_id = $1 AND resource_id = $2 AND interaction_type = $3',
+      [req.user.userId, id, 'upvote']
+    );
+
+    if (existing.rows.length > 0) {
+      await pool.query('DELETE FROM library_interactions WHERE id = $1', [existing.rows[0].id]);
+    } else {
+      await pool.query(
+        'INSERT INTO library_interactions (user_id, resource_id, interaction_type) VALUES ($1, $2, $3)',
+        [req.user.userId, id, 'upvote']
+      );
+    }
+
+    // Trigger rank update for the uploader
+    await updateStudentRank(resource.rows[0].uploader_id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/library/:id - Ownership Protected
+app.delete('/api/library/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM library_resources WHERE id = $1 AND uploader_id = $2 RETURNING *',
+      [req.params.id, req.user.userId]
+    );
+    if (result.rowCount === 0) return res.status(403).json({ success: false, message: "Unauthorized" });
+    res.json({ success: true, message: "Resource deleted" });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
