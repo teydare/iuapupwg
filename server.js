@@ -449,19 +449,35 @@ app.post('/api/init-db', async (req, res) => {
 // AUTH ROUTES
 // ============================================
 
+//
+
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, fullName, studentId, institution, phone, isCourseRep } = req.body;
   
   try {
-    const userExists = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (userExists.rows.length > 0) {
+    // 1. Check if Email exists
+    const emailCheck = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (emailCheck.rows.length > 0) {
       return res.status(400).json({ success: false, message: 'Email already registered' });
     }
+
+    // 2. Check if Student ID exists
+    const idCheck = await pool.query('SELECT id FROM users WHERE student_id = $1', [studentId]);
+    if (idCheck.rows.length > 0) {
+      return res.status(400).json({ success: false, message: 'Student ID already registered' });
+    }
+
+    // 3. Check if Phone Number exists
+    const phoneCheck = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    if (phoneCheck.rows.length > 0) {
+      return res.status(400).json({ success: false, message: 'Phone number already linked to an account' });
+    }
     
+    // 4. Create User
     const passwordHash = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (email, password_hash, full_name, student_id, institution, phone, is_course_rep) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, email, full_name, student_id, institution, phone, is_course_rep',
-      [email, passwordHash, fullName, studentId, institution, phone || null, isCourseRep || false]
+      [email, passwordHash, fullName, studentId, institution, phone, isCourseRep || false]
     );
     
     const user = result.rows[0];
@@ -485,6 +501,13 @@ app.post('/api/auth/register', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error("Registration error:", error);
+    // Handle database constraint violations gracefully if race conditions occur
+    if (error.code === '23505') { // Postgres unique violation code
+      if (error.constraint === 'users_email_key') return res.status(400).json({ success: false, message: 'Email already exists' });
+      if (error.constraint === 'users_student_id_key') return res.status(400).json({ success: false, message: 'Student ID already exists' });
+      if (error.constraint === 'users_phone_key') return res.status(400).json({ success: false, message: 'Phone number already exists' });
+    }
     res.status(500).json({ success: false, error: error.message });
   }
 });
