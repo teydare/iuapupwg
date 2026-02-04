@@ -239,6 +239,13 @@ CREATE TABLE IF NOT EXISTS library_resources (
   is_public BOOLEAN DEFAULT true,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS library_bookmarks (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  resource_id INTEGER REFERENCES library_resources(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, resource_id)
+);
 
 -- Marketplace Goods (with images array)
 CREATE TABLE IF NOT EXISTS marketplace_goods (
