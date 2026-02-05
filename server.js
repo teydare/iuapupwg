@@ -246,6 +246,25 @@ CREATE TABLE IF NOT EXISTS library_bookmarks (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, resource_id)
 );
+-- Upvotes for Library
+CREATE TABLE IF NOT EXISTS library_upvotes (
+  id SERIAL PRIMARY KEY,
+  resource_id INTEGER REFERENCES library_resources(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(resource_id, user_id)
+);
+
+-- Library Bounties (Requests)
+CREATE TABLE IF NOT EXISTS library_bounties (
+  id SERIAL PRIMARY KEY,
+  requester_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  course_code VARCHAR(50) NOT NULL,
+  description TEXT,
+  reward_points INTEGER DEFAULT 0,
+  status VARCHAR(20) DEFAULT 'open',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Marketplace Goods (with images array)
 CREATE TABLE IF NOT EXISTS marketplace_goods (
