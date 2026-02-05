@@ -34,9 +34,9 @@ async function updateStudentRank(userId) {
   try {
     // 1. Calculate new reputation score
     const scoreResult = await pool.query(
-      `SELECT (COUNT(li.id) * 10) + (SELECT COUNT(*) * 50 FROM library_resources WHERE uploader_id = $1) as total_score
-       FROM library_interactions li
-       JOIN library_resources lr ON li.resource_id = lr.id
+      `SELECT (COUNT(li.id) * 10) + (SELECT COUNT(*) * 50 FROM y_resources WHERE uploader_id = $1) as total_score
+       FROM y_interactions li
+       JOIN y_resources lr ON li.resource_id = lr.id
        WHERE lr.uploader_id = $1 AND li.interaction_type = 'upvote'`,
       [userId]
     );
@@ -239,6 +239,17 @@ CREATE TABLE IF NOT EXISTS library_resources (
   is_public BOOLEAN DEFAULT true,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- Table for Upvotes
+CREATE TABLE IF NOT EXISTS library_interactions (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  resource_id INTEGER REFERENCES library_resources(id) ON DELETE CASCADE,
+  interaction_type VARCHAR(50) DEFAULT 'upvote',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, resource_id, interaction_type)
+);
+
+-- Table for Bookmarks
 CREATE TABLE IF NOT EXISTS library_bookmarks (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -1835,7 +1846,7 @@ app.delete('/api/class-spaces/:classId/timetable/:entryId', authMiddleware, asyn
 });
 
 // ============================================
-// LIBRARY ROUTES WITH SUPABASE STORAGE
+// Y ROUTES WITH SUPABASE STORAGE
 // ============================================
 
 app.post('/api/library', authMiddleware, documentUpload.single('file'), async (req, res) => {
@@ -1884,19 +1895,6 @@ app.get('/api/library', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/library/bookmarks - Fetch only bookmarked items
-app.get('/api/library/bookmarks', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT resource_id FROM library_bookmarks WHERE user_id = $1`,
-      [req.user.userId]
-    );
-    res.json({ success: true, bookmarks: result.rows });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // POST /api/library/:id/bookmark - Toggle DB Bookmark
 app.post('/api/library/:id/bookmark', authMiddleware, async (req, res) => {
   const { id } = req.params;
@@ -1908,53 +1906,28 @@ app.post('/api/library/:id/bookmark', authMiddleware, async (req, res) => {
 
     if (existing.rows.length > 0) {
       await pool.query('DELETE FROM library_bookmarks WHERE id = $1', [existing.rows[0].id]);
-      res.json({ success: true, action: 'removed' });
+      res.json({ success: true, action: 'removed', is_bookmarked: false });
     } else {
       await pool.query(
         'INSERT INTO library_bookmarks (user_id, resource_id) VALUES ($1, $2)',
         [req.user.userId, id]
       );
-      res.json({ success: true, action: 'added' });
+      res.json({ success: true, action: 'added', is_bookmarked: true });
     }
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST /api/library/:id/upvote - (Keep your existing rank trigger)
-app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
-  const { id } = req.params;
+// DELETE /api/library/:id - Ownership Protected
+app.delete('/api/library/:id', authMiddleware, async (req, res) => {
   try {
-    const resource = await pool.query('SELECT uploader_id FROM library_resources WHERE id = $1', [id]);
-    if (resource.rows.length === 0) return res.status(404).json({ success: false, message: "Not found" });
-    
-    if (resource.rows[0].uploader_id === req.user.userId) {
-      return res.status(400).json({ success: false, message: "You can't upvote your own work!" });
-    }
-
-    const existing = await pool.query(
-      'SELECT id FROM library_interactions WHERE user_id = $1 AND resource_id = $2 AND interaction_type = $3',
-      [req.user.userId, id, 'upvote']
+    const result = await pool.query(
+      'DELETE FROM library_resources WHERE id = $1 AND uploader_id = $2 RETURNING *',
+      [req.params.id, req.user.userId]
     );
-
-    let action = '';
-    if (existing.rows.length > 0) {
-      await pool.query('DELETE FROM library_interactions WHERE id = $1', [existing.rows[0].id]);
-      action = 'removed';
-    } else {
-      await pool.query(
-        'INSERT INTO library_interactions (user_id, resource_id, interaction_type) VALUES ($1, $2, $3)',
-        [req.user.userId, id, 'upvote']
-      );
-      action = 'added';
-    }
-
-    // Update reputation system
-    if (typeof updateStudentRank === 'function') {
-      await updateStudentRank(resource.rows[0].uploader_id);
-    }
-    
-    res.json({ success: true, action });
+    if (result.rowCount === 0) return res.status(403).json({ success: false, message: "Unauthorized" });
+    res.json({ success: true, message: "Resource deleted" });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
