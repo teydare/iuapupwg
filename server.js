@@ -1849,38 +1849,17 @@ app.delete('/api/class-spaces/:classId/timetable/:entryId', authMiddleware, asyn
 // Y ROUTES WITH SUPABASE STORAGE
 // ============================================
 
-app.post('/api/library', authMiddleware, documentUpload.single('file'), async (req, res) => {
-  const { title, description, subject } = req.body;
-  
-  try {
-    // Upload to Supabase Storage
-    const fileUrl = await uploadToSupabase(req.file, 'library-resources', '');
-    
-    const result = await pool.query(
-      'INSERT INTO library_resources (uploader_id, title, description, subject, file_url, file_type, file_size) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [req.user.userId, title, description, subject, fileUrl, req.file.mimetype, req.file.size]
-    );
-    
-    res.json({ success: true, resource: result.rows[0] });
-  } catch (error) {
-    console.error('Error uploading library resource:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // ============================================
-// LIBRARY RESOURCES - UPDATED
+// LIBRARY RESOURCES - FINAL SYNCED VERSION
 // ============================================
 
-// GET /api/library - Includes Upvote and Bookmark status for the logged-in user
+// 1. GET ALL RESOURCES (Includes Upvote/Bookmark status)
 app.get('/api/library', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT lr.*, u.full_name as uploader_name,
-        -- Count upvotes and check if user has upvoted
         (SELECT COUNT(*) FROM library_interactions WHERE resource_id = lr.id AND interaction_type = 'upvote') as upvotes,
         EXISTS(SELECT 1 FROM library_interactions WHERE resource_id = lr.id AND user_id = $1 AND interaction_type = 'upvote') as has_upvoted,
-        -- Check if user has bookmarked
         EXISTS(SELECT 1 FROM library_bookmarks WHERE resource_id = lr.id AND user_id = $1) as is_bookmarked
       FROM library_resources lr 
       JOIN users u ON lr.uploader_id = u.id 
@@ -1895,7 +1874,45 @@ app.get('/api/library', authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/library/:id/bookmark - Toggle DB Bookmark
+// 2. GET USER BOOKMARKS - FIXES THE 404 ERROR
+// Note: This must be ABOVE /api/library/:id routes
+app.get('/api/library/bookmarks', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT resource_id FROM library_bookmarks WHERE user_id = $1`,
+      [req.user.userId]
+    );
+    res.json({ success: true, bookmarks: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 3. UPLOAD RESOURCE - UPDATED TO INCLUDE CATEGORY
+app.post('/api/library', authMiddleware, documentUpload.single('file'), async (req, res) => {
+  const { title, description, subject, category } = req.body;
+  
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    // Upload to Supabase Storage (Bucket: library-resources)
+    const fileUrl = await uploadToSupabase(req.file, 'library-resources', '');
+    
+    const result = await pool.query(
+      `INSERT INTO library_resources 
+       (uploader_id, title, description, subject, category, file_url, file_type, file_size) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.user.userId, title, description, subject, category || 'Lecture Notes', fileUrl, req.file.mimetype, req.file.size]
+    );
+    
+    res.json({ success: true, resource: result.rows[0] });
+  } catch (error) {
+    console.error('Error uploading library resource:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 4. TOGGLE BOOKMARK
 app.post('/api/library/:id/bookmark', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
@@ -1919,7 +1936,106 @@ app.post('/api/library/:id/bookmark', authMiddleware, async (req, res) => {
   }
 });
 
-// DELETE /api/library/:id - Ownership Protected
+// 5. DELETE RESOURCE
+app.delete('/api/library/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM library_resources WHERE id = $1 AND uploader_id = $2 RETURNING *',
+      [req.params.id, req.user.userId]
+    );
+    if (result.rowCount === 0) return res.status(403).json({ success: false, message: "Unauthorized" });
+    res.json({ success: true, message: "Resource deleted" });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});// ============================================
+// LIBRARY RESOURCES - FINAL SYNCED VERSION
+// ============================================
+
+// 1. GET ALL RESOURCES (Includes Upvote/Bookmark status)
+app.get('/api/library', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT lr.*, u.full_name as uploader_name,
+        (SELECT COUNT(*) FROM library_interactions WHERE resource_id = lr.id AND interaction_type = 'upvote') as upvotes,
+        EXISTS(SELECT 1 FROM library_interactions WHERE resource_id = lr.id AND user_id = $1 AND interaction_type = 'upvote') as has_upvoted,
+        EXISTS(SELECT 1 FROM library_bookmarks WHERE resource_id = lr.id AND user_id = $1) as is_bookmarked
+      FROM library_resources lr 
+      JOIN users u ON lr.uploader_id = u.id 
+      WHERE lr.is_public = true 
+      ORDER BY lr.created_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, resources: result.rows });
+  } catch (error) {
+    console.error('Library Fetch Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2. GET USER BOOKMARKS - FIXES THE 404 ERROR
+// Note: This must be ABOVE /api/library/:id routes
+app.get('/api/library/bookmarks', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT resource_id FROM library_bookmarks WHERE user_id = $1`,
+      [req.user.userId]
+    );
+    res.json({ success: true, bookmarks: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 3. UPLOAD RESOURCE - UPDATED TO INCLUDE CATEGORY
+app.post('/api/library', authMiddleware, documentUpload.single('file'), async (req, res) => {
+  const { title, description, subject, category } = req.body;
+  
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    // Upload to Supabase Storage (Bucket: library-resources)
+    const fileUrl = await uploadToSupabase(req.file, 'library-resources', '');
+    
+    const result = await pool.query(
+      `INSERT INTO library_resources 
+       (uploader_id, title, description, subject, category, file_url, file_type, file_size) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.user.userId, title, description, subject, category || 'Lecture Notes', fileUrl, req.file.mimetype, req.file.size]
+    );
+    
+    res.json({ success: true, resource: result.rows[0] });
+  } catch (error) {
+    console.error('Error uploading library resource:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 4. TOGGLE BOOKMARK
+app.post('/api/library/:id/bookmark', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM library_bookmarks WHERE user_id = $1 AND resource_id = $2',
+      [req.user.userId, id]
+    );
+
+    if (existing.rows.length > 0) {
+      await pool.query('DELETE FROM library_bookmarks WHERE id = $1', [existing.rows[0].id]);
+      res.json({ success: true, action: 'removed', is_bookmarked: false });
+    } else {
+      await pool.query(
+        'INSERT INTO library_bookmarks (user_id, resource_id) VALUES ($1, $2)',
+        [req.user.userId, id]
+      );
+      res.json({ success: true, action: 'added', is_bookmarked: true });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 5. DELETE RESOURCE
 app.delete('/api/library/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
