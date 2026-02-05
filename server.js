@@ -656,12 +656,51 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 // Add this under the existing /api/auth/profile routes
 app.get('/api/auth/stats', authMiddleware, async (req, res) => {
   try {
-    const user = await pool.query(
-      'SELECT reputation_score, rank_percentile FROM users WHERE id = $1',
-      [req.user.userId]
-    );
+   const userId = req.user.userId;
+
+    // 1. Calculate Reputation for EVERY user to determine ranking
+    // This query creates a virtual table of all user reputations
+    const rankResult = await pool.query(`
+      WITH UserReputations AS (
+        SELECT 
+          u.id,
+          (
+            (SELECT COUNT(*) FROM library_resources WHERE uploader_id = u.id) * 10 +
+            (SELECT COUNT(*) FROM library_interactions li 
+             JOIN library_resources lr ON li.resource_id = lr.id 
+             WHERE lr.uploader_id = u.id AND li.interaction_type = 'upvote') * 5
+          ) as total_rep
+        FROM users u
+      )
+      SELECT 
+        total_rep,
+        (SELECT COUNT(*) FROM UserReputations) as total_users,
+        (SELECT COUNT(*) FROM UserReputations WHERE total_rep > (SELECT total_rep FROM UserReputations WHERE id = $1)) as users_above
+      FROM UserReputations 
+      WHERE id = $1
+    `, [userId]);
+
+    if (rankResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const { total_rep, total_users, users_above } = rankResult.rows[0];
+
+    // 2. Calculate Real Percentile
+    // Formula: (Number of people below you / Total people) * 100
+    // We want "Top X%", so: (Users Above / Total Users) * 100
+    let percentile = Math.round((parseInt(users_above) / parseInt(total_users)) * 100);
     
-    const userId = req.user.userId;
+    // Ensure it doesn't say "Top 0%"
+    if (percentile === 0) percentile = 1;
+
+    // 3. Get individual counts for the UI display
+    const uploadCount = await pool.query('SELECT COUNT(*) FROM library_resources WHERE uploader_id = $1', [userId]);
+    const upvoteCount = await pool.query(`
+      SELECT COUNT(*) FROM library_interactions li
+      JOIN library_resources lr ON li.resource_id = lr.id
+      WHERE lr.uploader_id = $1 AND li.interaction_type = 'upvote'
+    `, [userId]);
 
     const classesCount = await pool.query(
       'SELECT COUNT(*) FROM class_space_members WHERE user_id = $1',
@@ -702,8 +741,10 @@ app.get('/api/auth/stats', authMiddleware, async (req, res) => {
         itemsSold: parseInt(itemsSold.rows[0].count),
         reviewsReceived: parseInt(reviewsReceived.rows[0].count),
         avgRating: parseFloat(avgRating.rows[0].avg),
-        reputation: user.rows[0].reputation_score,
-        percentile: parseFloat(user.rows[0].rank_percentile).toFixed(1)
+        reputation: parseInt(total_rep),
+        uploads: parseInt(uploadCount.rows[0].count),
+        upvotes: parseInt(upvoteCount.rows[0].count),
+        percentile: percentile
       }
     });
 
