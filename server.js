@@ -1857,13 +1857,20 @@ app.post('/api/library', authMiddleware, documentUpload.single('file'), async (r
   }
 });
 
-// GET /api/library - Enhanced to show if current user upvoted
+// ============================================
+// LIBRARY RESOURCES - UPDATED
+// ============================================
+
+// GET /api/library - Includes Upvote and Bookmark status for the logged-in user
 app.get('/api/library', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT lr.*, u.full_name as uploader_name,
-       (SELECT COUNT(*) FROM library_interactions WHERE resource_id = lr.id AND interaction_type = 'upvote') as current_upvotes,
-       EXISTS(SELECT 1 FROM library_interactions WHERE resource_id = lr.id AND user_id = $1 AND interaction_type = 'upvote') as has_upvoted
+        -- Count upvotes and check if user has upvoted
+        (SELECT COUNT(*) FROM library_interactions WHERE resource_id = lr.id AND interaction_type = 'upvote') as upvotes,
+        EXISTS(SELECT 1 FROM library_interactions WHERE resource_id = lr.id AND user_id = $1 AND interaction_type = 'upvote') as has_upvoted,
+        -- Check if user has bookmarked
+        EXISTS(SELECT 1 FROM library_bookmarks WHERE resource_id = lr.id AND user_id = $1) as is_bookmarked
       FROM library_resources lr 
       JOIN users u ON lr.uploader_id = u.id 
       WHERE lr.is_public = true 
@@ -1872,15 +1879,55 @@ app.get('/api/library', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, resources: result.rows });
   } catch (error) {
+    console.error('Library Fetch Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST /api/library/:id/upvote - Functional Ranking Trigger
+// GET /api/library/bookmarks - Fetch only bookmarked items
+app.get('/api/library/bookmarks', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT resource_id FROM library_bookmarks WHERE user_id = $1`,
+      [req.user.userId]
+    );
+    res.json({ success: true, bookmarks: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/library/:id/bookmark - Toggle DB Bookmark
+app.post('/api/library/:id/bookmark', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM library_bookmarks WHERE user_id = $1 AND resource_id = $2',
+      [req.user.userId, id]
+    );
+
+    if (existing.rows.length > 0) {
+      await pool.query('DELETE FROM library_bookmarks WHERE id = $1', [existing.rows[0].id]);
+      res.json({ success: true, action: 'removed' });
+    } else {
+      await pool.query(
+        'INSERT INTO library_bookmarks (user_id, resource_id) VALUES ($1, $2)',
+        [req.user.userId, id]
+      );
+      res.json({ success: true, action: 'added' });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/library/:id/upvote - (Keep your existing rank trigger)
 app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
     const resource = await pool.query('SELECT uploader_id FROM library_resources WHERE id = $1', [id]);
+    if (resource.rows.length === 0) return res.status(404).json({ success: false, message: "Not found" });
+    
     if (resource.rows[0].uploader_id === req.user.userId) {
       return res.status(400).json({ success: false, message: "You can't upvote your own work!" });
     }
@@ -1890,37 +1937,28 @@ app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
       [req.user.userId, id, 'upvote']
     );
 
+    let action = '';
     if (existing.rows.length > 0) {
       await pool.query('DELETE FROM library_interactions WHERE id = $1', [existing.rows[0].id]);
+      action = 'removed';
     } else {
       await pool.query(
         'INSERT INTO library_interactions (user_id, resource_id, interaction_type) VALUES ($1, $2, $3)',
         [req.user.userId, id, 'upvote']
       );
+      action = 'added';
     }
 
-    // Trigger rank update for the uploader
-    await updateStudentRank(resource.rows[0].uploader_id);
-    res.json({ success: true });
+    // Update reputation system
+    if (typeof updateStudentRank === 'function') {
+      await updateStudentRank(resource.rows[0].uploader_id);
+    }
+    
+    res.json({ success: true, action });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
-// DELETE /api/library/:id - Ownership Protected
-app.delete('/api/library/:id', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'DELETE FROM library_resources WHERE id = $1 AND uploader_id = $2 RETURNING *',
-      [req.params.id, req.user.userId]
-    );
-    if (result.rowCount === 0) return res.status(403).json({ success: false, message: "Unauthorized" });
-    res.json({ success: true, message: "Resource deleted" });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // ============================================
 // STUDY GROUPS ROUTES
 // ============================================
