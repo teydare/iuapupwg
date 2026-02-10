@@ -2089,6 +2089,38 @@ app.delete('/api/library/:id', authMiddleware, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// 6. TOGGLE UPVOTE
+app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Check if upvote exists
+    const existing = await pool.query(
+      "SELECT id FROM library_interactions WHERE user_id = $1 AND resource_id = $2 AND interaction_type = 'upvote'",
+      [req.user.userId, id]
+    );
+
+    if (existing.rows.length > 0) {
+      // If exists, remove it (Toggle OFF)
+      await pool.query(
+        "DELETE FROM library_interactions WHERE id = $1",
+        [existing.rows[0].id]
+      );
+      res.json({ success: true, action: 'removed' });
+    } else {
+      // If not, add it (Toggle ON)
+      await pool.query(
+        "INSERT INTO library_interactions (user_id, resource_id, interaction_type) VALUES ($1, $2, 'upvote')",
+        [req.user.userId, id]
+      );
+      res.json({ success: true, action: 'added' });
+    }
+  } catch (error) {
+    console.error('Upvote error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // ============================================
 // STUDY GROUPS ROUTES
 // ============================================
