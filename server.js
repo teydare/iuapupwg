@@ -144,6 +144,35 @@ const documentUpload = multer({
   }
 });
 
+const libraryUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB for documents
+  fileFilter: (req, file, cb) => {
+    // Allow both PDFs (main file) and images (thumbnail)
+    if (file.fieldname === 'file') {
+      // Main document must be PDF
+      const allowedTypes = /pdf|doc|docx|epub|mobi|txt/;
+      const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+      const mimetype = allowedTypes.test(file.mimetype);
+      if (extname && mimetype) {
+        return cb(null, true);
+      }
+      cb(new Error('Only document files are allowed for main file (PDF, DOC, DOCX, EPUB, MOBI, TXT)'));
+    } else if (file.fieldname === 'thumbnail') {
+      // Thumbnail must be an image
+      const allowedTypes = /jpeg|jpg|png|gif|webp/;
+      const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+      const mimetype = allowedTypes.test(file.mimetype);
+      if (extname && mimetype) {
+        return cb(null, true);
+      }
+      cb(new Error('Only image files are allowed for thumbnail (JPEG, PNG, GIF, WebP)'));
+    } else {
+      cb(new Error('Unexpected field'));
+    }
+  }
+});
+
 // ============================================
 // DATABASE CONNECTION
 // ============================================
@@ -1936,39 +1965,57 @@ const uploadFields = [
   { name: 'thumbnail', maxCount: 1 }
 ];
 
-app.post('/api/library', authMiddleware, imageUpload.fields(uploadFields), async (req, res) => {
+// Replace the existing POST /api/library route with this:
+app.post('/api/library', authMiddleware, libraryUpload.fields([
+  { name: 'file', maxCount: 1 },
+  { name: 'thumbnail', maxCount: 1 }
+]), async (req, res) => {
   const { title, description, subject, category } = req.body;
   
   try {
-    if (!req.files || !req.files['file']) {
-      return res.status(400).json({ success: false, message: 'No document file uploaded' });
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
-    // 1. Upload PDF
-    const pdfFile = req.files['file'][0];
-    const pdfUrl = await uploadToSupabase(pdfFile, 'library-resources', 'docs/');
+    const mainFile = req.files.file[0];
+    const thumbnailFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
 
-    // 2. Upload Thumbnail (Optional)
+    // Upload main file to Supabase Storage (Bucket: library-resources)
+    const fileUrl = await uploadToSupabase(mainFile, 'library-resources', 'documents/');
+    
+    // Upload thumbnail if provided
     let thumbnailUrl = null;
-    if (req.files['thumbnail']) {
-      const imgFile = req.files['thumbnail'][0];
-      thumbnailUrl = await uploadToSupabase(imgFile, 'library-resources', 'thumbs/');
+    if (thumbnailFile) {
+      thumbnailUrl = await uploadToSupabase(thumbnailFile, 'library-resources', 'thumbnails/');
     }
-
-    // 3. Insert into DB
+    
     const result = await pool.query(
       `INSERT INTO library_resources 
        (uploader_id, title, description, subject, category, file_url, thumbnail_url, file_type, file_size) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [req.user.userId, title, description, subject, category || 'Lecture Notes', pdfUrl, thumbnailUrl, pdfFile.mimetype, pdfFile.size]
+      [
+        req.user.userId, 
+        title, 
+        description, 
+        subject, 
+        category || 'Lecture Notes', 
+        fileUrl, 
+        thumbnailUrl,
+        mainFile.mimetype, 
+        mainFile.size
+      ]
     );
+    
+    // Update user reputation
+    await updateStudentRank(req.user.userId);
     
     res.json({ success: true, resource: result.rows[0] });
   } catch (error) {
-    console.error('Upload Error:', error);
+    console.error('Error uploading library resource:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
 
 // Handle Upvote/Downvote logic
 app.post('/api/library/:id/vote', authMiddleware, async (req, res) => {
