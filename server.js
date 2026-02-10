@@ -1930,25 +1930,122 @@ app.get('/api/library/bookmarks', authMiddleware, async (req, res) => {
 });
 
 // 3. UPLOAD RESOURCE - UPDATED TO INCLUDE CATEGORY
-app.post('/api/library', authMiddleware, documentUpload.single('file'), async (req, res) => {
+// UPDATED: Upload Resource (Supports PDF + Optional Thumbnail)
+const uploadFields = [
+  { name: 'file', maxCount: 1 }, 
+  { name: 'thumbnail', maxCount: 1 }
+];
+
+app.post('/api/library', authMiddleware, imageUpload.fields(uploadFields), async (req, res) => {
   const { title, description, subject, category } = req.body;
   
   try {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+    if (!req.files || !req.files['file']) {
+      return res.status(400).json({ success: false, message: 'No document file uploaded' });
+    }
 
-    // Upload to Supabase Storage (Bucket: library-resources)
-    const fileUrl = await uploadToSupabase(req.file, 'library-resources', '');
-    
+    // 1. Upload PDF
+    const pdfFile = req.files['file'][0];
+    const pdfUrl = await uploadToSupabase(pdfFile, 'library-resources', 'docs/');
+
+    // 2. Upload Thumbnail (Optional)
+    let thumbnailUrl = null;
+    if (req.files['thumbnail']) {
+      const imgFile = req.files['thumbnail'][0];
+      thumbnailUrl = await uploadToSupabase(imgFile, 'library-resources', 'thumbs/');
+    }
+
+    // 3. Insert into DB
     const result = await pool.query(
       `INSERT INTO library_resources 
-       (uploader_id, title, description, subject, category, file_url, file_type, file_size) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [req.user.userId, title, description, subject, category || 'Lecture Notes', fileUrl, req.file.mimetype, req.file.size]
+       (uploader_id, title, description, subject, category, file_url, thumbnail_url, file_type, file_size) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [req.user.userId, title, description, subject, category || 'Lecture Notes', pdfUrl, thumbnailUrl, pdfFile.mimetype, pdfFile.size]
     );
     
     res.json({ success: true, resource: result.rows[0] });
   } catch (error) {
-    console.error('Error uploading library resource:', error);
+    console.error('Upload Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Handle Upvote/Downvote logic
+app.post('/api/library/:id/vote', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { type } = req.body; // 'upvote' or 'downvote'
+
+  try {
+    // Check existing interaction
+    const existing = await pool.query(
+      'SELECT id, interaction_type FROM library_interactions WHERE user_id = $1 AND resource_id = $2',
+      [req.user.userId, id]
+    );
+
+    if (existing.rows.length > 0) {
+      const currentType = existing.rows[0].interaction_type;
+
+      if (currentType === type) {
+        // Toggle OFF (remove vote)
+        await pool.query('DELETE FROM library_interactions WHERE id = $1', [existing.rows[0].id]);
+        return res.json({ success: true, action: 'removed' });
+      } else {
+        // Switch Vote (Up -> Down or Down -> Up)
+        await pool.query(
+          'UPDATE library_interactions SET interaction_type = $1 WHERE id = $2',
+          [type, existing.rows[0].id]
+        );
+        return res.json({ success: true, action: 'switched' });
+      }
+    } else {
+      // Create New Vote
+      await pool.query(
+        'INSERT INTO library_interactions (user_id, resource_id, interaction_type) VALUES ($1, $2, $3)',
+        [req.user.userId, id, type]
+      );
+      return res.json({ success: true, action: 'added' });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get Comments for a Resource
+app.get('/api/library/:id/comments', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT c.*, u.full_name, u.profile_image_url,
+      (SELECT COUNT(*) FROM library_comment_likes WHERE comment_id = c.id) as likes,
+      EXISTS(SELECT 1 FROM library_comment_likes WHERE comment_id = c.id AND user_id = $1) as has_liked
+      FROM library_comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.resource_id = $2
+      ORDER BY c.created_at ASC
+    `, [req.user.userId, req.params.id]);
+
+    // Helper to nest comments (handled on frontend usually, but flat list is fine for now)
+    res.json({ success: true, comments: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Post a Comment
+app.post('/api/library/:id/comments', authMiddleware, async (req, res) => {
+  const { content, parentId } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO library_comments (resource_id, user_id, content, parent_id) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.params.id, req.user.userId, content, parentId || null]
+    );
+    // Return with user info for immediate display
+    const newComment = await pool.query(
+      `SELECT c.*, u.full_name, u.profile_image_url, 0 as likes, false as has_liked
+       FROM library_comments c JOIN users u ON c.user_id = u.id WHERE c.id = $1`,
+      [result.rows[0].id]
+    );
+    res.json({ success: true, comment: newComment.rows[0] });
+  } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
