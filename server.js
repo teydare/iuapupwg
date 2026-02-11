@@ -2265,6 +2265,49 @@ app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// ============================================
+// ADD THIS ROUTE TO YOUR server.js FILE
+// Place it right after the upvote route (around line 2267)
+// ============================================
+
+app.post('/api/library/:id/downvote', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Check if downvote exists
+    const existing = await pool.query(
+      "SELECT id FROM library_interactions WHERE user_id = $1 AND resource_id = $2 AND interaction_type = 'downvote'",
+      [req.user.userId, id]
+    );
+
+    if (existing.rows.length > 0) {
+      // If exists, remove it (Toggle OFF)
+      await pool.query(
+        "DELETE FROM library_interactions WHERE id = $1",
+        [existing.rows[0].id]
+      );
+      res.json({ success: true, action: 'removed' });
+    } else {
+      // If not, add it (Toggle ON)
+      // First, remove any existing upvote to prevent both
+      await pool.query(
+        "DELETE FROM library_interactions WHERE user_id = $1 AND resource_id = $2 AND interaction_type = 'upvote'",
+        [req.user.userId, id]
+      );
+      
+      await pool.query(
+        "INSERT INTO library_interactions (user_id, resource_id, interaction_type) VALUES ($1, $2, 'downvote')",
+        [req.user.userId, id]
+      );
+      res.json({ success: true, action: 'added' });
+    }
+  } catch (error) {
+    console.error('Downvote error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ============================================
 // STUDY GROUPS ROUTES
 // ============================================
