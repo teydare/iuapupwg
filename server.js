@@ -22,7 +22,7 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
-const { addPDFParsingRoute, upload } = require('./pdf-timetable-parser');
+const { addPDFParsingRoute, } = require('./pdf-timetable-parser');
 
 addPDFParsingRoute(app, pool);
 // ============================================
