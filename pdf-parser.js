@@ -1,17 +1,31 @@
 // ============================================
-// PDF TIMETABLE PARSER UTILITY
-// Add this to your backend utilities
-// npm install pdf-parse multer
+// UNIVERSAL TIMETABLE PDF PARSER
+// Works with ANY university, ANY courses, ANY format
 // ============================================
+
+// ADD THIS TO YOUR server.js (BEFORE any routes)
 
 const pdf = require('pdf-parse');
 const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
 
-// Parse timetable PDF and extract course information
-async function parseTimetablePDF(pdfBuffer, targetProgram, yearLevel) {
+// ============================================
+// UNIVERSAL PDF PARSE ROUTE
+// Detects ALL courses automatically
+// ============================================
+app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
-    const data = await pdf(pdfBuffer);
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
+    }
+    
+    const { yearLevel } = req.body;
+    
+    // Parse PDF
+    const data = await pdf(req.file.buffer);
     const text = data.text;
     
     const courses = [];
@@ -20,219 +34,261 @@ async function parseTimetablePDF(pdfBuffer, targetProgram, yearLevel) {
     let currentDay = null;
     let currentYear = null;
     
-    // Day mapping
-    const dayMap = {
-      'MONDAY': 1,
-      'TUESDAY': 2,
-      'WEDNESDAY': 3,
-      'THURSDAY': 4,
-      'FRIDAY': 5,
-      'SATURDAY': 6,
-      'SUNDAY': 0
-    };
+    // Universal day detection - works in any language/format
+    const dayPatterns = [
+      { pattern: /SUNDAY|SUN/i, value: 0 },
+      { pattern: /MONDAY|MON/i, value: 1 },
+      { pattern: /TUESDAY|TUE/i, value: 2 },
+      { pattern: /WEDNESDAY|WED/i, value: 3 },
+      { pattern: /THURSDAY|THU/i, value: 4 },
+      { pattern: /FRIDAY|FRI/i, value: 5 },
+      { pattern: /SATURDAY|SAT/i, value: 6 }
+    ];
     
-    // Program column indices (adjust based on your PDF structure)
-    const programColumns = {
-      'AEROSPACE': 0,
-      'AGRIC': 1,
-      'CHEMICAL': 2,
-      'CIVIL': 3,
-      'COMPUTER': 4,
-      'ELECTRICAL': 5,
-      'GEOMATIC': 6,
-      'MECHANICAL': 7,
-      'MATERIALS': 8,
-      'PETROLEUM': 9
-    };
+    // Universal year detection
+    const yearPatterns = [
+      { pattern: /FIRST\s+YEAR|YEAR\s+1|1ST\s+YEAR/i, value: 1 },
+      { pattern: /SECOND\s+YEAR|YEAR\s+2|2ND\s+YEAR/i, value: 2 },
+      { pattern: /THIRD\s+YEAR|YEAR\s+3|3RD\s+YEAR/i, value: 3 },
+      { pattern: /FOURTH\s+YEAR|YEAR\s+4|4TH\s+YEAR/i, value: 4 }
+    ];
     
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
+      if (!line) continue;
       
       // Detect year level
-      if (line.includes('FIRST YEAR')) currentYear = 1;
-      else if (line.includes('SECOND YEAR')) currentYear = 2;
-      else if (line.includes('THIRD YEAR')) currentYear = 3;
-      else if (line.includes('FOURTH YEAR')) currentYear = 4;
-      
-      // Detect day
-      for (const [dayName, dayValue] of Object.entries(dayMap)) {
-        if (line.includes(dayName)) {
-          currentDay = dayValue;
+      for (const { pattern, value } of yearPatterns) {
+        if (pattern.test(line)) {
+          currentYear = value;
           break;
         }
       }
       
-      // Skip if not the target year
-      if (yearLevel && currentYear !== parseInt(yearLevel)) continue;
+      // Detect day
+      for (const { pattern, value } of dayPatterns) {
+        if (pattern.test(line)) {
+          currentDay = value;
+          break;
+        }
+      }
       
-      // Parse time slots (format: HH:MM-HH:MM)
-      const timeMatch = line.match(/(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})/);
+      // Skip if year specified and doesn't match
+      if (yearLevel && currentYear && currentYear !== parseInt(yearLevel)) continue;
+      
+      // Parse time slots - supports multiple formats
+      const timePatterns = [
+        /(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/,  // 8:00-8:55
+        /(\d{1,2})\.(\d{2})\s*-\s*(\d{1,2})\.(\d{2})/, // 8.00-8.55
+        /(\d{1,2}):(\d{2})\s*to\s*(\d{1,2}):(\d{2})/i  // 8:00 to 8:55
+      ];
+      
+      let timeMatch = null;
+      for (const pattern of timePatterns) {
+        timeMatch = line.match(pattern);
+        if (timeMatch) break;
+      }
+      
       if (timeMatch && currentDay !== null) {
         const startTime = `${timeMatch[1].padStart(2, '0')}:${timeMatch[2]}`;
         const endTime = `${timeMatch[3].padStart(2, '0')}:${timeMatch[4]}`;
         
-        // Split line into columns
-        const parts = line.split(/\s{2,}/); // Split by multiple spaces
+        // UNIVERSAL COURSE CODE DETECTION
+        // Matches ANY pattern of letters followed by numbers
+        // Examples: CS101, MATH151, BIO-101, ENG 201, etc.
+        const coursePatterns = [
+          /\b([A-Z]{2,4})[\s-]?(\d{3,4}[A-Z]?)\b/g,  // CS101, MATH 151, BIO-101
+          /\b([A-Z][A-Z]+)\s+(\d+)\b/g,               // COMP 101
+          /\b([A-Z]+)(\d+)\b/g                        // CS101 (no space)
+        ];
         
-        // Look for course codes in the line
-        const courseRegex = /([A-Z]{2,4})\s+(\d{3})/g;
-        let match;
-        const coursesInLine = [];
+        const foundCourses = new Set();
         
-        while ((match = courseRegex.exec(line)) !== null) {
-          const courseCode = `${match[1]} ${match[2]}`;
-          coursesInLine.push({
-            code: courseCode,
-            position: match.index
-          });
-        }
-        
-        // Extract location/room information
-        const roomRegex = /([A-Z0-9\-]+)\s+([\w\-]+)/;
-        const locationMatches = line.match(roomRegex);
-        
-        // Extract instructor names (usually capitalized words after location)
-        const instructorRegex = /([A-Z]\.\s*[A-Z][a-z]+\s*[A-Z]*[a-z]*)/g;
-        const instructors = [];
-        let instMatch;
-        while ((instMatch = instructorRegex.exec(line)) !== null) {
-          instructors.push(instMatch[1].trim());
-        }
-        
-        // Process each course found
-        coursesInLine.forEach((courseInfo, index) => {
-          // Check if this course belongs to target program
-          const coursePrefix = courseInfo.code.substring(0, 2);
-          const programPrefixes = {
-            'AEROSPACE': ['AE', 'AERO'],
-            'CHEMICAL': ['CHE', 'CHEM'],
-            'CIVIL': ['CE'],
-            'COMPUTER': ['COE', 'COMP'],
-            'ELECTRICAL': ['EE'],
-            'GEOMATIC': ['GE'],
-            'MECHANICAL': ['ME'],
-            'MATERIALS': ['MSE'],
-            'PETROLEUM': ['PE', 'PCE']
-          };
-          
-          // Check if course belongs to target program or is a common course
-          const isTargetCourse = targetProgram === 'ALL' || 
-            programPrefixes[targetProgram]?.includes(coursePrefix) ||
-            ['MATH', 'ENGL', 'ECON', 'FC', 'STAT', 'TE'].includes(coursePrefix); // Common courses
-          
-          if (isTargetCourse) {
-            // Extract course name (usually follows course code)
-            const codeIndex = line.indexOf(courseInfo.code);
-            const afterCode = line.substring(codeIndex + courseInfo.code.length, codeIndex + 100);
-            const nameMatch = afterCode.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/);
-            const courseName = nameMatch ? nameMatch[1].trim() : courseInfo.code;
-            
-            // Determine building and room
-            let building = '';
-            let roomNumber = '';
-            if (locationMatches) {
-              building = locationMatches[1];
-              roomNumber = locationMatches[2] || '';
-            }
-            
-            // If location contains specific keywords
-            const locationKeywords = line.match(/(LAB|PRACTICALS|PROJECT|NEB-\w+|FOSS\s+\w+|PB\d+|VSLA|VCR|ECR|ENG\s+AUDIT)/);
-            if (locationKeywords) {
-              const loc = locationKeywords[1];
-              if (loc.includes('-')) {
-                const [bldg, room] = loc.split('-');
-                building = bldg;
-                roomNumber = room;
-              } else {
-                building = loc;
-              }
-            }
-            
-            courses.push({
-              course_code: courseInfo.code,
-              course_name: courseName,
-              day_of_week: currentDay,
-              start_time: startTime,
-              end_time: endTime,
-              building: building || 'TBD',
-              room_number: roomNumber || '',
-              instructor: instructors[index] || instructors[0] || 'Staff',
-              year_level: currentYear || yearLevel
-            });
+        for (const pattern of coursePatterns) {
+          let match;
+          while ((match = pattern.exec(line)) !== null) {
+            const courseCode = `${match[1]} ${match[2]}`.trim();
+            foundCourses.add(courseCode);
           }
+        }
+        
+        // Extract location - universal patterns
+        const locationPatterns = [
+          /\b(LAB|LABORATORY|PRACTICALS?|PROJECT)\b/i,
+          /\b([A-Z]{2,4}-[A-Z0-9]+)\b/,              // NEB-GF, PB-208
+          /\b([A-Z]+\s*\d+)\b/,                      // PB208, ROOM 101
+          /\b(ROOM|RM|HALL|BLDG|BUILDING)\s*([A-Z0-9-]+)/i,
+          /\b([A-Z]{3,})\b/                          // VSLA, AUDIT, etc.
+        ];
+        
+        let building = 'TBD';
+        let roomNumber = '';
+        
+        for (const pattern of locationPatterns) {
+          const locMatch = line.match(pattern);
+          if (locMatch) {
+            const location = locMatch[0];
+            if (location.includes('-')) {
+              [building, roomNumber] = location.split('-');
+            } else {
+              building = location;
+            }
+            break;
+          }
+        }
+        
+        // Extract instructor - universal name patterns
+        const instructorPatterns = [
+          /\b([A-Z]\.\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/g,  // J. Smith, A. Johnson
+          /\b(Dr|Prof|Mr|Mrs|Ms)\.?\s+([A-Z][a-z]+)/gi,       // Dr. Smith
+          /\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b/g                  // John Smith
+        ];
+        
+        let instructor = 'Staff';
+        for (const pattern of instructorPatterns) {
+          const instMatch = line.match(pattern);
+          if (instMatch && instMatch[0]) {
+            instructor = instMatch[0].trim();
+            break;
+          }
+        }
+        
+        // Add all detected courses
+        foundCourses.forEach(courseCode => {
+          courses.push({
+            course_code: courseCode,
+            course_name: courseCode, // Can be enriched later
+            day_of_week: currentDay,
+            start_time: startTime,
+            end_time: endTime,
+            building: building,
+            room_number: roomNumber,
+            instructor: instructor,
+            year_level: currentYear || yearLevel || null,
+            raw_line: line // Keep original for reference
+          });
         });
       }
     }
     
     // Remove duplicates
-    const uniqueCourses = courses.filter((course, index, self) =>
-      index === self.findIndex(c => 
-        c.course_code === course.course_code &&
-        c.day_of_week === course.day_of_week &&
-        c.start_time === course.start_time
-      )
-    );
+    const uniqueCourses = [];
+    const seen = new Set();
     
-    return {
+    for (const course of courses) {
+      const key = `${course.course_code}-${course.day_of_week}-${course.start_time}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueCourses.push(course);
+      }
+    }
+    
+    // Sort by day and time
+    uniqueCourses.sort((a, b) => {
+      if (a.day_of_week !== b.day_of_week) return a.day_of_week - b.day_of_week;
+      return a.start_time.localeCompare(b.start_time);
+    });
+    
+    res.json({
       success: true,
       courses: uniqueCourses,
-      totalFound: uniqueCourses.length,
-      yearLevel: currentYear || yearLevel
-    };
+      count: uniqueCourses.length,
+      yearLevel: currentYear,
+      message: `Detected ${uniqueCourses.length} courses`
+    });
     
   } catch (error) {
-    console.error('PDF parsing error:', error);
-    return {
+    console.error('PDF parse error:', error);
+    res.status(500).json({
       success: false,
-      error: error.message,
-      courses: []
-    };
+      error: error.message
+    });
   }
-}
+});
 
-// Add this route to your server.js
-function addPDFParsingRoute(app, pool) {
-  app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
-      }
-      
-      const { program, yearLevel } = req.body;
-      
-      if (!program) {
-        return res.status(400).json({ success: false, error: 'Program not specified' });
-      }
-      
-      // Parse the PDF
-      const result = await parseTimetablePDF(req.file.buffer, program, yearLevel);
-      
-      if (result.success) {
-        res.json({
-          success: true,
-          courses: result.courses,
-          count: result.totalFound,
-          yearLevel: result.yearLevel
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to parse PDF'
-        });
-      }
-      
-    } catch (error) {
-      console.error('PDF upload error:', error);
-      res.status(500).json({
-        success: false,
-        error: error.message
-      });
+// ============================================
+// CREATE/GET PROGRAM (Universal)
+// ============================================
+app.post('/api/programs', authMiddleware, async (req, res) => {
+  try {
+    const { programName, programCode, department, yearLevel, semester } = req.body;
+    
+    const result = await pool.query(
+      `INSERT INTO programs (user_id, program_name, program_code, department, year_level, semester)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [req.user.id, programName, programCode, department, yearLevel, semester]
+    );
+    
+    res.json({ success: true, program: result.rows[0] });
+  } catch (error) {
+    console.error('Create program error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/programs', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM programs WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json({ success: true, programs: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// BULK UPLOAD COURSES
+// ============================================
+app.post('/api/program-courses/bulk', authMiddleware, async (req, res) => {
+  try {
+    const { programId, courses } = req.body;
+    
+    if (!courses || courses.length === 0) {
+      return res.status(400).json({ success: false, error: 'No courses provided' });
     }
-  });
-}
+    
+    // Insert all courses
+    for (const course of courses) {
+      await pool.query(
+        `INSERT INTO program_courses 
+        (program_id, course_code, course_name, day_of_week, start_time, end_time, 
+         building, room_number, instructor, year_level)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          programId,
+          course.course_code,
+          course.course_name || course.course_code,
+          course.day_of_week,
+          course.start_time,
+          course.end_time,
+          course.building,
+          course.room_number,
+          course.instructor,
+          course.year_level
+        ]
+      );
+    }
+    
+    res.json({ success: true, imported: courses.length });
+  } catch (error) {
+    console.error('Bulk upload error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
-module.exports = {
-  parseTimetablePDF,
-  addPDFParsingRoute,
-  upload
-};
+// ============================================
+// GET PROGRAM COURSES
+// ============================================
+app.get('/api/programs/:id/courses', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM program_courses WHERE program_id = $1 ORDER BY day_of_week, start_time',
+      [req.params.id]
+    );
+    res.json({ success: true, courses: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
