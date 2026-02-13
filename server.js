@@ -3464,6 +3464,118 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
     console.error('PDF parse error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+});// ============================================
+// UNIVERSAL PDF PARSER LOGIC (FIXED)
+// ============================================
+
+app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
+  try {
+    if (!req.file) {
+      console.error("PDF Parser: No file received");
+      return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
+    }
+
+    console.log(`PDF Parser: Processing file size: ${req.file.size} bytes`);
+
+    // 1. Extract raw text
+    let data;
+    try {
+      data = await pdf(req.file.buffer);
+    } catch (parseError) {
+      console.error("PDF Parsing Failed:", parseError);
+      return res.status(400).json({ success: false, error: 'Corrupt or unreadable PDF' });
+    }
+
+    const text = data.text;
+    const lines = text.split('\n');
+    const detectedCourses = [];
+    
+    // Context to hold the "current" day/time as we scroll down the document
+    let currentContext = { day: null, time: null };
+
+    // Regex Patterns
+    const patterns = {
+      // Matches: Mon, Monday, Tue, Tuesday...
+      days: /(mon|tue|wed|thu|fri|sat|sun)[a-z]*/i,
+      // Matches: 8:00, 08:30, 8.30, 14:00, 2pm
+      time: /\b((?:0?[1-9]|1[0-2])[:.][0-5][0-9]\s*(?:am|pm)?|1[3-9][:.][0-5][0-9])\b/i,
+      // Matches: CS101, MATH-151, ENG 202 (2-4 letters, optional space/dash, 3-4 numbers)
+      courseCode: /\b([A-Z]{2,5})[\s-]?(\d{3,4}[A-Z]?)\b/i
+    };
+
+    const dayMap = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 0 };
+
+    // 2. Scan Line by Line
+    lines.forEach((line, index) => {
+      const cleanLine = line.trim();
+      if (!cleanLine) return;
+
+      // A. Detect Day (Update Context)
+      // We use cleanLine.toLowerCase() to make matching easier
+      const dayMatch = cleanLine.match(patterns.days);
+      if (dayMatch) {
+        const d = dayMatch[0].toLowerCase().substring(0, 3);
+        if (dayMap[d] !== undefined) {
+          currentContext.day = dayMap[d];
+        }
+      }
+
+      // B. Detect Time (Update Context)
+      // Check for two times in a line (e.g., "8:00 - 10:00")
+      const timeMatches = cleanLine.match(new RegExp(patterns.time, 'gi'));
+      if (timeMatches && timeMatches.length >= 2) {
+        currentContext.time = { start: timeMatches[0], end: timeMatches[1] };
+      }
+
+      // C. Detect Course Codes (The core extraction)
+      // We use a fresh regex with 'g' flag for every line to avoid state issues
+      const codeRegex = new RegExp(patterns.courseCode, 'gi');
+      let match;
+      
+      while ((match = codeRegex.exec(cleanLine)) !== null) {
+        const fullCode = match[0].toUpperCase(); 
+        
+        // Use current context, or fallbacks if context is missing
+        const effectiveDay = currentContext.day !== null ? currentContext.day : 1; // Default to Monday
+        const effectiveStart = currentContext.time ? currentContext.time.start : '09:00';
+        const effectiveEnd = currentContext.time ? currentContext.time.end : '11:00';
+
+        // Add to list
+        detectedCourses.push({
+          id: `${fullCode}-${index}-${Date.now()}`, // Unique ID for React Key
+          course_code: fullCode,
+          course_name: fullCode, // User can rename in UI
+          day_of_week: effectiveDay,
+          start_time: effectiveStart,
+          end_time: effectiveEnd,
+          location: 'TBD'
+        });
+      }
+    });
+
+    // 3. Deduplicate (Remove exact duplicates of Code + Day + Time)
+    const uniqueCourses = [];
+    const seen = new Set();
+
+    detectedCourses.forEach(c => {
+      const key = `${c.course_code}-${c.day_of_week}-${c.start_time}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueCourses.push(c);
+      }
+    });
+
+    res.json({
+      success: true,
+      courses: uniqueCourses,
+      count: uniqueCourses.length,
+      message: `Scanned document. Found ${uniqueCourses.length} potential courses.`
+    });
+
+  } catch (error) {
+    console.error('PDF Parser Critical Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // ... rest of server.js ...
