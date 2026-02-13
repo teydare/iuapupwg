@@ -10,8 +10,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
-const pdf = require('pdf-parse');
-const path = require('path');
+const pdfParser = require('pdf-parse'); 
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -3380,183 +3379,74 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
       return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
     }
 
-    // 1. Extract raw text
-    const data = await pdf(req.file.buffer);
-    const text = data.text;
-    
-    // 2. Universal Regex Patterns
-    const patterns = {
-      // Matches: CS101, CS-101, CS 101, MATH 1234
-      courseCode: /\b([A-Z]{2,5})[\s-]?(\d{3,4}[A-Z]?)\b/gi,
-      // Matches: 8:00, 08:00, 8.00, 8am, 8:00 AM
-      time: /\b((?:0?[1-9]|1[0-2])[:.][0-5][0-9]\s*(?:am|pm)?|1[3-9][:.][0-5][0-9])\b/gi,
-      // Days
-      days: /(mon|tue|wed|thu|fri|sat|sun)[a-z]*/gi
-    };
-
-    const lines = text.split('\n');
-    const detectedCourses = [];
-    let currentContext = { day: null, time: null };
-
-    // 3. Heuristic Parsing Loop
-    lines.forEach((line, index) => {
-      const cleanLine = line.trim();
-      if (!cleanLine) return;
-
-      // A. Detect Day Context (Update current context if a day is found on a line)
-      const dayMatch = cleanLine.match(patterns.days);
-      if (dayMatch) {
-        const dayMap = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 0 };
-        const d = dayMatch[0].toLowerCase().substring(0, 3);
-        if (dayMap[d] !== undefined) currentContext.day = dayMap[d];
-      }
-
-      // B. Detect Time Context
-      const timeMatches = cleanLine.match(patterns.time);
-      if (timeMatches && timeMatches.length >= 2) {
-        // If line has "8:00 - 10:00", update context
-        currentContext.time = { start: timeMatches[0], end: timeMatches[1] };
-      }
-
-      // C. Detect Course Codes
-      let match;
-      while ((match = patterns.courseCode.exec(cleanLine)) !== null) {
-        const fullCode = match[0].toUpperCase(); // e.g., "COE 153"
-        
-        // Intelligent Context Lookup
-        // If this line doesn't have time/day, look at previous 5 lines (common in grid PDFs)
-        let effectiveDay = currentContext.day;
-        let effectiveTime = currentContext.time;
-
-        if (effectiveDay === null) {
-            // Fallback: Default to Monday if undetected, User will fix in UI
-            effectiveDay = 1; 
-        }
-
-        detectedCourses.push({
-          id: Math.random().toString(36).substr(2, 9),
-          course_code: fullCode,
-          course_name: fullCode, // User can edit
-          day_of_week: effectiveDay,
-          start_time: effectiveTime ? effectiveTime.start : '08:00', // Default start
-          end_time: effectiveTime ? effectiveTime.end : '10:00',     // Default end
-          confidence: effectiveTime ? 'high' : 'low', // UI hint
-          instructor: 'Check Timetable', // Placeholder
-          location: 'TBD'
-        });
-      }
-    });
-
-    // 4. Deduplicate results
-    const uniqueCourses = Array.from(new Set(detectedCourses.map(c => c.course_code)))
-      .map(code => {
-        return detectedCourses.find(c => c.course_code === code);
-      });
-
-    res.json({
-      success: true,
-      courses: uniqueCourses,
-      count: uniqueCourses.length,
-      message: `Scanned document. Found ${uniqueCourses.length} potential courses.`
-    });
-
-  } catch (error) {
-    console.error('PDF parse error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});// ============================================
-// UNIVERSAL PDF PARSER LOGIC (FIXED)
-// ============================================
-
-app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
-  try {
-    if (!req.file) {
-      console.error("PDF Parser: No file received");
-      return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
-    }
-
-    console.log(`PDF Parser: Processing file size: ${req.file.size} bytes`);
-
-    // 1. Extract raw text
+    // 1. Extract raw text from the PDF buffer
     let data;
     try {
-      data = await pdf(req.file.buffer);
+      // Using the renamed pdfParser function here
+      data = await pdfParser(req.file.buffer);
     } catch (parseError) {
-      console.error("PDF Parsing Failed:", parseError);
-      return res.status(400).json({ success: false, error: 'Corrupt or unreadable PDF' });
+      console.error("PDF Extraction Error:", parseError);
+      return res.status(500).json({ success: false, error: 'Could not read PDF content' });
     }
 
     const text = data.text;
     const lines = text.split('\n');
     const detectedCourses = [];
     
-    // Context to hold the "current" day/time as we scroll down the document
-    let currentContext = { day: null, time: null };
+    // Tracking state as we scan the document
+    let currentDay = 1; // Default to Monday
+    let currentTime = { start: '09:00', end: '11:00' };
 
     // Regex Patterns
     const patterns = {
-      // Matches: Mon, Monday, Tue, Tuesday...
-      days: /(mon|tue|wed|thu|fri|sat|sun)[a-z]*/i,
-      // Matches: 8:00, 08:30, 8.30, 14:00, 2pm
+      days: /(monday|tuesday|wednesday|thursday|friday|sat|sun|mon|tue|wed|thu|fri)/i,
       time: /\b((?:0?[1-9]|1[0-2])[:.][0-5][0-9]\s*(?:am|pm)?|1[3-9][:.][0-5][0-9])\b/i,
-      // Matches: CS101, MATH-151, ENG 202 (2-4 letters, optional space/dash, 3-4 numbers)
-      courseCode: /\b([A-Z]{2,5})[\s-]?(\d{3,4}[A-Z]?)\b/i
+      // Matches codes like CS101, MATH 202, COE-301
+      courseCode: /\b([A-Z]{2,5})[\s-]?(\d{3,4}[A-Z]?)\b/
     };
 
     const dayMap = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 0 };
 
-    // 2. Scan Line by Line
+    // 2. Scan line by line to build context
     lines.forEach((line, index) => {
       const cleanLine = line.trim();
       if (!cleanLine) return;
 
-      // A. Detect Day (Update Context)
-      // We use cleanLine.toLowerCase() to make matching easier
+      // Detect Day in this line
       const dayMatch = cleanLine.match(patterns.days);
       if (dayMatch) {
         const d = dayMatch[0].toLowerCase().substring(0, 3);
-        if (dayMap[d] !== undefined) {
-          currentContext.day = dayMap[d];
-        }
+        if (dayMap[d] !== undefined) currentDay = dayMap[d];
       }
 
-      // B. Detect Time (Update Context)
-      // Check for two times in a line (e.g., "8:00 - 10:00")
+      // Detect Times in this line
       const timeMatches = cleanLine.match(new RegExp(patterns.time, 'gi'));
       if (timeMatches && timeMatches.length >= 2) {
-        currentContext.time = { start: timeMatches[0], end: timeMatches[1] };
+        currentTime = { start: timeMatches[0], end: timeMatches[1] };
       }
 
-      // C. Detect Course Codes (The core extraction)
-      // We use a fresh regex with 'g' flag for every line to avoid state issues
+      // Detect Course Codes (The actual data extraction)
+      // We use a fresh regex instance per line to avoid 'g' flag state issues
       const codeRegex = new RegExp(patterns.courseCode, 'gi');
       let match;
-      
       while ((match = codeRegex.exec(cleanLine)) !== null) {
-        const fullCode = match[0].toUpperCase(); 
+        const fullCode = match[0].toUpperCase();
         
-        // Use current context, or fallbacks if context is missing
-        const effectiveDay = currentContext.day !== null ? currentContext.day : 1; // Default to Monday
-        const effectiveStart = currentContext.time ? currentContext.time.start : '09:00';
-        const effectiveEnd = currentContext.time ? currentContext.time.end : '11:00';
-
-        // Add to list
         detectedCourses.push({
-          id: `${fullCode}-${index}-${Date.now()}`, // Unique ID for React Key
+          id: `ext-${index}-${Math.random().toString(36).substr(2, 9)}`,
           course_code: fullCode,
-          course_name: fullCode, // User can rename in UI
-          day_of_week: effectiveDay,
-          start_time: effectiveStart,
-          end_time: effectiveEnd,
-          location: 'TBD'
+          course_name: fullCode, 
+          day_of_week: currentDay,
+          start_time: currentTime.start.replace('.', ':'),
+          end_time: currentTime.end.replace('.', ':'),
+          location: 'See PDF'
         });
       }
     });
 
-    // 3. Deduplicate (Remove exact duplicates of Code + Day + Time)
+    // 3. Deduplicate exact matches
     const uniqueCourses = [];
     const seen = new Set();
-
     detectedCourses.forEach(c => {
       const key = `${c.course_code}-${c.day_of_week}-${c.start_time}`;
       if (!seen.has(key)) {
@@ -3568,18 +3458,14 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
     res.json({
       success: true,
       courses: uniqueCourses,
-      count: uniqueCourses.length,
-      message: `Scanned document. Found ${uniqueCourses.length} potential courses.`
+      count: uniqueCourses.length
     });
 
   } catch (error) {
-    console.error('PDF Parser Critical Error:', error);
+    console.error('Critical Route Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
-// ... rest of server.js ...
-
 // ============================================
 // CREATE/GET PROGRAM (Universal)
 // ============================================
