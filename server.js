@@ -3376,94 +3376,101 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
+      console.log("Upload Error: No file in request");
       return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
     }
 
-    // 1. Extract raw text from the PDF buffer
+    console.log(`Parsing PDF: ${req.file.originalname} (${req.file.size} bytes)`);
+
+    // Extract text with a safety check
     let data;
     try {
-      // Using the renamed pdfParser function here
-      data = await pdfParser(req.file.buffer);
-    } catch (parseError) {
-      console.error("PDF Extraction Error:", parseError);
-      return res.status(500).json({ success: false, error: 'Could not read PDF content' });
+      // Ensure pdfParser is the function from the library
+      const parseFunction = typeof pdfParser === 'function' ? pdfParser : pdfParser.default;
+      if (typeof parseFunction !== 'function') {
+        throw new Error("pdf-parse library not loaded correctly. Check your require statement.");
+      }
+      
+      data = await parseFunction(req.file.buffer);
+    } catch (parseErr) {
+      console.error("PDF-PARSE CRASHED:", parseErr.message);
+      return res.status(500).json({ 
+        success: false, 
+        error: `Library failed to read PDF: ${parseErr.message}` 
+      });
     }
 
     const text = data.text;
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'PDF appears to be empty or an image (scanned). Only text-based PDFs are supported.' });
+    }
+
     const lines = text.split('\n');
     const detectedCourses = [];
     
-    // Tracking state as we scan the document
-    let currentDay = 1; // Default to Monday
+    // Tracking context
+    let currentDay = 1; 
     let currentTime = { start: '09:00', end: '11:00' };
 
-    // Regex Patterns
+    // RegEx for Course Codes (e.g., CS 101, MATH151, COE-475)
     const patterns = {
       days: /(monday|tuesday|wednesday|thursday|friday|sat|sun|mon|tue|wed|thu|fri)/i,
       time: /\b((?:0?[1-9]|1[0-2])[:.][0-5][0-9]\s*(?:am|pm)?|1[3-9][:.][0-5][0-9])\b/i,
-      // Matches codes like CS101, MATH 202, COE-301
       courseCode: /\b([A-Z]{2,5})[\s-]?(\d{3,4}[A-Z]?)\b/
     };
 
     const dayMap = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 0 };
 
-    // 2. Scan line by line to build context
     lines.forEach((line, index) => {
       const cleanLine = line.trim();
       if (!cleanLine) return;
 
-      // Detect Day in this line
+      // Update Day Context
       const dayMatch = cleanLine.match(patterns.days);
       if (dayMatch) {
         const d = dayMatch[0].toLowerCase().substring(0, 3);
         if (dayMap[d] !== undefined) currentDay = dayMap[d];
       }
 
-      // Detect Times in this line
+      // Update Time Context (Look for "Start-End")
       const timeMatches = cleanLine.match(new RegExp(patterns.time, 'gi'));
       if (timeMatches && timeMatches.length >= 2) {
         currentTime = { start: timeMatches[0], end: timeMatches[1] };
       }
 
-      // Detect Course Codes (The actual data extraction)
-      // We use a fresh regex instance per line to avoid 'g' flag state issues
+      // Extract Course Codes
       const codeRegex = new RegExp(patterns.courseCode, 'gi');
       let match;
       while ((match = codeRegex.exec(cleanLine)) !== null) {
-        const fullCode = match[0].toUpperCase();
-        
         detectedCourses.push({
-          id: `ext-${index}-${Math.random().toString(36).substr(2, 9)}`,
-          course_code: fullCode,
-          course_name: fullCode, 
+          id: `pdf-${index}-${Math.random().toString(36).substr(2, 5)}`,
+          course_code: match[0].toUpperCase(),
+          course_name: match[0].toUpperCase(), 
           day_of_week: currentDay,
           start_time: currentTime.start.replace('.', ':'),
           end_time: currentTime.end.replace('.', ':'),
-          location: 'See PDF'
+          location: 'Detected from PDF'
         });
       }
     });
 
-    // 3. Deduplicate exact matches
-    const uniqueCourses = [];
+    // Remove duplicates
+    const unique = [];
     const seen = new Set();
     detectedCourses.forEach(c => {
       const key = `${c.course_code}-${c.day_of_week}-${c.start_time}`;
       if (!seen.has(key)) {
         seen.add(key);
-        uniqueCourses.push(c);
+        unique.push(c);
       }
     });
 
-    res.json({
-      success: true,
-      courses: uniqueCourses,
-      count: uniqueCourses.length
-    });
+    console.log(`Successfully parsed ${unique.length} items.`);
+    res.json({ success: true, courses: unique, count: unique.length });
 
   } catch (error) {
-    console.error('Critical Route Error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error('SERVER 500 ERROR:', error);
+    res.status(500).json({ success: false, error: "Internal Server Error: " + error.message });
   }
 });
 // ============================================
