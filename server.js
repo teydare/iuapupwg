@@ -22,9 +22,7 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
-const { addPDFParsingRoute, } = require('./pdf-parser');
 
-addPDFParsingRoute(app, pool);
 // ============================================
 // SUPABASE STORAGE CLIENT
 // ============================================
@@ -3369,20 +3367,13 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
   }
 });
 
-// ============================================
-// PDF TIMETABLE UPLOAD & PARSE ROUTE
-// ============================================
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
     }
     
-    const { program, yearLevel } = req.body;
-    
-    if (!program) {
-      return res.status(400).json({ success: false, error: 'Program not specified' });
-    }
+    const { yearLevel } = req.body;
     
     // Parse PDF
     const data = await pdf(req.file.buffer);
@@ -3394,106 +3385,167 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
     let currentDay = null;
     let currentYear = null;
     
-    const dayMap = {
-      'MONDAY': 1, 'TUESDAY': 2, 'WEDNESDAY': 3,
-      'THURSDAY': 4, 'FRIDAY': 5, 'SATURDAY': 6, 'SUNDAY': 0
-    };
+    // Universal day detection - works in any language/format
+    const dayPatterns = [
+      { pattern: /SUNDAY|SUN/i, value: 0 },
+      { pattern: /MONDAY|MON/i, value: 1 },
+      { pattern: /TUESDAY|TUE/i, value: 2 },
+      { pattern: /WEDNESDAY|WED/i, value: 3 },
+      { pattern: /THURSDAY|THU/i, value: 4 },
+      { pattern: /FRIDAY|FRI/i, value: 5 },
+      { pattern: /SATURDAY|SAT/i, value: 6 }
+    ];
     
-    const programPrefixes = {
-      'AEROSPACE': ['AE', 'AERO'], 'CHEMICAL': ['CHE', 'CHEM'],
-      'CIVIL': ['CE'], 'COMPUTER': ['COE', 'COMP'],
-      'ELECTRICAL': ['EE'], 'GEOMATIC': ['GE'],
-      'MECHANICAL': ['ME'], 'MATERIALS': ['MSE'],
-      'PETROLEUM': ['PE', 'PCE']
-    };
+    // Universal year detection
+    const yearPatterns = [
+      { pattern: /FIRST\s+YEAR|YEAR\s+1|1ST\s+YEAR/i, value: 1 },
+      { pattern: /SECOND\s+YEAR|YEAR\s+2|2ND\s+YEAR/i, value: 2 },
+      { pattern: /THIRD\s+YEAR|YEAR\s+3|3RD\s+YEAR/i, value: 3 },
+      { pattern: /FOURTH\s+YEAR|YEAR\s+4|4TH\s+YEAR/i, value: 4 }
+    ];
     
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
+      if (!line) continue;
       
-      // Detect year
-      if (line.includes('FIRST YEAR')) currentYear = 1;
-      else if (line.includes('SECOND YEAR')) currentYear = 2;
-      else if (line.includes('THIRD YEAR')) currentYear = 3;
-      else if (line.includes('FOURTH YEAR')) currentYear = 4;
-      
-      // Detect day
-      for (const [dayName, dayValue] of Object.entries(dayMap)) {
-        if (line.includes(dayName)) {
-          currentDay = dayValue;
+      // Detect year level
+      for (const { pattern, value } of yearPatterns) {
+        if (pattern.test(line)) {
+          currentYear = value;
           break;
         }
       }
       
-      // Skip if not target year
-      if (yearLevel && currentYear !== parseInt(yearLevel)) continue;
+      // Detect day
+      for (const { pattern, value } of dayPatterns) {
+        if (pattern.test(line)) {
+          currentDay = value;
+          break;
+        }
+      }
       
-      // Parse time slots
-      const timeMatch = line.match(/(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})/);
+      // Skip if year specified and doesn't match
+      if (yearLevel && currentYear && currentYear !== parseInt(yearLevel)) continue;
+      
+      // Parse time slots - supports multiple formats
+      const timePatterns = [
+        /(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/,  // 8:00-8:55
+        /(\d{1,2})\.(\d{2})\s*-\s*(\d{1,2})\.(\d{2})/, // 8.00-8.55
+        /(\d{1,2}):(\d{2})\s*to\s*(\d{1,2}):(\d{2})/i  // 8:00 to 8:55
+      ];
+      
+      let timeMatch = null;
+      for (const pattern of timePatterns) {
+        timeMatch = line.match(pattern);
+        if (timeMatch) break;
+      }
+      
       if (timeMatch && currentDay !== null) {
         const startTime = `${timeMatch[1].padStart(2, '0')}:${timeMatch[2]}`;
         const endTime = `${timeMatch[3].padStart(2, '0')}:${timeMatch[4]}`;
         
-        // Find course codes
-        const courseRegex = /([A-Z]{2,4})\s+(\d{3})/g;
-        let match;
+        // UNIVERSAL COURSE CODE DETECTION
+        // Matches ANY pattern of letters followed by numbers
+        // Examples: CS101, MATH151, BIO-101, ENG 201, etc.
+        const coursePatterns = [
+          /\b([A-Z]{2,4})[\s-]?(\d{3,4}[A-Z]?)\b/g,  // CS101, MATH 151, BIO-101
+          /\b([A-Z][A-Z]+)\s+(\d+)\b/g,               // COMP 101
+          /\b([A-Z]+)(\d+)\b/g                        // CS101 (no space)
+        ];
         
-        while ((match = courseRegex.exec(line)) !== null) {
-          const courseCode = `${match[1]} ${match[2]}`;
-          const coursePrefix = match[1];
-          
-          // Check if course belongs to program
-          const isTargetCourse = program === 'ALL' || 
-            programPrefixes[program]?.includes(coursePrefix) ||
-            ['MATH', 'ENGL', 'ECON', 'FC', 'STAT', 'TE'].includes(coursePrefix);
-          
-          if (isTargetCourse) {
-            // Extract location
-            let building = 'TBD';
-            let roomNumber = '';
-            const locationMatch = line.match(/(LAB|PRACTICALS|PROJECT|NEB-\w+|FOSS\s+\w+|PB\d+|VSLA|VCR|ECR|ENG\s+AUDIT)/);
-            if (locationMatch) {
-              const loc = locationMatch[1];
-              if (loc.includes('-')) {
-                [building, roomNumber] = loc.split('-');
-              } else {
-                building = loc;
-              }
-            }
-            
-            // Extract instructor
-            const instructorMatch = line.match(/([A-Z]\.\s*[A-Z][a-z]+)/);
-            const instructor = instructorMatch ? instructorMatch[1].trim() : 'Staff';
-            
-            courses.push({
-              course_code: courseCode,
-              course_name: courseCode,
-              day_of_week: currentDay,
-              start_time: startTime,
-              end_time: endTime,
-              building: building,
-              room_number: roomNumber,
-              instructor: instructor,
-              year_level: currentYear || yearLevel
-            });
+        const foundCourses = new Set();
+        
+        for (const pattern of coursePatterns) {
+          let match;
+          while ((match = pattern.exec(line)) !== null) {
+            const courseCode = `${match[1]} ${match[2]}`.trim();
+            foundCourses.add(courseCode);
           }
         }
+        
+        // Extract location - universal patterns
+        const locationPatterns = [
+          /\b(LAB|LABORATORY|PRACTICALS?|PROJECT)\b/i,
+          /\b([A-Z]{2,4}-[A-Z0-9]+)\b/,              // NEB-GF, PB-208
+          /\b([A-Z]+\s*\d+)\b/,                      // PB208, ROOM 101
+          /\b(ROOM|RM|HALL|BLDG|BUILDING)\s*([A-Z0-9-]+)/i,
+          /\b([A-Z]{3,})\b/                          // VSLA, AUDIT, etc.
+        ];
+        
+        let building = 'TBD';
+        let roomNumber = '';
+        
+        for (const pattern of locationPatterns) {
+          const locMatch = line.match(pattern);
+          if (locMatch) {
+            const location = locMatch[0];
+            if (location.includes('-')) {
+              [building, roomNumber] = location.split('-');
+            } else {
+              building = location;
+            }
+            break;
+          }
+        }
+        
+        // Extract instructor - universal name patterns
+        const instructorPatterns = [
+          /\b([A-Z]\.\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/g,  // J. Smith, A. Johnson
+          /\b(Dr|Prof|Mr|Mrs|Ms)\.?\s+([A-Z][a-z]+)/gi,       // Dr. Smith
+          /\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b/g                  // John Smith
+        ];
+        
+        let instructor = 'Staff';
+        for (const pattern of instructorPatterns) {
+          const instMatch = line.match(pattern);
+          if (instMatch && instMatch[0]) {
+            instructor = instMatch[0].trim();
+            break;
+          }
+        }
+        
+        // Add all detected courses
+        foundCourses.forEach(courseCode => {
+          courses.push({
+            course_code: courseCode,
+            course_name: courseCode, // Can be enriched later
+            day_of_week: currentDay,
+            start_time: startTime,
+            end_time: endTime,
+            building: building,
+            room_number: roomNumber,
+            instructor: instructor,
+            year_level: currentYear || yearLevel || null,
+            raw_line: line // Keep original for reference
+          });
+        });
       }
     }
     
     // Remove duplicates
-    const uniqueCourses = courses.filter((course, index, self) =>
-      index === self.findIndex(c => 
-        c.course_code === course.course_code &&
-        c.day_of_week === course.day_of_week &&
-        c.start_time === course.start_time
-      )
-    );
+    const uniqueCourses = [];
+    const seen = new Set();
+    
+    for (const course of courses) {
+      const key = `${course.course_code}-${course.day_of_week}-${course.start_time}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueCourses.push(course);
+      }
+    }
+    
+    // Sort by day and time
+    uniqueCourses.sort((a, b) => {
+      if (a.day_of_week !== b.day_of_week) return a.day_of_week - b.day_of_week;
+      return a.start_time.localeCompare(b.start_time);
+    });
     
     res.json({
       success: true,
       courses: uniqueCourses,
       count: uniqueCourses.length,
-      yearLevel: currentYear || yearLevel
+      yearLevel: currentYear,
+      message: `Detected ${uniqueCourses.length} courses`
     });
     
   } catch (error) {
@@ -3506,36 +3558,91 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
 });
 
 // ============================================
-// BULK UPLOAD PROGRAM COURSES
+// CREATE/GET PROGRAM (Universal)
+// ============================================
+app.post('/api/programs', authMiddleware, async (req, res) => {
+  try {
+    const { programName, programCode, department, yearLevel, semester } = req.body;
+    
+    const result = await pool.query(
+      `INSERT INTO programs (user_id, program_name, program_code, department, year_level, semester)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [req.user.id, programName, programCode, department, yearLevel, semester]
+    );
+    
+    res.json({ success: true, program: result.rows[0] });
+  } catch (error) {
+    console.error('Create program error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/programs', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM programs WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json({ success: true, programs: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// BULK UPLOAD COURSES
 // ============================================
 app.post('/api/program-courses/bulk', authMiddleware, async (req, res) => {
   try {
     const { programId, courses } = req.body;
     
-    if (!programId || !courses || !courses.length) {
-      return res.status(400).json({ success: false, error: 'Invalid data' });
+    if (!courses || courses.length === 0) {
+      return res.status(400).json({ success: false, error: 'No courses provided' });
     }
     
     // Insert all courses
-    const insertPromises = courses.map(c => {
-      return pool.query(
+    for (const course of courses) {
+      await pool.query(
         `INSERT INTO program_courses 
-        (program_id, course_code, course_name, day_of_week, start_time, end_time, building, room_number, instructor, year_level)
+        (program_id, course_code, course_name, day_of_week, start_time, end_time, 
+         building, room_number, instructor, year_level)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [programId, c.course_code, c.course_name, c.day_of_week, c.start_time, c.end_time, c.building, c.room_number, c.instructor, c.year_level]
+        [
+          programId,
+          course.course_code,
+          course.course_name || course.course_code,
+          course.day_of_week,
+          course.start_time,
+          course.end_time,
+          course.building,
+          course.room_number,
+          course.instructor,
+          course.year_level
+        ]
       );
-    });
-    
-    await Promise.all(insertPromises);
+    }
     
     res.json({ success: true, imported: courses.length });
-    
   } catch (error) {
     console.error('Bulk upload error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// ============================================
+// GET PROGRAM COURSES
+// ============================================
+app.get('/api/programs/:id/courses', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM program_courses WHERE program_id = $1 ORDER BY day_of_week, start_time',
+      [req.params.id]
+    );
+    res.json({ success: true, courses: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // ============================================
 // ERROR HANDLING
