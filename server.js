@@ -3428,13 +3428,12 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
     // Add unique IDs and checked state for the frontend
     const formattedCourses = courses.map((c, i) => ({
       ...c,
-      id: \`gemini-course-\${i}\`,
+      id: `gemini-course-${i}`,
       checked: true,
       program: 'Imported Timetable' // Default tag
     }));
 
-    console.log(\`✅ Gemini detected \${formattedCourses.length} unique class sessions\`);
-
+    console.log(`✅ Gemini detected ${formattedCourses.length} unique class sessions`);
     res.json({ 
       success: true, 
       courses: formattedCourses, 
