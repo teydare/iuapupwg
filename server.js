@@ -3372,15 +3372,7 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 // UNIVERSAL PDF PARSER - FIXED VERSION
 // ============================================
 
-// ============================================
-// GEMINI-POWERED UNIVERSAL PDF PARSER
-// ============================================
 
-// ============================================
-// 2. GEMINI PDF PARSER (Resolves padStart Error)
-// ============================================
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
