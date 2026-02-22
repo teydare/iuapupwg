@@ -21,7 +21,8 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
-
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // ============================================
 // SUPABASE STORAGE CLIENT
 // ============================================
@@ -3372,145 +3373,80 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 // UNIVERSAL PDF PARSER - FIXED VERSION
 // ============================================
 
+// ============================================
+// GEMINI-POWERED UNIVERSAL PDF PARSER
+// ============================================
+
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
     }
 
-    console.log('📄 Parsing PDF:', req.file.originalname, '- Size:', req.file.size);
+    console.log('📄 Parsing PDF with Gemini:', req.file.originalname, '- Size:', req.file.size);
 
-    // Parse PDF with error handling
-    let pdfData;
-    try {
-      // pdf-parse returns a promise when called with a buffer
-      pdfData = await pdfExtractor(req.file.buffer);
-    } catch (parseError) {
-      console.error('❌ PDF Parse Error:', parseError.message);
-      return res.status(500).json({ 
-        success: false, 
-        error: 'Failed to read PDF content. Please ensure the file is a valid PDF.',
-        details: parseError.message 
-      });
-    }
+    // Convert PDF buffer to Base64 for Gemini
+    const base64Pdf = req.file.buffer.toString('base64');
 
-    const text = pdfData.text;
-    console.log('✅ Extracted text length:', text.length);
-    
-    if (!text || text.length < 10) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'PDF appears to be empty or unreadable' 
-      });
-    }
+    // Use Gemini 1.5 Flash - extremely fast and perfect for extraction tasks
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const lines = text.split('\n');
-    const detectedCourses = [];
-    
-    // Context tracking
-    let currentDay = 1; // Default Monday
-    let currentTime = { start: '08:00', end: '09:00' };
-
-    // RegEx Patterns
-    const patterns = {
-      days: /(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)/i,
-      timeRange: /(\d{1,2})[:.，](\d{2})\s*[-–—to]\s*(\d{1,2})[:.，](\d{2})/i,
-      courseCode: /\b([A-Z]{2,5})[\s-]?(\d{3,4}[A-Z]?)\b/gi,
-      location: /\b([A-Z]{2,4}[-\s]?[A-Z]{0,3}[-\s]?\d{1,4}[A-Z]?)\b/g
-    };
-
-    const dayMap = { 
-      sun: 0, sunday: 0,
-      mon: 1, monday: 1,
-      tue: 2, tuesday: 2,
-      wed: 3, wednesday: 3,
-      thu: 4, thursday: 4,
-      fri: 5, friday: 5,
-      sat: 6, saturday: 6
-    };
-
-    // Parse line by line
-    lines.forEach((line, index) => {
-      const cleanLine = line.trim();
-      if (!cleanLine || cleanLine.length < 3) return;
-
-      // Update Day
-      const dayMatch = cleanLine.match(patterns.days);
-      if (dayMatch) {
-        const dayStr = dayMatch[0].toLowerCase();
-        const dayKey = Object.keys(dayMap).find(k => dayStr.includes(k));
-        if (dayKey) currentDay = dayMap[dayKey];
+    const prompt = `Analyze this university timetable PDF. Extract all the courses and their schedules.
+    Return a JSON array of objects with the following strict structure:
+    [
+      {
+        "course_code": "String (e.g., CS 101)",
+        "course_name": "String (e.g., Intro to Computer Science, or just the course code if unnamed)",
+        "day_of_week": "Number (0 for Sunday, 1 for Monday, 2 for Tuesday, 3 for Wednesday, 4 for Thursday, 5 for Friday, 6 for Saturday)",
+        "start_time": "String (HH:MM format in 24-hour time, e.g., 08:00)",
+        "end_time": "String (HH:MM format in 24-hour time, e.g., 10:00)",
+        "location": "String (e.g., ENG-BLDG 101)",
+        "building": "String (e.g., ENG-BLDG)",
+        "room_number": "String (e.g., 101)",
+        "instructor": "String (Name of the instructor, or 'Staff' if not listed)"
       }
+    ]
+    Extract every single class session. If a class happens twice a week, create two separate objects.`;
 
-      // Update Time
-      const timeMatch = cleanLine.match(patterns.timeRange);
-      if (timeMatch) {
-        const startHour = timeMatch[1].padStart(2, '0');
-        const startMin = timeMatch[2];
-        const endHour = timeMatch[3].padStart(2, '0');
-        const endMin = timeMatch[4];
-        currentTime = { 
-          start: `${startHour}:${startMin}`, 
-          end: `${endHour}:${endMin}` 
-        };
-      }
-
-      // Extract Courses
-      let match;
-      patterns.courseCode.lastIndex = 0;
-      while ((match = patterns.courseCode.exec(cleanLine)) !== null) {
-        const fullCode = match[0].replace(/\s+/g, ' ').toUpperCase();
-        
-        // Skip common false positives
-        if (['CO 2', 'CO 3', 'NO 1'].includes(fullCode)) continue;
-        
-        // Extract potential location from same line
-        let location = 'TBD';
-        const locationMatch = cleanLine.match(/([A-Z]{2,4}[-\s]?GF|[A-Z]{2,4}[-\s]?\d{2,4})/);
-        if (locationMatch) {
-          location = locationMatch[0].replace(/\s+/g, '');
-        }
-
-        detectedCourses.push({
-          id: `course-${index}-${detectedCourses.length}`,
-          course_code: fullCode,
-          course_name: fullCode,
-          day_of_week: currentDay,
-          start_time: currentTime.start,
-          end_time: currentTime.end,
-          location: location,
-          building: location.split('-')[0] || 'Main',
-          room_number: location.split('-')[1] || '',
-          checked: true
-        });
+    const result = await model.generateContent({
+      contents: [{
+        role: "user",
+        parts: [
+          { text: prompt },
+          { inlineData: { data: base64Pdf, mimeType: "application/pdf" } }
+        ]
+      }],
+      generationConfig: {
+        // This forces Gemini to return strict, clean JSON without markdown wrappers
+        responseMimeType: "application/json" 
       }
     });
 
-    // Deduplicate based on course code + day + time
-    const uniqueKey = (c) => `${c.course_code}-${c.day_of_week}-${c.start_time}`;
-    const seen = new Set();
-    const unique = detectedCourses.filter(c => {
-      const key = uniqueKey(c);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const responseText = result.response.text();
+    const courses = JSON.parse(responseText);
 
-    console.log(`✅ Detected ${unique.length} unique courses`);
+    // Add unique IDs and checked state for the frontend
+    const formattedCourses = courses.map((c, i) => ({
+      ...c,
+      id: \`gemini-course-\${i}\`,
+      checked: true,
+      program: 'Imported Timetable' // Default tag
+    }));
+
+    console.log(\`✅ Gemini detected \${formattedCourses.length} unique class sessions\`);
 
     res.json({ 
       success: true, 
-      courses: unique, 
-      count: unique.length,
-      raw_lines: lines.length 
+      courses: formattedCourses, 
+      count: formattedCourses.length 
     });
 
   } catch (error) {
-    console.error('❌ Route Error:', error);
+    console.error('❌ Gemini Parse Error:', error);
     res.status(500).json({ 
       success: false, 
-      error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      error: 'AI parsing failed. Please ensure the PDF is readable.',
+      details: error.message 
     });
   }
 });
