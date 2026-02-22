@@ -3379,74 +3379,55 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
 
-    console.log('📄 Parsing PDF with Gemini:', req.file.originalname, '- Size:', req.file.size);
-
-    // Convert PDF buffer to Base64 for Gemini
     const base64Pdf = req.file.buffer.toString('base64');
-
-    // Use Gemini 1.5 Flash - extremely fast and perfect for extraction tasks
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const prompt = `Analyze this university timetable PDF. Extract all the courses and their schedules.
-    Return a JSON array of objects with the following strict structure:
-    [
-      {
-        "course_code": "String (e.g., CS 101)",
-        "course_name": "String (e.g., Intro to Computer Science, or just the course code if unnamed)",
-        "day_of_week": "Number (0 for Sunday, 1 for Monday, 2 for Tuesday, 3 for Wednesday, 4 for Thursday, 5 for Friday, 6 for Saturday)",
-        "start_time": "String (HH:MM format in 24-hour time, e.g., 08:00)",
-        "end_time": "String (HH:MM format in 24-hour time, e.g., 10:00)",
-        "location": "String (e.g., ENG-BLDG 101)",
-        "building": "String (e.g., ENG-BLDG)",
-        "room_number": "String (e.g., 101)",
-        "instructor": "String (Name of the instructor, or 'Staff' if not listed)"
-      }
-    ]
-    Extract every single class session. If a class happens twice a week, create two separate objects.`;
+    const prompt = `Analyze this university timetable PDF. Extract all courses.
+    Return a JSON array of objects. 
+    IMPORTANT: Times MUST be in "HH:MM" 24-hour format (e.g., "08:00", "14:30").
+    
+    Structure:
+    {
+      "course_code": "CS101",
+      "course_name": "Programming",
+      "day_of_week": 1, 
+      "start_time": "09:00",
+      "end_time": "11:00",
+      "location": "Room 101",
+      "instructor": "Dr. Smith"
+    }`;
 
     const result = await model.generateContent({
       contents: [{
         role: "user",
-        parts: [
-          { text: prompt },
-          { inlineData: { data: base64Pdf, mimeType: "application/pdf" } }
-        ]
+        parts: [{ text: prompt }, { inlineData: { data: base64Pdf, mimeType: "application/pdf" } }]
       }],
-      generationConfig: {
-        // This forces Gemini to return strict, clean JSON without markdown wrappers
-        responseMimeType: "application/json" 
-      }
+      generationConfig: { responseMimeType: "application/json" }
     });
 
-    const responseText = result.response.text();
-    const courses = JSON.parse(responseText);
+    const courses = JSON.parse(result.response.text());
 
-    // Add unique IDs and checked state for the frontend
-    const formattedCourses = courses.map((c, i) => ({
-      ...c,
-      id: `gemini-course-${i}`,
-      checked: true,
-      program: 'Imported Timetable' // Default tag
-    }));
+    // Added safety check to prevent "undefined" errors
+    const formattedCourses = courses.map((c, i) => {
+      // Ensure times exist and are strings before the frontend touches them
+      const startTime = String(c.start_time || "00:00");
+      const endTime = String(c.end_time || "00:00");
 
-    console.log(`✅ Gemini detected ${formattedCourses.length} unique class sessions`);
-    res.json({ 
-      success: true, 
-      courses: formattedCourses, 
-      count: formattedCourses.length 
+      return {
+        ...c,
+        id: `gemini-course-${i}`,
+        start_time: startTime,
+        end_time: endTime,
+        checked: true
+      };
     });
 
+    res.json({ success: true, courses: formattedCourses });
   } catch (error) {
-    console.error('❌ Gemini Parse Error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'AI parsing failed. Please ensure the PDF is readable.',
-      details: error.message 
-    });
+    console.error('Gemini Error:', error);
+    res.status(500).json({ success: false, error: 'AI processing failed' });
   }
 });
 // ============================================
