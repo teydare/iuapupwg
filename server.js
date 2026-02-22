@@ -98,10 +98,30 @@ async function uploadToSupabase(file, bucket, folder = '') {
 app.set('trust proxy', 1);
 
 app.use(helmet());
+// allowlist + options for CORS
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'https://fuddystudy.vercel.app',
+  'http://localhost:3000'
+].filter(Boolean);
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true
+  origin: function(origin, callback) {
+    // allow non-browser requests (e.g. curl, server-to-server) with no origin
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
 }));
+
+// Ensure preflight requests are answered
+app.options('*', cors());  
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
