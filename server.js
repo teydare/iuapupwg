@@ -486,28 +486,27 @@ CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(reviewed_user_id);
 // AUTH MIDDLEWARE
 // ============================================
 
+// ============================================
+// 1. FIXED AUTH MIDDLEWARE (Resolves 401 Errors)
+// ============================================
 const authMiddleware = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+  
   if (!token) {
     return res.status(401).json({ success: false, message: 'No token provided' });
   }
+
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
     req.user = decoded;
     next();
   } catch (error) {
-    return res.status(401).json({ success: false, message: 'Invalid token' });
+    console.error("JWT Verify Error:", error.message);
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
   }
-  module.exports = (req,res,next) => {
-  req.user = null;
-  next();
-};
 };
 
-module.exports = (req,res,next) => {
-  req.user = null;
-  next();
-};
 
 // ============================================
 // HEALTH & INIT ROUTES
@@ -3377,57 +3376,52 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 // GEMINI-POWERED UNIVERSAL PDF PARSER
 // ============================================
 
+// ============================================
+// 2. GEMINI PDF PARSER (Resolves padStart Error)
+// ============================================
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: 'No PDF file uploaded' });
+    if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
-    const base64Pdf = req.file.buffer.toString('base64');
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const base64Pdf = req.file.buffer.toString('base64');
 
-    const prompt = `Analyze this university timetable PDF. Extract all courses.
-    Return a JSON array of objects. 
-    IMPORTANT: Times MUST be in "HH:MM" 24-hour format (e.g., "08:00", "14:30").
-    
-    Structure:
+    const prompt = `Analyze this university timetable. Extract all class sessions into a JSON array.
+    Strictly use this format:
     {
       "course_code": "CS101",
-      "course_name": "Programming",
-      "day_of_week": 1, 
-      "start_time": "09:00",
-      "end_time": "11:00",
-      "location": "Room 101",
-      "instructor": "Dr. Smith"
+      "course_name": "Intro to Computing",
+      "day_of_week": 1, (1 for Monday, 2 for Tuesday, etc.)
+      "start_time": "HH:MM", (24h format, e.g. "08:30")
+      "end_time": "HH:MM",
+      "location": "Room 302",
+      "instructor": "Dr. Name"
     }`;
 
-    const result = await model.generateContent({
-      contents: [{
-        role: "user",
-        parts: [{ text: prompt }, { inlineData: { data: base64Pdf, mimeType: "application/pdf" } }]
-      }],
-      generationConfig: { responseMimeType: "application/json" }
-    });
+    const result = await model.generateContent([
+      { text: prompt },
+      { inlineData: { data: base64Pdf, mimeType: "application/pdf" } }
+    ]);
 
-    const courses = JSON.parse(result.response.text());
+    const text = result.response.text().replace(/```json|```/g, '');
+    const courses = JSON.parse(text);
 
-    // Added safety check to prevent "undefined" errors
-    const formattedCourses = courses.map((c, i) => {
-      // Ensure times exist and are strings before the frontend touches them
-      const startTime = String(c.start_time || "00:00");
-      const endTime = String(c.end_time || "00:00");
+    // Safety formatting to prevent frontend crashes
+    const formatted = courses.map((c, i) => ({
+      ...c,
+      id: `gemini-${Date.now()}-${i}`,
+      start_time: String(c.start_time || "08:00"),
+      end_time: String(c.end_time || "09:00"),
+      checked: true
+    }));
 
-      return {
-        ...c,
-        id: `gemini-course-${i}`,
-        start_time: startTime,
-        end_time: endTime,
-        checked: true
-      };
-    });
-
-    res.json({ success: true, courses: formattedCourses });
+    res.json({ success: true, courses: formatted });
   } catch (error) {
     console.error('Gemini Error:', error);
-    res.status(500).json({ success: false, error: 'AI processing failed' });
+    res.status(500).json({ success: false, error: 'AI failed to parse PDF' });
   }
 });
 // ============================================
