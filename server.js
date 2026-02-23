@@ -21,8 +21,19 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Gemini is optional - server works without it using pdf-parse fallback
+let genAI = null;
+try {
+  const { GoogleGenerativeAI } = require('@google/generative-ai');
+  if (process.env.GEMINI_API_KEY) {
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    console.log('✅ Gemini AI initialized');
+  } else {
+    console.log('ℹ️  No GEMINI_API_KEY - using pdf-parse fallback for timetable parsing');
+  }
+} catch (e) {
+  console.log('ℹ️  @google/generative-ai not installed - using pdf-parse fallback');
+}
 // ============================================
 // SUPABASE STORAGE CLIENT
 // ============================================
@@ -120,8 +131,18 @@ app.use(cors({
   allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
 }));
 
-// Ensure preflight requests are answered
-app.options('*', cors());  
+// Ensure preflight requests are answered with the SAME strict origin config
+// NOTE: app.options('*', cors()) with no args sets ACAO:* which BREAKS credentialed requests
+app.options('*', cors({
+  origin: function(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -3398,42 +3419,118 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const base64Pdf = req.file.buffer.toString('base64');
+    // ── STEP 1: Extract raw text with pdf-parse (always available) ──────────
+    const pdfData = await pdfExtractor(req.file.buffer);
+    const rawText = pdfData.text;
 
-    const prompt = `Analyze this university timetable. Extract all class sessions into a JSON array.
-    Strictly use this format:
-    {
-      "course_code": "CS101",
-      "course_name": "Intro to Computing",
-      "day_of_week": 1, (1 for Monday, 2 for Tuesday, etc.)
-      "start_time": "HH:MM", (24h format, e.g. "08:30")
-      "end_time": "HH:MM",
-      "location": "Room 302",
-      "instructor": "Dr. Name"
-    }`;
+    // ── STEP 2: Try Gemini if available ────────────────────────────────────
+    if (genAI) {
+      try {
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        const prompt = `You are a university timetable parser. Extract ALL class sessions from the text below into a JSON array. Return ONLY raw JSON, no markdown, no backticks.
 
-    const result = await model.generateContent([
-      { text: prompt },
-      { inlineData: { data: base64Pdf, mimeType: "application/pdf" } }
-    ]);
+Each object must have exactly these fields:
+{
+  "course_code": "CS101",
+  "course_name": "Introduction to Computing",
+  "day_of_week": 1,
+  "start_time": "08:00",
+  "end_time": "10:00",
+  "location": "Room 302",
+  "instructor": "Dr. Smith"
+}
 
-    const text = result.response.text().replace(/```json|```/g, '');
-    const courses = JSON.parse(text);
+Rules:
+- day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
+- start_time and end_time must be HH:MM in 24-hour format
+- If a field is unknown use empty string ""
+- Extract EVERY class you can find
 
-    // Safety formatting to prevent frontend crashes
-    const formatted = courses.map((c, i) => ({
-      ...c,
-      id: `gemini-${Date.now()}-${i}`,
-      start_time: String(c.start_time || "08:00"),
-      end_time: String(c.end_time || "09:00"),
-      checked: true
-    }));
+TIMETABLE TEXT:
+${rawText.substring(0, 15000)}`;
 
-    res.json({ success: true, courses: formatted });
+        const result = await model.generateContent(prompt);
+        const responseText = result.response.text();
+        // Strip any accidental markdown fences
+        const jsonStr = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+        const parsed = JSON.parse(jsonStr);
+
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const formatted = parsed.map((c, i) => ({
+            id: `parsed-${Date.now()}-${i}`,
+            course_code: String(c.course_code || '').toUpperCase(),
+            course_name: String(c.course_name || c.course_code || ''),
+            program: 'General',
+            year: 'Not specified',
+            day_of_week: Number(c.day_of_week) || 1,
+            start_time: String(c.start_time || '08:00'),
+            end_time: String(c.end_time || '09:00'),
+            location: String(c.location || 'TBD'),
+            instructor: String(c.instructor || 'Staff'),
+            checked: true,
+          }));
+          return res.json({ success: true, courses: formatted, method: 'smart' });
+        }
+      } catch (geminiErr) {
+        console.warn('Gemini parse failed, falling back to pattern matching:', geminiErr.message);
+      }
+    }
+
+    // ── STEP 3: Pattern-matching fallback (works without any API key) ───────
+    const DAY_MAP = {
+      SUNDAY: 0, SUN: 0, MONDAY: 1, MON: 1,
+      TUESDAY: 2, TUE: 2, TUES: 2, WEDNESDAY: 3, WED: 3,
+      THURSDAY: 4, THU: 4, THUR: 4, FRIDAY: 5, FRI: 5,
+      SATURDAY: 6, SAT: 6,
+    };
+
+    const lines = rawText.split(/\n/).map(l => l.trim()).filter(Boolean);
+    const courses = [];
+    let currentDay = 1;
+
+    lines.forEach(line => {
+      // Update current day context
+      const dayMatch = line.match(/\b(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUN|MON|TUES?|WED|THUR?|FRI|SAT)\b/i);
+      if (dayMatch) {
+        currentDay = DAY_MAP[dayMatch[1].toUpperCase()] ?? currentDay;
+      }
+
+      // Extract course codes: e.g. CS101, MAT 201, ENG302B
+      const codeMatches = [...line.matchAll(/\b([A-Z]{2,6})[\s-]?(\d{2,4})([A-Z])?\b/g)];
+      const timeMatch = line.match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
+
+      codeMatches.forEach(m => {
+        const code = `${m[1]} ${m[2]}${m[3] || ''}`;
+        courses.push({
+          id: `fallback-${courses.length}`,
+          course_code: code,
+          course_name: code,
+          program: 'General',
+          year: 'Not specified',
+          day_of_week: currentDay,
+          start_time: timeMatch ? `${String(timeMatch[1]).padStart(2,'0')}:${timeMatch[2]}` : '08:00',
+          end_time:   timeMatch ? `${String(timeMatch[3]).padStart(2,'0')}:${timeMatch[4]}` : '09:00',
+          location: 'TBD',
+          instructor: 'Staff',
+          checked: true,
+        });
+      });
+    });
+
+    // Deduplicate
+    const seen = new Set();
+    const unique = courses.filter(c => {
+      const key = `${c.course_code}|${c.day_of_week}|${c.start_time}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    return res.json({ success: true, courses: unique, method: 'pattern' });
+
   } catch (error) {
-    console.error('Gemini Error:', error);
-    res.status(500).json({ success: false, error: 'AI failed to parse PDF' });
+    console.error('PDF parse error:', error);
+    res.status(500).json({ success: false, error: 'Failed to parse PDF: ' + error.message });
   }
 });
 // ============================================
@@ -3576,4 +3673,3 @@ app.listen(PORT, () => {
   console.log(`📊 Database: PostgreSQL (Supabase)`);
   console.log(`\n✅ Initialize database at: /api/init-db`);
 });
-
