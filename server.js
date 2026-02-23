@@ -3412,18 +3412,27 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 
 // Step 1: Extract text using pdfjs-dist (robust pure-JS, no native deps).
 // Falls back to zlib stream scanning if pdfjs-dist isn't installed.
+// pdfjs-dist v5 (your installed version) uses require('pdfjs-dist') directly.
+// Must disable the worker explicitly and pass Node-safe options to getDocument.
 async function extractPdfText(buffer) {
-  // Try pdfjs-dist first — handles compressed streams, custom fonts, all encodings
   try {
-    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
-    pdfjsLib.GlobalWorkerOptions.workerSrc = false; // Disable web worker (Node env)
-    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(buffer) });
+    const pdfjsLib = require('pdfjs-dist');
+    // v5: workerSrc must be empty string, not false
+    pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+    const loadingTask = pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      useWorkerFetch: false,     // Don't try to fetch anything via worker
+      isEvalSupported: false,    // Safer in server environments
+      useSystemFonts: true,      // Use system fonts instead of fetching them
+      disableFontFace: true,     // Don't load font faces (not needed for text)
+      verbosity: 0,              // Suppress pdfjs console noise
+    });
     const pdf = await loadingTask.promise;
+    console.log(`[PDF] pdfjs-dist v5 opened PDF — ${pdf.numPages} pages`);
     const textParts = [];
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
-      // Each item has .str (the text) and .hasEOL (line break)
       let pageText = '';
       for (const item of content.items) {
         pageText += item.str;
@@ -3434,7 +3443,7 @@ async function extractPdfText(buffer) {
     }
     const text = textParts.join('\n\n').replace(/[ \t]+/g, ' ').trim();
     if (text.length > 50) return text;
-    console.warn('[PDF] pdfjs-dist returned minimal text, trying fallback');
+    console.warn('[PDF] pdfjs-dist extracted minimal text — PDF may be image-based');
   } catch (e) {
     console.warn('[PDF] pdfjs-dist failed:', e.message, '— trying zlib fallback');
   }
@@ -3472,22 +3481,30 @@ async function extractPdfText(buffer) {
 }
 
 // Step 2: If text extraction fails, convert first page to JPEG and use Groq Vision
-// Uses pdfjs-dist + canvas (if available) to render the page as an image
+// Render first page of PDF as JPEG using pdfjs-dist + canvas
 async function renderPdfPageAsBase64(buffer) {
   try {
     const { createCanvas } = require('canvas');
-    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
-    pdfjsLib.GlobalWorkerOptions.workerSrc = false;
-    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    const pdfjsLib = require('pdfjs-dist');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+    const pdf = await pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      useWorkerFetch: false,
+      isEvalSupported: false,
+      useSystemFonts: true,
+      disableFontFace: true,
+      verbosity: 0,
+    }).promise;
     const page = await pdf.getPage(1);
-    const scale = 2.0; // Higher = better quality for OCR
+    const scale = 2.0;
     const viewport = page.getViewport({ scale });
     const canvas = createCanvas(viewport.width, viewport.height);
     const ctx = canvas.getContext('2d');
     await page.render({ canvasContext: ctx, viewport }).promise;
+    console.log('[PDF] Page 1 rendered as image');
     return canvas.toBuffer('image/jpeg', { quality: 0.92 }).toString('base64');
   } catch (e) {
-    console.warn('[PDF] Canvas render failed:', e.message, '(canvas package not installed)');
+    console.warn('[PDF] Canvas render failed:', e.message);
     return null;
   }
 }
