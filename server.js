@@ -10,7 +10,10 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
-const pdfExtractor = require('pdf-parse');
+// FIX: pdf-parse can export { default: fn } instead of fn directly in some environments.
+// Guard against both shapes so it's always callable.
+const _pdfParseModule = require('pdf-parse');
+const pdfExtractor = typeof _pdfParseModule === 'function' ? _pdfParseModule : (_pdfParseModule.default || _pdfParseModule);
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
