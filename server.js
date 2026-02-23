@@ -3415,32 +3415,68 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 // Reads raw text from PDF content streams using regex.
 // Works on all text-based PDFs without pdf-parse.
 // ============================================
+// Robust PDF text extractor using Node built-in zlib to decompress PDF streams.
+// Handles both compressed (FlateDecode) and uncompressed PDF content streams.
+// No npm dependency needed.
 function extractRawTextFromPdf(buffer) {
-  const str = buffer.toString('latin1');
+  const zlib = require('zlib');
   const chunks = [];
 
-  // Extract text from BT...ET blocks (standard PDF text blocks)
-  const btBlocks = str.match(/BT[\s\S]*?ET/g) || [];
-  btBlocks.forEach(block => {
-    // (text) Tj  or  (text) TJ
-    const tjMatches = block.match(/\(([^)]*)\)\s*Tj/g) || [];
-    tjMatches.forEach(m => {
-      const text = m.replace(/^\(/, '').replace(/\)\s*Tj$/, '');
-      chunks.push(text);
-    });
-    // [(text)(text)...] TJ
-    const tjArrayMatches = block.match(/\[([^\]]*)\]\s*TJ/g) || [];
-    tjArrayMatches.forEach(m => {
-      const inner = m.match(/\(([^)]*)\)/g) || [];
-      inner.forEach(s => chunks.push(s.replace(/[()]/g, '')));
-    });
-  });
+  // Helper: decode PDF string escape sequences
+  const decodePdfString = (s) =>
+    s.replace(/\\n/g, '\n')
+     .replace(/\\r/g, '')
+     .replace(/\\t/g, ' ')
+     .replace(/\\\(/g, '(')
+     .replace(/\\\)/g, ')')
+     .replace(/\\\\/g, '\\');
 
-  return chunks
-    .map(s => s.replace(/\\n/g, '\n').replace(/\\r/g, '').replace(/\\t/g, ' '))
+  // Helper: extract text operators from a decoded stream string
+  const extractTextFromStream = (streamStr) => {
+    // BT ... ET blocks
+    const btBlocks = streamStr.match(/BT[\s\S]*?ET/g) || [];
+    btBlocks.forEach(block => {
+      // (text) Tj
+      const tjMatches = [...block.matchAll(/\(([^)]*)\)\s*Tj/g)];
+      tjMatches.forEach(m => chunks.push(decodePdfString(m[1])));
+      // [(text) num (text)] TJ
+      const tjArrayMatches = [...block.matchAll(/\[([^\]]*)\]\s*TJ/g)];
+      tjArrayMatches.forEach(m => {
+        const inner = [...m[1].matchAll(/\(([^)]*)\)/g)];
+        inner.forEach(s => chunks.push(decodePdfString(s[1])));
+      });
+      // Td / T* = new line marker
+      if (block.includes(' Td') || block.includes('T*')) chunks.push('\n');
+    });
+  };
+
+  const raw = buffer.toString('latin1');
+
+  // 1. Try compressed streams (FlateDecode) — most modern PDFs
+  const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+  let match;
+  while ((match = streamRegex.exec(raw)) !== null) {
+    try {
+      const streamBuf = Buffer.from(match[1], 'latin1');
+      const decompressed = zlib.inflateRawSync(streamBuf).toString('latin1');
+      extractTextFromStream(decompressed);
+    } catch (_) {
+      // Not a compressed stream — try as plain text
+      extractTextFromStream(match[1]);
+    }
+  }
+
+  // 2. Also scan uncompressed top-level BT...ET (some simple PDFs)
+  extractTextFromStream(raw);
+
+  const text = chunks
     .join(' ')
-    .replace(/\s+/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n +/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
+
+  return text;
 }
 
 // Pattern-match timetable entries from raw extracted PDF text
@@ -3505,7 +3541,9 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
     // This is more reliable than sending a binary PDF to a vision model.
     const rawText = extractRawTextFromPdf(req.file.buffer);
 
-    if (GROQ_API_KEY && rawText && rawText.length > 20) {
+    console.log(`[PDF] Extracted ${rawText.length} chars of text from PDF`);
+
+    if (GROQ_API_KEY) {
       try {
         const prompt = `You are a university timetable parser. Extract ALL class/lecture/lab/tutorial sessions from the timetable text below.
 Return ONLY a raw JSON array — no markdown, no backticks, no explanation, nothing else.
@@ -3528,7 +3566,7 @@ Rules:
 - Extract EVERY session — do not skip any
 
 TIMETABLE TEXT:
-${rawText.substring(0, 12000)}`;
+${rawText.length > 20 ? rawText.substring(0, 12000) : '[PDF text could not be extracted - this may be a scanned/image PDF. Return an empty array []]'}`;
 
         const timeoutPromise = new Promise((_, reject) =>
           setTimeout(() => reject(new Error('TIMEOUT')), 25000)
