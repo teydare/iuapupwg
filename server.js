@@ -10,7 +10,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
-// pdf-parse removed: Gemini reads PDFs directly as base64, no text extraction needed.
+// pdfjs-dist is used for PDF text extraction (installed via npm install pdfjs-dist).
+// Falls back to zlib stream scanning if not available.
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -3402,84 +3403,96 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
   }
 });
 
-// ... existing imports ...
-// Add lodash for easier data manipulation if not present: const _ = require('lodash');
 // ============================================
-// UNIVERSAL PDF PARSER - FIXED VERSION
+// PDF PARSING — pdfjs-dist + Groq Vision
+// pdfjs-dist: pure-JS, handles ALL PDF encodings including compressed/custom fonts.
+// Groq Vision: reads the PDF as an image when text extraction yields nothing
+//              (for scanned/image-only PDFs).
 // ============================================
 
-
-
-// ============================================
-// PURE-JS PDF TEXT EXTRACTOR (no npm dependency)
-// Reads raw text from PDF content streams using regex.
-// Works on all text-based PDFs without pdf-parse.
-// ============================================
-// Robust PDF text extractor using Node built-in zlib to decompress PDF streams.
-// Handles both compressed (FlateDecode) and uncompressed PDF content streams.
-// No npm dependency needed.
-function extractRawTextFromPdf(buffer) {
-  const zlib = require('zlib');
-  const chunks = [];
-
-  // Helper: decode PDF string escape sequences
-  const decodePdfString = (s) =>
-    s.replace(/\\n/g, '\n')
-     .replace(/\\r/g, '')
-     .replace(/\\t/g, ' ')
-     .replace(/\\\(/g, '(')
-     .replace(/\\\)/g, ')')
-     .replace(/\\\\/g, '\\');
-
-  // Helper: extract text operators from a decoded stream string
-  const extractTextFromStream = (streamStr) => {
-    // BT ... ET blocks
-    const btBlocks = streamStr.match(/BT[\s\S]*?ET/g) || [];
-    btBlocks.forEach(block => {
-      // (text) Tj
-      const tjMatches = [...block.matchAll(/\(([^)]*)\)\s*Tj/g)];
-      tjMatches.forEach(m => chunks.push(decodePdfString(m[1])));
-      // [(text) num (text)] TJ
-      const tjArrayMatches = [...block.matchAll(/\[([^\]]*)\]\s*TJ/g)];
-      tjArrayMatches.forEach(m => {
-        const inner = [...m[1].matchAll(/\(([^)]*)\)/g)];
-        inner.forEach(s => chunks.push(decodePdfString(s[1])));
-      });
-      // Td / T* = new line marker
-      if (block.includes(' Td') || block.includes('T*')) chunks.push('\n');
-    });
-  };
-
-  const raw = buffer.toString('latin1');
-
-  // 1. Try compressed streams (FlateDecode) — most modern PDFs
-  const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-  let match;
-  while ((match = streamRegex.exec(raw)) !== null) {
-    try {
-      const streamBuf = Buffer.from(match[1], 'latin1');
-      const decompressed = zlib.inflateRawSync(streamBuf).toString('latin1');
-      extractTextFromStream(decompressed);
-    } catch (_) {
-      // Not a compressed stream — try as plain text
-      extractTextFromStream(match[1]);
+// Step 1: Extract text using pdfjs-dist (robust pure-JS, no native deps).
+// Falls back to zlib stream scanning if pdfjs-dist isn't installed.
+async function extractPdfText(buffer) {
+  // Try pdfjs-dist first — handles compressed streams, custom fonts, all encodings
+  try {
+    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = false; // Disable web worker (Node env)
+    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(buffer) });
+    const pdf = await loadingTask.promise;
+    const textParts = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      // Each item has .str (the text) and .hasEOL (line break)
+      let pageText = '';
+      for (const item of content.items) {
+        pageText += item.str;
+        if (item.hasEOL) pageText += '\n';
+        else pageText += ' ';
+      }
+      textParts.push(pageText.trim());
     }
+    const text = textParts.join('\n\n').replace(/[ \t]+/g, ' ').trim();
+    if (text.length > 50) return text;
+    console.warn('[PDF] pdfjs-dist returned minimal text, trying fallback');
+  } catch (e) {
+    console.warn('[PDF] pdfjs-dist failed:', e.message, '— trying zlib fallback');
   }
 
-  // 2. Also scan uncompressed top-level BT...ET (some simple PDFs)
-  extractTextFromStream(raw);
-
-  const text = chunks
-    .join(' ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n +/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  return text;
+  // Zlib fallback — works on some PDFs where pdfjs-dist isn't available
+  try {
+    const zlib = require('zlib');
+    const chunks = [];
+    const raw = buffer.toString('latin1');
+    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    let match;
+    while ((match = streamRegex.exec(raw)) !== null) {
+      try {
+        const decompressed = zlib.inflateRawSync(Buffer.from(match[1], 'latin1')).toString('latin1');
+        const btBlocks = decompressed.match(/BT[\s\S]*?ET/g) || [];
+        btBlocks.forEach(block => {
+          [...block.matchAll(/\(([^)]*)\)\s*Tj/g)].forEach(m => chunks.push(m[1]));
+          [...block.matchAll(/\[([^\]]*)\]\s*TJ/g)].forEach(m => {
+            [...m[1].matchAll(/\(([^)]*)\)/g)].forEach(s => chunks.push(s[1]));
+          });
+          if (block.includes(' Td') || block.includes('T*')) chunks.push('\n');
+        });
+      } catch (_) {
+        // Not a compressed stream, try as plain text
+        const btBlocks = match[1].match(/BT[\s\S]*?ET/g) || [];
+        btBlocks.forEach(block => {
+          [...block.matchAll(/\(([^)]*)\)\s*Tj/g)].forEach(m => chunks.push(m[1]));
+        });
+      }
+    }
+    return chunks.join(' ').replace(/\s+/g, ' ').trim();
+  } catch (e) {
+    return '';
+  }
 }
 
-// Pattern-match timetable entries from raw extracted PDF text
+// Step 2: If text extraction fails, convert first page to JPEG and use Groq Vision
+// Uses pdfjs-dist + canvas (if available) to render the page as an image
+async function renderPdfPageAsBase64(buffer) {
+  try {
+    const { createCanvas } = require('canvas');
+    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = false;
+    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    const page = await pdf.getPage(1);
+    const scale = 2.0; // Higher = better quality for OCR
+    const viewport = page.getViewport({ scale });
+    const canvas = createCanvas(viewport.width, viewport.height);
+    const ctx = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return canvas.toBuffer('image/jpeg', { quality: 0.92 }).toString('base64');
+  } catch (e) {
+    console.warn('[PDF] Canvas render failed:', e.message, '(canvas package not installed)');
+    return null;
+  }
+}
+
+// Step 3: Pattern-matching fallback for when AI is unavailable
 function parseCoursesFromText(rawText) {
   const DAY_MAP = {
     SUNDAY: 0, SUN: 0, MONDAY: 1, MON: 1,
@@ -3487,42 +3500,28 @@ function parseCoursesFromText(rawText) {
     THURSDAY: 4, THU: 4, THUR: 4, FRIDAY: 5, FRI: 5,
     SATURDAY: 6, SAT: 6,
   };
-
   const lines = rawText.split(/[\n\r]/).map(l => l.trim()).filter(Boolean);
   const courses = [];
   let currentDay = 1;
-
   lines.forEach(line => {
     const upper = line.toUpperCase();
-
-    // Update day context
     const dayMatch = upper.match(/\b(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUN|MON|TUES?|WED|THUR?|FRI|SAT)\b/);
     if (dayMatch) currentDay = DAY_MAP[dayMatch[1]] ?? currentDay;
-
-    // Extract time
     const timeMatch = line.match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
-
-    // Extract course codes: CS101, MAT 201B, ENG 302
     const codeMatches = [...line.matchAll(/\b([A-Z]{2,6})[\s-]?(\d{2,4})([A-Z])?\b/g)];
     codeMatches.forEach(m => {
       const code = `${m[1]} ${m[2]}${m[3] || ''}`;
       courses.push({
         id: `fallback-${courses.length}`,
-        course_code: code,
-        course_name: code,
-        program: 'General',
-        year: 'Not specified',
+        course_code: code, course_name: code,
+        program: 'General', year: 'Not specified',
         day_of_week: currentDay,
         start_time: timeMatch ? `${String(timeMatch[1]).padStart(2,'0')}:${timeMatch[2]}` : '08:00',
         end_time:   timeMatch ? `${String(timeMatch[3]).padStart(2,'0')}:${timeMatch[4]}` : '09:00',
-        location: 'TBD',
-        instructor: 'Staff',
-        checked: true,
+        location: 'TBD', instructor: 'Staff', checked: true,
       });
     });
   });
-
-  // Deduplicate
   const seen = new Set();
   return courses.filter(c => {
     const key = `${c.course_code}|${c.day_of_week}|${c.start_time}`;
@@ -3532,130 +3531,154 @@ function parseCoursesFromText(rawText) {
   });
 }
 
-app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
+// Shared response formatter
+function formatCourses(parsed) {
+  return parsed.map((c, i) => ({
+    id: `parsed-${Date.now()}-${i}`,
+    course_code: String(c.course_code || '').toUpperCase().trim(),
+    course_name: String(c.course_name || c.course_code || '').trim(),
+    program: String(c.program || 'General').trim(),
+    year: 'Not specified',
+    day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
+    start_time: String(c.start_time || '08:00'),
+    end_time: String(c.end_time || '09:00'),
+    location: String(c.location || 'TBD').trim(),
+    instructor: String(c.instructor || 'Staff').trim(),
+    checked: true,
+  }));
+}
 
-    // ── PATH A: Groq (free, fast, smart — uses Llama 3.3 70B) ──────────────
-    // Extract text first with pure-JS (no dependency), then send text to Groq.
-    // This is more reliable than sending a binary PDF to a vision model.
-    const rawText = extractRawTextFromPdf(req.file.buffer);
-
-    console.log(`[PDF] Extracted ${rawText.length} chars of text from PDF`);
-
-    if (GROQ_API_KEY) {
-      try {
-        const prompt = `You are a university timetable parser. Extract ALL class/lecture/lab/tutorial sessions from the timetable text below.
-Return ONLY a raw JSON array — no markdown, no backticks, no explanation, nothing else.
+const GROQ_TIMETABLE_PROMPT = `You are a university timetable parser. Extract ALL class/lecture/lab/tutorial sessions.
+Return ONLY a raw JSON array — no markdown, no backticks, no explanation.
 
 Each object must have exactly these fields:
 {
-  "course_code": "CS101",
-  "course_name": "Introduction to Computing",
+  "course_code": "EE 151",
+  "course_name": "EE 151",
   "day_of_week": 1,
   "start_time": "08:00",
-  "end_time": "10:00",
-  "location": "Room 302",
-  "instructor": "Dr. Smith"
+  "end_time": "09:00",
+  "location": "VSLA",
+  "instructor": "E. Twumasi",
+  "program": "ELECTRICAL"
 }
 
 Rules:
 - day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
-- start_time and end_time in 24-hour HH:MM format (e.g. "08:30", "14:00")
+- start_time and end_time in 24-hour HH:MM format
+- program = the department column the course appears under (ELECTRICAL, MECHANICAL, CIVIL, etc.)
 - If a field is unknown use empty string ""
-- Extract EVERY session — do not skip any
+- Extract EVERY session — include all days, all departments`;
 
-TIMETABLE TEXT:
-${rawText.length > 20 ? rawText.substring(0, 12000) : '[PDF text could not be extracted - this may be a scanned/image PDF. Return an empty array []]'}`;
+app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('TIMEOUT')), 25000)
-        );
+    const timeout = ms => new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), ms));
 
+    // ── STEP 1: Extract text (pdfjs-dist handles virtually all PDFs) ──────────
+    const rawText = await extractPdfText(req.file.buffer);
+    console.log(`[PDF] Extracted ${rawText.length} chars from PDF`);
+
+    // ── STEP 2A: Groq text model (fast, accurate — if text extracted) ─────────
+    if (GROQ_API_KEY && rawText.length > 50) {
+      try {
         const groqRes = await Promise.race([
           fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${GROQ_API_KEY}`,
-            },
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
             body: JSON.stringify({
               model: 'llama-3.3-70b-versatile',
-              messages: [{ role: 'user', content: prompt }],
-              temperature: 0.1,  // Low temp = more deterministic JSON
-              max_tokens: 4096,
+              messages: [{ role: 'user', content: GROQ_TIMETABLE_PROMPT + '\n\nTIMETABLE TEXT:\n' + rawText.substring(0, 14000) }],
+              temperature: 0.1,
+              max_tokens: 8192,
             }),
           }),
-          timeoutPromise
+          timeout(25000),
         ]);
-
         const groqData = await groqRes.json();
-
-        if (!groqRes.ok) {
-          // 429 = rate limited (very rare on Groq free tier), fall through gracefully
-          console.warn('Groq API error:', groqData.error?.message || groqRes.status);
-        } else {
+        if (groqRes.ok) {
           const responseText = groqData.choices?.[0]?.message?.content || '';
-          const jsonStr = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
-          const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
-
+          const jsonMatch = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').match(/\[[\s\S]*\]/);
           if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0]);
             if (Array.isArray(parsed) && parsed.length > 0) {
-              const formatted = parsed.map((c, i) => ({
-                id: `parsed-${Date.now()}-${i}`,
-                course_code: String(c.course_code || '').toUpperCase().trim(),
-                course_name: String(c.course_name || c.course_code || '').trim(),
-                program: 'General',
-                year: 'Not specified',
-                day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
-                start_time: String(c.start_time || '08:00'),
-                end_time: String(c.end_time || '09:00'),
-                location: String(c.location || 'TBD').trim(),
-                instructor: String(c.instructor || 'Staff').trim(),
-                checked: true,
-              }));
-              console.log(`PDF parsed via Groq (${formatted.length} courses)`);
-              return res.json({ success: true, courses: formatted });
+              console.log(`[PDF] Groq text → ${parsed.length} courses`);
+              return res.json({ success: true, courses: formatCourses(parsed) });
             }
           }
-          console.warn('Groq returned no parseable JSON, falling back to pattern matching');
         }
-      } catch (groqErr) {
-        console.warn('Groq error, falling back to pattern matching:', groqErr.message);
+        console.warn('[PDF] Groq text returned no JSON, trying vision...');
+      } catch (e) {
+        console.warn('[PDF] Groq text error:', e.message);
       }
     }
 
-    // ── PATH B: Pure-JS pattern matching fallback ─────────────────────────────
-    console.log('Using pattern-matching fallback for PDF parsing');
-
-    if (!rawText || rawText.length < 20) {
-      return res.status(422).json({ 
-        success: false, 
-        error: 'Could not read text from this PDF. Make sure it is not a scanned image PDF. Please add courses manually.'
-      });
+    // ── STEP 2B: Groq Vision (reads PDF as image — works on scanned/image PDFs) ─
+    if (GROQ_API_KEY) {
+      try {
+        const imageB64 = await renderPdfPageAsBase64(req.file.buffer);
+        if (imageB64) {
+          const groqRes = await Promise.race([
+            fetch('https://api.groq.com/openai/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+              body: JSON.stringify({
+                model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+                messages: [{
+                  role: 'user',
+                  content: [
+                    { type: 'text', text: GROQ_TIMETABLE_PROMPT },
+                    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageB64}` } }
+                  ]
+                }],
+                temperature: 0.1,
+                max_tokens: 8192,
+              }),
+            }),
+            timeout(30000),
+          ]);
+          const groqData = await groqRes.json();
+          if (groqRes.ok) {
+            const responseText = groqData.choices?.[0]?.message?.content || '';
+            const jsonMatch = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').match(/\[[\s\S]*\]/);
+            if (jsonMatch) {
+              const parsed = JSON.parse(jsonMatch[0]);
+              if (Array.isArray(parsed) && parsed.length > 0) {
+                console.log(`[PDF] Groq vision → ${parsed.length} courses`);
+                return res.json({ success: true, courses: formatCourses(parsed) });
+              }
+            }
+          }
+          console.warn('[PDF] Groq vision returned no JSON');
+        } else {
+          console.warn('[PDF] Canvas not available — install canvas for vision support: npm install canvas');
+        }
+      } catch (e) {
+        console.warn('[PDF] Groq vision error:', e.message);
+      }
     }
 
+    // ── STEP 3: Pattern-matching fallback ─────────────────────────────────────
+    if (rawText.length < 20) {
+      return res.status(422).json({
+        success: false,
+        error: 'Could not extract text from this PDF. Install the canvas package on the server for image-based reading, or add courses manually.'
+      });
+    }
     const courses = parseCoursesFromText(rawText);
-
     if (courses.length === 0) {
-      return res.status(422).json({ 
-        success: false, 
-        error: 'No course codes found in this PDF. You can add courses manually instead.'
-      });
+      return res.status(422).json({ success: false, error: 'No courses found. Please add them manually.' });
     }
-
-    console.log(`PDF parsed via pattern matching (${courses.length} courses)`);
+    console.log(`[PDF] Pattern match → ${courses.length} courses`);
     return res.json({ success: true, courses, method: 'pattern' });
 
   } catch (error) {
-    console.error('PDF parse error:', error.message);
-    const userMsg = error.message === 'TIMEOUT'
-      ? 'PDF took too long to process. Try a smaller file.'
-      : 'Failed to parse PDF: ' + error.message;
-    res.status(500).json({ success: false, error: userMsg });
+    console.error('[PDF] parse error:', error.message);
+    res.status(500).json({ success: false, error: error.message === 'TIMEOUT' ? 'PDF took too long — try a smaller file.' : 'Failed to parse: ' + error.message });
   }
 });
+
 
 
 // ============================================
