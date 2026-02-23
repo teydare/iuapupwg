@@ -21,18 +21,13 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
-// Gemini for PDF parsing
-let genAI = null;
-try {
-  const { GoogleGenerativeAI } = require('@google/generative-ai');
-  if (process.env.GEMINI_API_KEY) {
-    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    console.log('✅ Gemini AI initialized');
-  } else {
-    console.log('ℹ️  No GEMINI_API_KEY set - PDF parsing will return 503 until key is added');
-  }
-} catch (e) {
-  console.log('ℹ️  @google/generative-ai not installed - run: npm install @google/generative-ai');
+// Groq for PDF parsing (free tier: 14,400 req/day, no credit card needed)
+// Sign up at https://console.groq.com → API Keys → Create key → add as GROQ_API_KEY in Railway
+const GROQ_API_KEY = process.env.GROQ_API_KEY || null;
+if (GROQ_API_KEY) {
+  console.log('✅ Groq AI ready for PDF parsing');
+} else {
+  console.log('ℹ️  No GROQ_API_KEY set - PDF parsing will use pattern-matching fallback');
 }
 // ============================================
 // SUPABASE STORAGE CLIENT
@@ -3505,14 +3500,15 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
-    // ── PATH A: Gemini (best results, requires API key + quota) ──────────────
-    if (genAI) {
-      try {
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-        const base64Pdf = req.file.buffer.toString('base64');
+    // ── PATH A: Groq (free, fast, smart — uses Llama 3.3 70B) ──────────────
+    // Extract text first with pure-JS (no dependency), then send text to Groq.
+    // This is more reliable than sending a binary PDF to a vision model.
+    const rawText = extractRawTextFromPdf(req.file.buffer);
 
-        const prompt = `You are a university timetable parser. Analyze this PDF and extract ALL class/lecture/lab/tutorial sessions.
-Return ONLY a raw JSON array — no markdown, no backticks, no explanation.
+    if (GROQ_API_KEY && rawText && rawText.length > 20) {
+      try {
+        const prompt = `You are a university timetable parser. Extract ALL class/lecture/lab/tutorial sessions from the timetable text below.
+Return ONLY a raw JSON array — no markdown, no backticks, no explanation, nothing else.
 
 Each object must have exactly these fields:
 {
@@ -3528,73 +3524,72 @@ Each object must have exactly these fields:
 Rules:
 - day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
 - start_time and end_time in 24-hour HH:MM format (e.g. "08:30", "14:00")
-- If a field is unknown, use empty string ""
-- Extract EVERY session you can find`;
+- If a field is unknown use empty string ""
+- Extract EVERY session — do not skip any
 
-        // Retry up to 3 times on 429 with exponential backoff
-        let lastGeminiError;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          if (attempt > 0) {
-            const delay = 1000 * Math.pow(2, attempt); // 2s, 4s
-            console.log(`Gemini 429 - retrying in ${delay}ms (attempt ${attempt + 1})`);
-            await new Promise(r => setTimeout(r, delay));
-          }
-          try {
-            const timeoutPromise = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('TIMEOUT')), 25000)
-            );
-            const result = await Promise.race([
-              model.generateContent([
-                { text: prompt },
-                { inlineData: { data: base64Pdf, mimeType: 'application/pdf' } }
-              ]),
-              timeoutPromise
-            ]);
+TIMETABLE TEXT:
+${rawText.substring(0, 12000)}`;
 
-            const responseText = result.response.text();
-            const jsonStr = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
-            const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
-            if (!jsonMatch) throw new Error('No JSON array in Gemini response');
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('TIMEOUT')), 25000)
+        );
 
+        const groqRes = await Promise.race([
+          fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${GROQ_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: 'llama-3.3-70b-versatile',
+              messages: [{ role: 'user', content: prompt }],
+              temperature: 0.1,  // Low temp = more deterministic JSON
+              max_tokens: 4096,
+            }),
+          }),
+          timeoutPromise
+        ]);
+
+        const groqData = await groqRes.json();
+
+        if (!groqRes.ok) {
+          // 429 = rate limited (very rare on Groq free tier), fall through gracefully
+          console.warn('Groq API error:', groqData.error?.message || groqRes.status);
+        } else {
+          const responseText = groqData.choices?.[0]?.message?.content || '';
+          const jsonStr = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+          const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+
+          if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0]);
-            if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('Empty result from Gemini');
-
-            const formatted = parsed.map((c, i) => ({
-              id: `parsed-${Date.now()}-${i}`,
-              course_code: String(c.course_code || '').toUpperCase().trim(),
-              course_name: String(c.course_name || c.course_code || '').trim(),
-              program: 'General',
-              year: 'Not specified',
-              day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
-              start_time: String(c.start_time || '08:00'),
-              end_time: String(c.end_time || '09:00'),
-              location: String(c.location || 'TBD').trim(),
-              instructor: String(c.instructor || 'Staff').trim(),
-              checked: true,
-            }));
-
-            console.log(`PDF parsed via Gemini (${formatted.length} courses)`);
-            return res.json({ success: true, courses: formatted });
-
-          } catch (err) {
-            lastGeminiError = err;
-            const is429 = err.message && err.message.includes('429');
-            if (!is429) break; // Only retry on rate limit errors
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              const formatted = parsed.map((c, i) => ({
+                id: `parsed-${Date.now()}-${i}`,
+                course_code: String(c.course_code || '').toUpperCase().trim(),
+                course_name: String(c.course_name || c.course_code || '').trim(),
+                program: 'General',
+                year: 'Not specified',
+                day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
+                start_time: String(c.start_time || '08:00'),
+                end_time: String(c.end_time || '09:00'),
+                location: String(c.location || 'TBD').trim(),
+                instructor: String(c.instructor || 'Staff').trim(),
+                checked: true,
+              }));
+              console.log(`PDF parsed via Groq (${formatted.length} courses)`);
+              return res.json({ success: true, courses: formatted });
+            }
           }
+          console.warn('Groq returned no parseable JSON, falling back to pattern matching');
         }
-
-        console.warn('Gemini unavailable, falling back to pattern matching:', lastGeminiError.message);
-        // Fall through to Path B
-
-      } catch (geminiSetupErr) {
-        console.warn('Gemini setup error:', geminiSetupErr.message);
-        // Fall through to Path B
+      } catch (groqErr) {
+        console.warn('Groq error, falling back to pattern matching:', groqErr.message);
       }
     }
 
-    // ── PATH B: Pure-JS fallback (no API key, no npm dependency) ─────────────
+    // ── PATH B: Pure-JS pattern matching fallback ─────────────────────────────
     console.log('Using pattern-matching fallback for PDF parsing');
-    const rawText = extractRawTextFromPdf(req.file.buffer);
 
     if (!rawText || rawText.length < 20) {
       return res.status(422).json({ 
