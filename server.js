@@ -3388,14 +3388,12 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 });
 
 // ============================================
-// PDF PARSING — Groq Vision only
-// Converts each PDF page to an image with ImageMagick,
-// then sends ALL pages to Groq Vision to read like a human.
-// No text extraction. No pattern matching. AI reads it directly.
-// ImageMagick (convert command) is pre-installed on Railway/Ubuntu.
+// PDF PARSING — ImageMagick + Groq Vision
+// ImageMagick converts each PDF page to a JPEG image.
+// Groq Vision reads the images exactly as a human would.
+// Requires: ImageMagick installed (via Dockerfile), GROQ_API_KEY in Railway Variables.
 // ============================================
 
-// Convert all PDF pages to base64 JPEG images using ImageMagick
 async function pdfToImages(buffer) {
   const { spawnSync } = require('child_process');
   const fs = require('fs');
@@ -3408,20 +3406,19 @@ async function pdfToImages(buffer) {
   try {
     fs.writeFileSync(pdfPath, buffer);
 
-    // Convert all pages to JPEGs at 200dpi (good balance of quality vs size)
     const result = spawnSync('convert', [
       '-density', '200',
       '-quality', '85',
       pdfPath,
       path.join(tmpDir, 'page-%d.jpg')
-    ]);
+    ], { timeout: 60000 });
 
     if (result.status !== 0) {
-      console.warn('[PDF] ImageMagick convert failed:', result.stderr?.toString());
+      const errMsg = result.stderr?.toString() || result.error?.message || 'unknown error';
+      console.warn('[PDF] ImageMagick failed:', errMsg);
       return [];
     }
 
-    // Read all generated page images, sorted by page number
     const files = fs.readdirSync(tmpDir)
       .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
       .sort((a, b) => {
@@ -3434,20 +3431,20 @@ async function pdfToImages(buffer) {
       fs.readFileSync(path.join(tmpDir, f)).toString('base64')
     );
 
-    console.log(`[PDF] ImageMagick converted ${images.length} pages to images`);
+    console.log(`[PDF] ImageMagick converted ${images.length} pages`);
     return images;
 
   } catch (e) {
     console.warn('[PDF] ImageMagick error:', e.message);
     return [];
   } finally {
-    try { spawnSync('rm', ['-rf', tmpDir]); } catch (_) {} 
+    try { spawnSync('rm', ['-rf', tmpDir]); } catch (_) {}
   }
 }
 
-const TIMETABLE_PROMPT = `You are reading a university timetable image. Extract EVERY class session you can see.
+const TIMETABLE_PROMPT = `You are reading a university timetable image. Extract EVERY class session visible.
 
-Return ONLY a raw JSON array. No markdown, no backticks, no explanation — just the array.
+Return ONLY a raw JSON array — no markdown, no backticks, no explanation.
 
 Each object must have exactly these fields:
 {
@@ -3463,36 +3460,25 @@ Each object must have exactly these fields:
 
 Rules:
 - day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
-- The day (Monday/Tuesday etc.) is stated in the page heading — apply it to ALL entries on that page
-- Times in 24-hour HH:MM format. "8:00-8:55" → start_time "08:00", end_time "08:55"
-- program = the department column header the course appears under (ELECTRICAL, MECHANICAL, CIVIL, COMPUTER, CHEMICAL, AEROSPACE, GEOMATIC, MATERIALS, PETROLEUM, AGRIC)
-- Extract every single session — every row, every department column
+- The day (MONDAY/TUESDAY etc.) is in the page heading — apply it to ALL entries on that page
+- Times in 24-hour HH:MM. "8:00-8:55" becomes "08:00" and "08:55"
+- program = the department column the course is under (ELECTRICAL, MECHANICAL, CIVIL, COMPUTER, CHEMICAL, AEROSPACE, GEOMATIC, MATERIALS, PETROLEUM, AGRIC)
+- Extract EVERY session — every row, every column, every department
 - Unknown fields = empty string ""`;
 
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
+    if (!GROQ_API_KEY) return res.status(503).json({ success: false, error: 'GROQ_API_KEY not set in Railway Variables.' });
 
-    if (!GROQ_API_KEY) {
-      return res.status(503).json({
-        success: false,
-        error: 'GROQ_API_KEY is not set. Add it in Railway → Variables to enable AI PDF parsing.'
-      });
-    }
-
-    // Convert PDF to images
     const images = await pdfToImages(req.file.buffer);
     if (!images.length) {
-      return res.status(422).json({
-        success: false,
-        error: 'Could not convert PDF to images. Make sure ImageMagick is installed on the server.'
-      });
+      return res.status(422).json({ success: false, error: 'Could not convert PDF to images. Check that ImageMagick is installed (Dockerfile).' });
     }
 
     const timer = ms => new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), ms));
     const allCourses = [];
 
-    // Send each page to Groq Vision
     for (let i = 0; i < images.length; i++) {
       console.log(`[PDF] Sending page ${i + 1}/${images.length} to Groq Vision...`);
       try {
@@ -3520,24 +3506,19 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
         ]);
 
         const data = await groqRes.json();
-
-        if (!groqRes.ok) {
-          console.warn(`[PDF] Groq error on page ${i + 1}:`, data.error?.message);
-          continue;
-        }
+        if (!groqRes.ok) { console.warn(`[PDF] Groq error page ${i+1}:`, data.error?.message); continue; }
 
         const text = data.choices?.[0]?.message?.content || '';
         const jsonMatch = text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').match(/\[[\s\S]*\]/);
-        if (!jsonMatch) { console.warn(`[PDF] No JSON in page ${i + 1} response`); continue; }
+        if (!jsonMatch) { console.warn(`[PDF] No JSON from page ${i+1}`); continue; }
 
         const parsed = JSON.parse(jsonMatch[0]);
         if (Array.isArray(parsed)) {
-          console.log(`[PDF] Page ${i + 1} → ${parsed.length} courses`);
+          console.log(`[PDF] Page ${i+1} -> ${parsed.length} courses`);
           allCourses.push(...parsed);
         }
-
       } catch (e) {
-        console.warn(`[PDF] Page ${i + 1} failed:`, e.message);
+        console.warn(`[PDF] Page ${i+1} error:`, e.message);
       }
     }
 
@@ -3545,37 +3526,36 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
       return res.status(422).json({ success: false, error: 'Groq could not extract any courses from this PDF.' });
     }
 
-    // Deduplicate by course_code + day + start_time
     const seen = new Set();
-    const unique = allCourses.filter(c => {
-      const key = `${c.course_code}|${c.day_of_week}|${c.start_time}|${c.program}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    const courses = unique.map((c, i) => ({
-      id: `parsed-${Date.now()}-${i}`,
-      course_code: String(c.course_code || '').toUpperCase().trim(),
-      course_name: String(c.course_name || c.course_code || '').trim(),
-      program: String(c.program || '').trim(),
-      year: 'Not specified',
-      day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
-      start_time: String(c.start_time || '08:00'),
-      end_time: String(c.end_time || '09:00'),
-      location: String(c.location || '').trim(),
-      instructor: String(c.instructor || '').trim(),
-      checked: true,
-    }));
+    const courses = allCourses
+      .filter(c => {
+        const key = `${c.course_code}|${c.day_of_week}|${c.start_time}|${c.program}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map((c, i) => ({
+        id: `parsed-${Date.now()}-${i}`,
+        course_code: String(c.course_code || '').toUpperCase().trim(),
+        course_name: String(c.course_name || c.course_code || '').trim(),
+        program: String(c.program || '').trim(),
+        year: 'Not specified',
+        day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
+        start_time: String(c.start_time || '08:00'),
+        end_time: String(c.end_time || '09:00'),
+        location: String(c.location || '').trim(),
+        instructor: String(c.instructor || '').trim(),
+        checked: true,
+      }));
 
     console.log(`[PDF] Done — ${courses.length} unique courses from ${images.length} pages`);
     return res.json({ success: true, courses });
 
   } catch (error) {
-    console.error('[PDF] parse error:', error.message);
+    console.error('[PDF] Error:', error.message);
     res.status(500).json({
       success: false,
-      error: error.message === 'TIMEOUT' ? 'Groq took too long — try again.' : 'Failed: ' + error.message
+      error: error.message === 'TIMEOUT' ? 'Groq timed out. Try again.' : 'Failed: ' + error.message
     });
   }
 });
