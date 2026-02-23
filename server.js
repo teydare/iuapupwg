@@ -3428,7 +3428,7 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
       return res.status(503).json({ success: false, error: 'PDF parser is not configured on the server. Add GEMINI_API_KEY to Railway environment variables.' });
     }
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
     const base64Pdf = req.file.buffer.toString('base64');
 
     const prompt = `You are a university timetable parser. Analyze this PDF and extract ALL class/lecture/lab/tutorial sessions.
