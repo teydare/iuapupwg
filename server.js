@@ -10,8 +10,6 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
-// pdfjs-dist is used for PDF text extraction (installed via npm install pdfjs-dist).
-// Falls back to zlib stream scanning if not available.
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -22,14 +20,10 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
-// Groq for PDF parsing (free tier: 14,400 req/day, no credit card needed)
-// Sign up at https://console.groq.com → API Keys → Create key → add as GROQ_API_KEY in Railway
+// Groq for PDF parsing (free, fast, no quota issues)
 const GROQ_API_KEY = process.env.GROQ_API_KEY || null;
-if (GROQ_API_KEY) {
-  console.log('✅ Groq AI ready for PDF parsing');
-} else {
-  console.log('ℹ️  No GROQ_API_KEY set - PDF parsing will use pattern-matching fallback');
-}
+if (GROQ_API_KEY) console.log('✅ Groq ready');
+else console.log('⚠️  No GROQ_API_KEY — PDF parsing will use pattern-matching fallback');
 // ============================================
 // SUPABASE STORAGE CLIENT
 // ============================================
@@ -127,18 +121,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
 }));
 
-// Ensure preflight requests are answered with the SAME strict origin config
-// NOTE: app.options('*', cors()) with no args sets ACAO:* which BREAKS credentialed requests
-app.options('*', cors({
-  origin: function(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
-    return callback(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
-}));
+// Ensure preflight requests are answered
+app.options('*', cors());  
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -3404,169 +3388,66 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
 });
 
 // ============================================
-// PDF PARSING — pdfjs-dist + Groq Vision
-// pdfjs-dist: pure-JS, handles ALL PDF encodings including compressed/custom fonts.
-// Groq Vision: reads the PDF as an image when text extraction yields nothing
-//              (for scanned/image-only PDFs).
+// PDF PARSING — Groq Vision only
+// Converts each PDF page to an image with ImageMagick,
+// then sends ALL pages to Groq Vision to read like a human.
+// No text extraction. No pattern matching. AI reads it directly.
+// ImageMagick (convert command) is pre-installed on Railway/Ubuntu.
 // ============================================
 
-// Step 1: Extract text using pdfjs-dist (robust pure-JS, no native deps).
-// Falls back to zlib stream scanning if pdfjs-dist isn't installed.
-// pdfjs-dist v5 (your installed version) uses require('pdfjs-dist') directly.
-// Must disable the worker explicitly and pass Node-safe options to getDocument.
-async function extractPdfText(buffer) {
+// Convert all PDF pages to base64 JPEG images using ImageMagick
+async function pdfToImages(buffer) {
+  const { spawnSync } = require('child_process');
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-'));
+  const pdfPath = path.join(tmpDir, 'input.pdf');
+
   try {
-    const pdfjsLib = require('pdfjs-dist');
-    // v5: workerSrc must be empty string, not false
-    pdfjsLib.GlobalWorkerOptions.workerSrc = '';
-    const loadingTask = pdfjsLib.getDocument({
-      data: new Uint8Array(buffer),
-      useWorkerFetch: false,     // Don't try to fetch anything via worker
-      isEvalSupported: false,    // Safer in server environments
-      useSystemFonts: true,      // Use system fonts instead of fetching them
-      disableFontFace: true,     // Don't load font faces (not needed for text)
-      verbosity: 0,              // Suppress pdfjs console noise
-    });
-    const pdf = await loadingTask.promise;
-    console.log(`[PDF] pdfjs-dist v5 opened PDF — ${pdf.numPages} pages`);
-    const textParts = [];
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const content = await page.getTextContent();
-      let pageText = '';
-      for (const item of content.items) {
-        pageText += item.str;
-        if (item.hasEOL) pageText += '\n';
-        else pageText += ' ';
-      }
-      textParts.push(pageText.trim());
+    fs.writeFileSync(pdfPath, buffer);
+
+    // Convert all pages to JPEGs at 200dpi (good balance of quality vs size)
+    const result = spawnSync('convert', [
+      '-density', '200',
+      '-quality', '85',
+      pdfPath,
+      path.join(tmpDir, 'page-%d.jpg')
+    ]);
+
+    if (result.status !== 0) {
+      console.warn('[PDF] ImageMagick convert failed:', result.stderr?.toString());
+      return [];
     }
-    const text = textParts.join('\n\n').replace(/[ \t]+/g, ' ').trim();
-    if (text.length > 50) return text;
-    console.warn('[PDF] pdfjs-dist extracted minimal text — PDF may be image-based');
-  } catch (e) {
-    console.warn('[PDF] pdfjs-dist failed:', e.message, '— trying zlib fallback');
-  }
 
-  // Zlib fallback — works on some PDFs where pdfjs-dist isn't available
-  try {
-    const zlib = require('zlib');
-    const chunks = [];
-    const raw = buffer.toString('latin1');
-    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-    let match;
-    while ((match = streamRegex.exec(raw)) !== null) {
-      try {
-        const decompressed = zlib.inflateRawSync(Buffer.from(match[1], 'latin1')).toString('latin1');
-        const btBlocks = decompressed.match(/BT[\s\S]*?ET/g) || [];
-        btBlocks.forEach(block => {
-          [...block.matchAll(/\(([^)]*)\)\s*Tj/g)].forEach(m => chunks.push(m[1]));
-          [...block.matchAll(/\[([^\]]*)\]\s*TJ/g)].forEach(m => {
-            [...m[1].matchAll(/\(([^)]*)\)/g)].forEach(s => chunks.push(s[1]));
-          });
-          if (block.includes(' Td') || block.includes('T*')) chunks.push('\n');
-        });
-      } catch (_) {
-        // Not a compressed stream, try as plain text
-        const btBlocks = match[1].match(/BT[\s\S]*?ET/g) || [];
-        btBlocks.forEach(block => {
-          [...block.matchAll(/\(([^)]*)\)\s*Tj/g)].forEach(m => chunks.push(m[1]));
-        });
-      }
-    }
-    return chunks.join(' ').replace(/\s+/g, ' ').trim();
-  } catch (e) {
-    return '';
-  }
-}
-
-// Step 2: If text extraction fails, convert first page to JPEG and use Groq Vision
-// Render first page of PDF as JPEG using pdfjs-dist + canvas
-async function renderPdfPageAsBase64(buffer) {
-  try {
-    const { createCanvas } = require('canvas');
-    const pdfjsLib = require('pdfjs-dist');
-    pdfjsLib.GlobalWorkerOptions.workerSrc = '';
-    const pdf = await pdfjsLib.getDocument({
-      data: new Uint8Array(buffer),
-      useWorkerFetch: false,
-      isEvalSupported: false,
-      useSystemFonts: true,
-      disableFontFace: true,
-      verbosity: 0,
-    }).promise;
-    const page = await pdf.getPage(1);
-    const scale = 2.0;
-    const viewport = page.getViewport({ scale });
-    const canvas = createCanvas(viewport.width, viewport.height);
-    const ctx = canvas.getContext('2d');
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    console.log('[PDF] Page 1 rendered as image');
-    return canvas.toBuffer('image/jpeg', { quality: 0.92 }).toString('base64');
-  } catch (e) {
-    console.warn('[PDF] Canvas render failed:', e.message);
-    return null;
-  }
-}
-
-// Step 3: Pattern-matching fallback for when AI is unavailable
-function parseCoursesFromText(rawText) {
-  const DAY_MAP = {
-    SUNDAY: 0, SUN: 0, MONDAY: 1, MON: 1,
-    TUESDAY: 2, TUE: 2, TUES: 2, WEDNESDAY: 3, WED: 3,
-    THURSDAY: 4, THU: 4, THUR: 4, FRIDAY: 5, FRI: 5,
-    SATURDAY: 6, SAT: 6,
-  };
-  const lines = rawText.split(/[\n\r]/).map(l => l.trim()).filter(Boolean);
-  const courses = [];
-  let currentDay = 1;
-  lines.forEach(line => {
-    const upper = line.toUpperCase();
-    const dayMatch = upper.match(/\b(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUN|MON|TUES?|WED|THUR?|FRI|SAT)\b/);
-    if (dayMatch) currentDay = DAY_MAP[dayMatch[1]] ?? currentDay;
-    const timeMatch = line.match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
-    const codeMatches = [...line.matchAll(/\b([A-Z]{2,6})[\s-]?(\d{2,4})([A-Z])?\b/g)];
-    codeMatches.forEach(m => {
-      const code = `${m[1]} ${m[2]}${m[3] || ''}`;
-      courses.push({
-        id: `fallback-${courses.length}`,
-        course_code: code, course_name: code,
-        program: 'General', year: 'Not specified',
-        day_of_week: currentDay,
-        start_time: timeMatch ? `${String(timeMatch[1]).padStart(2,'0')}:${timeMatch[2]}` : '08:00',
-        end_time:   timeMatch ? `${String(timeMatch[3]).padStart(2,'0')}:${timeMatch[4]}` : '09:00',
-        location: 'TBD', instructor: 'Staff', checked: true,
+    // Read all generated page images, sorted by page number
+    const files = fs.readdirSync(tmpDir)
+      .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
+      .sort((a, b) => {
+        const na = parseInt(a.match(/page-(\d+)/)?.[1] ?? '0');
+        const nb = parseInt(b.match(/page-(\d+)/)?.[1] ?? '0');
+        return na - nb;
       });
-    });
-  });
-  const seen = new Set();
-  return courses.filter(c => {
-    const key = `${c.course_code}|${c.day_of_week}|${c.start_time}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+
+    const images = files.map(f =>
+      fs.readFileSync(path.join(tmpDir, f)).toString('base64')
+    );
+
+    console.log(`[PDF] ImageMagick converted ${images.length} pages to images`);
+    return images;
+
+  } catch (e) {
+    console.warn('[PDF] ImageMagick error:', e.message);
+    return [];
+  } finally {
+    try { spawnSync('rm', ['-rf', tmpDir]); } catch (_) {} 
+  }
 }
 
-// Shared response formatter
-function formatCourses(parsed) {
-  return parsed.map((c, i) => ({
-    id: `parsed-${Date.now()}-${i}`,
-    course_code: String(c.course_code || '').toUpperCase().trim(),
-    course_name: String(c.course_name || c.course_code || '').trim(),
-    program: String(c.program || 'General').trim(),
-    year: 'Not specified',
-    day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
-    start_time: String(c.start_time || '08:00'),
-    end_time: String(c.end_time || '09:00'),
-    location: String(c.location || 'TBD').trim(),
-    instructor: String(c.instructor || 'Staff').trim(),
-    checked: true,
-  }));
-}
+const TIMETABLE_PROMPT = `You are reading a university timetable image. Extract EVERY class session you can see.
 
-const GROQ_TIMETABLE_PROMPT = `You are a university timetable parser. Extract ALL class/lecture/lab/tutorial sessions.
-Return ONLY a raw JSON array — no markdown, no backticks, no explanation.
+Return ONLY a raw JSON array. No markdown, no backticks, no explanation — just the array.
 
 Each object must have exactly these fields:
 {
@@ -3574,7 +3455,7 @@ Each object must have exactly these fields:
   "course_name": "EE 151",
   "day_of_week": 1,
   "start_time": "08:00",
-  "end_time": "09:00",
+  "end_time": "08:55",
   "location": "VSLA",
   "instructor": "E. Twumasi",
   "program": "ELECTRICAL"
@@ -3582,121 +3463,122 @@ Each object must have exactly these fields:
 
 Rules:
 - day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
-- start_time and end_time in 24-hour HH:MM format
-- program = the department column the course appears under (ELECTRICAL, MECHANICAL, CIVIL, etc.)
-- If a field is unknown use empty string ""
-- Extract EVERY session — include all days, all departments`;
+- The day (Monday/Tuesday etc.) is stated in the page heading — apply it to ALL entries on that page
+- Times in 24-hour HH:MM format. "8:00-8:55" → start_time "08:00", end_time "08:55"
+- program = the department column header the course appears under (ELECTRICAL, MECHANICAL, CIVIL, COMPUTER, CHEMICAL, AEROSPACE, GEOMATIC, MATERIALS, PETROLEUM, AGRIC)
+- Extract every single session — every row, every department column
+- Unknown fields = empty string ""`;
 
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
-    const timeout = ms => new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), ms));
+    if (!GROQ_API_KEY) {
+      return res.status(503).json({
+        success: false,
+        error: 'GROQ_API_KEY is not set. Add it in Railway → Variables to enable AI PDF parsing.'
+      });
+    }
 
-    // ── STEP 1: Extract text (pdfjs-dist handles virtually all PDFs) ──────────
-    const rawText = await extractPdfText(req.file.buffer);
-    console.log(`[PDF] Extracted ${rawText.length} chars from PDF`);
+    // Convert PDF to images
+    const images = await pdfToImages(req.file.buffer);
+    if (!images.length) {
+      return res.status(422).json({
+        success: false,
+        error: 'Could not convert PDF to images. Make sure ImageMagick is installed on the server.'
+      });
+    }
 
-    // ── STEP 2A: Groq text model (fast, accurate — if text extracted) ─────────
-    if (GROQ_API_KEY && rawText.length > 50) {
+    const timer = ms => new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), ms));
+    const allCourses = [];
+
+    // Send each page to Groq Vision
+    for (let i = 0; i < images.length; i++) {
+      console.log(`[PDF] Sending page ${i + 1}/${images.length} to Groq Vision...`);
       try {
         const groqRes = await Promise.race([
           fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${GROQ_API_KEY}`
+            },
             body: JSON.stringify({
-              model: 'llama-3.3-70b-versatile',
-              messages: [{ role: 'user', content: GROQ_TIMETABLE_PROMPT + '\n\nTIMETABLE TEXT:\n' + rawText.substring(0, 14000) }],
+              model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+              messages: [{
+                role: 'user',
+                content: [
+                  { type: 'text', text: TIMETABLE_PROMPT },
+                  { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${images[i]}` } }
+                ]
+              }],
               temperature: 0.1,
               max_tokens: 8192,
-            }),
+            })
           }),
-          timeout(25000),
+          timer(30000)
         ]);
-        const groqData = await groqRes.json();
-        if (groqRes.ok) {
-          const responseText = groqData.choices?.[0]?.message?.content || '';
-          const jsonMatch = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').match(/\[[\s\S]*\]/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              console.log(`[PDF] Groq text → ${parsed.length} courses`);
-              return res.json({ success: true, courses: formatCourses(parsed) });
-            }
-          }
+
+        const data = await groqRes.json();
+
+        if (!groqRes.ok) {
+          console.warn(`[PDF] Groq error on page ${i + 1}:`, data.error?.message);
+          continue;
         }
-        console.warn('[PDF] Groq text returned no JSON, trying vision...');
+
+        const text = data.choices?.[0]?.message?.content || '';
+        const jsonMatch = text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').match(/\[[\s\S]*\]/);
+        if (!jsonMatch) { console.warn(`[PDF] No JSON in page ${i + 1} response`); continue; }
+
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(parsed)) {
+          console.log(`[PDF] Page ${i + 1} → ${parsed.length} courses`);
+          allCourses.push(...parsed);
+        }
+
       } catch (e) {
-        console.warn('[PDF] Groq text error:', e.message);
+        console.warn(`[PDF] Page ${i + 1} failed:`, e.message);
       }
     }
 
-    // ── STEP 2B: Groq Vision (reads PDF as image — works on scanned/image PDFs) ─
-    if (GROQ_API_KEY) {
-      try {
-        const imageB64 = await renderPdfPageAsBase64(req.file.buffer);
-        if (imageB64) {
-          const groqRes = await Promise.race([
-            fetch('https://api.groq.com/openai/v1/chat/completions', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
-              body: JSON.stringify({
-                model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-                messages: [{
-                  role: 'user',
-                  content: [
-                    { type: 'text', text: GROQ_TIMETABLE_PROMPT },
-                    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageB64}` } }
-                  ]
-                }],
-                temperature: 0.1,
-                max_tokens: 8192,
-              }),
-            }),
-            timeout(30000),
-          ]);
-          const groqData = await groqRes.json();
-          if (groqRes.ok) {
-            const responseText = groqData.choices?.[0]?.message?.content || '';
-            const jsonMatch = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').match(/\[[\s\S]*\]/);
-            if (jsonMatch) {
-              const parsed = JSON.parse(jsonMatch[0]);
-              if (Array.isArray(parsed) && parsed.length > 0) {
-                console.log(`[PDF] Groq vision → ${parsed.length} courses`);
-                return res.json({ success: true, courses: formatCourses(parsed) });
-              }
-            }
-          }
-          console.warn('[PDF] Groq vision returned no JSON');
-        } else {
-          console.warn('[PDF] Canvas not available — install canvas for vision support: npm install canvas');
-        }
-      } catch (e) {
-        console.warn('[PDF] Groq vision error:', e.message);
-      }
+    if (!allCourses.length) {
+      return res.status(422).json({ success: false, error: 'Groq could not extract any courses from this PDF.' });
     }
 
-    // ── STEP 3: Pattern-matching fallback ─────────────────────────────────────
-    if (rawText.length < 20) {
-      return res.status(422).json({
-        success: false,
-        error: 'Could not extract text from this PDF. Install the canvas package on the server for image-based reading, or add courses manually.'
-      });
-    }
-    const courses = parseCoursesFromText(rawText);
-    if (courses.length === 0) {
-      return res.status(422).json({ success: false, error: 'No courses found. Please add them manually.' });
-    }
-    console.log(`[PDF] Pattern match → ${courses.length} courses`);
-    return res.json({ success: true, courses, method: 'pattern' });
+    // Deduplicate by course_code + day + start_time
+    const seen = new Set();
+    const unique = allCourses.filter(c => {
+      const key = `${c.course_code}|${c.day_of_week}|${c.start_time}|${c.program}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const courses = unique.map((c, i) => ({
+      id: `parsed-${Date.now()}-${i}`,
+      course_code: String(c.course_code || '').toUpperCase().trim(),
+      course_name: String(c.course_name || c.course_code || '').trim(),
+      program: String(c.program || '').trim(),
+      year: 'Not specified',
+      day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
+      start_time: String(c.start_time || '08:00'),
+      end_time: String(c.end_time || '09:00'),
+      location: String(c.location || '').trim(),
+      instructor: String(c.instructor || '').trim(),
+      checked: true,
+    }));
+
+    console.log(`[PDF] Done — ${courses.length} unique courses from ${images.length} pages`);
+    return res.json({ success: true, courses });
 
   } catch (error) {
     console.error('[PDF] parse error:', error.message);
-    res.status(500).json({ success: false, error: error.message === 'TIMEOUT' ? 'PDF took too long — try a smaller file.' : 'Failed to parse: ' + error.message });
+    res.status(500).json({
+      success: false,
+      error: error.message === 'TIMEOUT' ? 'Groq took too long — try again.' : 'Failed: ' + error.message
+    });
   }
 });
-
-
 
 // ============================================
 // CREATE/GET PROGRAM (Universal)
