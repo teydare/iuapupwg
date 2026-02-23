@@ -10,10 +10,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
-// FIX: pdf-parse can export { default: fn } instead of fn directly in some environments.
-// Guard against both shapes so it's always callable.
-const _pdfParseModule = require('pdf-parse');
-const pdfExtractor = typeof _pdfParseModule === 'function' ? _pdfParseModule : (_pdfParseModule.default || _pdfParseModule);
+// pdf-parse removed: Gemini reads PDFs directly as base64, no text extraction needed.
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -24,7 +21,7 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
-// Gemini is optional - server works without it using pdf-parse fallback
+// Gemini for PDF parsing
 let genAI = null;
 try {
   const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -32,10 +29,10 @@ try {
     genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     console.log('✅ Gemini AI initialized');
   } else {
-    console.log('ℹ️  No GEMINI_API_KEY - using pdf-parse fallback for timetable parsing');
+    console.log('ℹ️  No GEMINI_API_KEY set - PDF parsing will return 503 until key is added');
   }
 } catch (e) {
-  console.log('ℹ️  @google/generative-ai not installed - using pdf-parse fallback');
+  console.log('ℹ️  @google/generative-ai not installed - run: npm install @google/generative-ai');
 }
 // ============================================
 // SUPABASE STORAGE CLIENT
@@ -3422,15 +3419,20 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
-    // ── STEP 1: Extract raw text with pdf-parse (always available) ──────────
-    const pdfData = await pdfExtractor(req.file.buffer);
-    const rawText = pdfData.text;
+    // FIX: Removed pdf-parse entirely — it fails on Railway because the package
+    // does not export a callable function in that Node environment.
+    // Gemini 1.5-flash accepts PDFs directly as base64 inlineData, so no
+    // text pre-extraction step is needed at all.
 
-    // ── STEP 2: Try Gemini if available ────────────────────────────────────
-    if (genAI) {
-      try {
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const prompt = `You are a university timetable parser. Extract ALL class sessions from the text below into a JSON array. Return ONLY raw JSON, no markdown, no backticks.
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({ success: false, error: 'PDF parser is not configured on the server. Add GEMINI_API_KEY to Railway environment variables.' });
+    }
+
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const base64Pdf = req.file.buffer.toString('base64');
+
+    const prompt = `You are a university timetable parser. Analyze this PDF and extract ALL class/lecture/lab/tutorial sessions.
+Return ONLY a raw JSON array — no markdown, no backticks, no explanation.
 
 Each object must have exactly these fields:
 {
@@ -3445,97 +3447,63 @@ Each object must have exactly these fields:
 
 Rules:
 - day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
-- start_time and end_time must be HH:MM in 24-hour format
-- If a field is unknown use empty string ""
-- Extract EVERY class you can find
+- start_time and end_time in 24-hour HH:MM format (e.g. "08:30", "14:00")
+- If a field is unknown, use empty string ""
+- Extract EVERY session you can find`;
 
-TIMETABLE TEXT:
-${rawText.substring(0, 15000)}`;
+    // Race against 25s timeout so Railway never kills connection before we respond
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('TIMEOUT')), 25000)
+    );
 
-        const result = await model.generateContent(prompt);
-        const responseText = result.response.text();
-        // Strip any accidental markdown fences
-        const jsonStr = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
-        const parsed = JSON.parse(jsonStr);
+    const result = await Promise.race([
+      model.generateContent([
+        { text: prompt },
+        { inlineData: { data: base64Pdf, mimeType: 'application/pdf' } }
+      ]),
+      timeoutPromise
+    ]);
 
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const formatted = parsed.map((c, i) => ({
-            id: `parsed-${Date.now()}-${i}`,
-            course_code: String(c.course_code || '').toUpperCase(),
-            course_name: String(c.course_name || c.course_code || ''),
-            program: 'General',
-            year: 'Not specified',
-            day_of_week: Number(c.day_of_week) || 1,
-            start_time: String(c.start_time || '08:00'),
-            end_time: String(c.end_time || '09:00'),
-            location: String(c.location || 'TBD'),
-            instructor: String(c.instructor || 'Staff'),
-            checked: true,
-          }));
-          return res.json({ success: true, courses: formatted, method: 'smart' });
-        }
-      } catch (geminiErr) {
-        console.warn('Gemini parse failed, falling back to pattern matching:', geminiErr.message);
-      }
+    const responseText = result.response.text();
+    const jsonStr = responseText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+
+    if (!jsonMatch) {
+      console.error('No JSON array in Gemini response:', responseText.substring(0, 300));
+      return res.status(422).json({ success: false, error: 'Could not find timetable data in this PDF.' });
     }
 
-    // ── STEP 3: Pattern-matching fallback (works without any API key) ───────
-    const DAY_MAP = {
-      SUNDAY: 0, SUN: 0, MONDAY: 1, MON: 1,
-      TUESDAY: 2, TUE: 2, TUES: 2, WEDNESDAY: 3, WED: 3,
-      THURSDAY: 4, THU: 4, THUR: 4, FRIDAY: 5, FRI: 5,
-      SATURDAY: 6, SAT: 6,
-    };
+    const parsed = JSON.parse(jsonMatch[0]);
 
-    const lines = rawText.split(/\n/).map(l => l.trim()).filter(Boolean);
-    const courses = [];
-    let currentDay = 1;
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return res.status(422).json({ success: false, error: 'No class sessions found in this PDF.' });
+    }
 
-    lines.forEach(line => {
-      // Update current day context
-      const dayMatch = line.match(/\b(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUN|MON|TUES?|WED|THUR?|FRI|SAT)\b/i);
-      if (dayMatch) {
-        currentDay = DAY_MAP[dayMatch[1].toUpperCase()] ?? currentDay;
-      }
+    const formatted = parsed.map((c, i) => ({
+      id: `parsed-${Date.now()}-${i}`,
+      course_code: String(c.course_code || '').toUpperCase().trim(),
+      course_name: String(c.course_name || c.course_code || '').trim(),
+      program: 'General',
+      year: 'Not specified',
+      day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
+      start_time: String(c.start_time || '08:00'),
+      end_time: String(c.end_time || '09:00'),
+      location: String(c.location || 'TBD').trim(),
+      instructor: String(c.instructor || 'Staff').trim(),
+      checked: true,
+    }));
 
-      // Extract course codes: e.g. CS101, MAT 201, ENG302B
-      const codeMatches = [...line.matchAll(/\b([A-Z]{2,6})[\s-]?(\d{2,4})([A-Z])?\b/g)];
-      const timeMatch = line.match(/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})/);
-
-      codeMatches.forEach(m => {
-        const code = `${m[1]} ${m[2]}${m[3] || ''}`;
-        courses.push({
-          id: `fallback-${courses.length}`,
-          course_code: code,
-          course_name: code,
-          program: 'General',
-          year: 'Not specified',
-          day_of_week: currentDay,
-          start_time: timeMatch ? `${String(timeMatch[1]).padStart(2,'0')}:${timeMatch[2]}` : '08:00',
-          end_time:   timeMatch ? `${String(timeMatch[3]).padStart(2,'0')}:${timeMatch[4]}` : '09:00',
-          location: 'TBD',
-          instructor: 'Staff',
-          checked: true,
-        });
-      });
-    });
-
-    // Deduplicate
-    const seen = new Set();
-    const unique = courses.filter(c => {
-      const key = `${c.course_code}|${c.day_of_week}|${c.start_time}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    return res.json({ success: true, courses: unique, method: 'pattern' });
+    res.json({ success: true, courses: formatted });
 
   } catch (error) {
-    console.error('PDF parse error:', error);
-    res.status(500).json({ success: false, error: 'Failed to parse PDF: ' + error.message });
+    console.error('PDF parse error:', error.message);
+    const userMsg = error.message === 'TIMEOUT'
+      ? 'PDF took too long to process. Try a smaller file.'
+      : 'Failed to parse PDF: ' + error.message;
+    res.status(500).json({ success: false, error: userMsg });
   }
 });
+
 // ============================================
 // CREATE/GET PROGRAM (Universal)
 // ============================================
