@@ -2561,6 +2561,876 @@ app.post('/api/program-courses/bulk', authMiddleware, async (req, res) => {
 // ============================================
 
 // ============================================
+// TIMETABLE IMPORT FROM PROGRAM
+// ============================================
+
+app.post('/api/timetable/import-from-program', authMiddleware, async (req, res) => {
+  const { programId, selectedCourses } = req.body;
+  
+  try {
+    await pool.query(
+      'INSERT INTO student_programs (user_id, program_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.user.userId, programId]
+    );
+    
+    const result = await pool.query(
+      `SELECT * FROM master_timetables 
+       WHERE program_id = $1 AND course_code = ANY($2)`,
+      [programId, selectedCourses]
+    );
+    
+    const insertPromises = result.rows.map(course =>
+      pool.query(
+        `INSERT INTO timetables 
+         (user_id, title, day_of_week, start_time, end_time, course_code, instructor, 
+          building, room_number, color, location, notification_enabled)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING *`,
+        [req.user.userId, course.course_name, course.day_of_week, course.start_time, 
+         course.end_time, course.course_code, course.instructor, course.building, 
+         course.room_number, '#3B82F6', course.building + ' ' + course.room_number, true]
+      )
+    );
+    
+    const imported = await Promise.all(insertPromises);
+    
+    // Check for clashes
+    const clashes = await pool.query(
+      `SELECT t1.id as entry1_id, t1.title as title1, t1.start_time as start1, t1.end_time as end1,
+              t2.id as entry2_id, t2.title as title2, t2.start_time as start2, t2.end_time as end2,
+              t1.day_of_week
+       FROM timetables t1
+       JOIN timetables t2 ON t1.day_of_week = t2.day_of_week AND t1.id < t2.id
+       WHERE t1.user_id = $1 AND t2.user_id = $1
+       AND (t1.start_time < t2.end_time AND t1.end_time > t2.start_time)`,
+      [req.user.userId]
+    );
+    
+    for (const clash of clashes.rows) {
+      await pool.query(
+        `INSERT INTO timetable_clashes (user_id, entry1_id, entry2_id, clash_type)
+         VALUES ($1, $2, $3, 'overlap')
+         ON CONFLICT DO NOTHING`,
+        [req.user.userId, clash.entry1_id, clash.entry2_id]
+      );
+    }
+    
+    res.json({ 
+      success: true, 
+      imported: imported.length,
+      clashes: clashes.rows
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// CLASH DETECTION
+// ============================================
+
+app.get('/api/timetable/clashes', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT tc.*, 
+              t1.title as class1_title, t1.start_time as class1_start, t1.end_time as class1_end,
+              t2.title as class2_title, t2.start_time as class2_start, t2.end_time as class2_end,
+              t1.day_of_week
+       FROM timetable_clashes tc
+       JOIN timetables t1 ON tc.entry1_id = t1.id
+       JOIN timetables t2 ON tc.entry2_id = t2.id
+       WHERE tc.user_id = $1 AND tc.resolved = false`,
+      [req.user.userId]
+    );
+    res.json({ success: true, clashes: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/timetable/clashes/:clashId/resolve', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      'UPDATE timetable_clashes SET resolved = true WHERE id = $1 AND user_id = $2',
+      [req.params.clashId, req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// CLASSROOM LOCATIONS & MAPS
+// ============================================
+
+app.post('/api/classroom-locations', authMiddleware, async (req, res) => {
+  const { building, roomNumber, locationName, lat, lng, notes, isPublic } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `INSERT INTO classroom_locations 
+       (user_id, building, room_number, location_name, location_lat, location_lng, notes, is_public)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (user_id, building, room_number) 
+       DO UPDATE SET location_name = $4, location_lat = $5, location_lng = $6, notes = $7, is_public = $8
+       RETURNING *`,
+      [req.user.userId, building, roomNumber, locationName, lat, lng, notes, isPublic]
+    );
+    res.json({ success: true, location: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/classroom-locations', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT cl.*, u.full_name as created_by_name
+       FROM classroom_locations cl
+       JOIN users u ON cl.user_id = u.id
+       WHERE cl.user_id = $1 OR cl.is_public = true
+       ORDER BY cl.building, cl.room_number`,
+      [req.user.userId]
+    );
+    res.json({ success: true, locations: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/classroom-locations/:building/:room', authMiddleware, async (req, res) => {
+  const { building, room } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT * FROM classroom_locations 
+       WHERE (user_id = $1 OR is_public = true)
+       AND building = $2 AND room_number = $3
+       LIMIT 1`,
+      [req.user.userId, building, room]
+    );
+    
+    if (result.rows.length > 0) {
+      res.json({ success: true, location: result.rows[0] });
+    } else {
+      res.json({ success: false, message: 'Location not found' });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// ASSIGNMENTS
+// ============================================
+
+app.post('/api/assignments', authMiddleware, async (req, res) => {
+  const { courseCode, title, description, dueDate, submissionPlace, submissionType, weight, notificationHoursBefore } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `INSERT INTO assignments 
+       (user_id, course_code, title, description, due_date, submission_place, 
+        submission_type, weight, notification_hours_before)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [req.user.userId, courseCode, title, description, dueDate, submissionPlace, 
+       submissionType, weight, notificationHoursBefore || 24]
+    );
+    
+    const assignment = result.rows[0];
+    const notificationTime = new Date(dueDate);
+    notificationTime.setHours(notificationTime.getHours() - (notificationHoursBefore || 24));
+    
+    await pool.query(
+      `INSERT INTO notifications 
+       (user_id, notification_type, reference_id, title, message, scheduled_time)
+       VALUES ($1, 'assignment', $2, $3, $4, $5)`,
+      [
+        req.user.userId,
+        assignment.id,
+        `Assignment Due: ${title}`,
+        `Your assignment "${title}" for ${courseCode} is due in ${notificationHoursBefore || 24} hours!`,
+        notificationTime
+      ]
+    );
+    
+    res.json({ success: true, assignment: assignment });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/assignments', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE assignments SET status = 'overdue'
+       WHERE due_date < NOW() AND status = 'pending' AND user_id = $1`,
+      [req.user.userId]
+    );
+    
+    const result = await pool.query(
+      `SELECT * FROM assignments 
+       WHERE user_id = $1 
+       ORDER BY due_date ASC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, assignments: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.patch('/api/assignments/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  
+  try {
+    const fields = [];
+    const values = [];
+    let paramCount = 1;
+    
+    Object.keys(updates).forEach(key => {
+      if (updates[key] !== undefined) {
+        fields.push(`${key} = $${paramCount}`);
+        values.push(updates[key]);
+        paramCount++;
+      }
+    });
+    
+    values.push(id);
+    values.push(req.user.userId);
+    
+    const result = await pool.query(
+      `UPDATE assignments SET ${fields.join(', ')} 
+       WHERE id = $${paramCount} AND user_id = $${paramCount + 1}
+       RETURNING *`,
+      values
+    );
+    
+    res.json({ success: true, assignment: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/assignments/:id/submit', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE assignments 
+       SET status = 'submitted', submitted_at = NOW()
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [req.params.id, req.user.userId]
+    );
+    res.json({ success: true, assignment: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/assignments/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM assignments WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/assignments/cleanup', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM assignments 
+       WHERE due_date < NOW() - INTERVAL '1 hour'
+       AND status != 'submitted'
+       RETURNING id`
+    );
+    res.json({ success: true, deleted: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// SCHOOL EVENTS
+// ============================================
+
+app.get('/api/school-events', authMiddleware, async (req, res) => {
+  try {
+    const userResult = await pool.query(
+      'SELECT institution FROM users WHERE id = $1',
+      [req.user.userId]
+    );
+    
+    const institution = userResult.rows[0]?.institution;
+    
+    const result = await pool.query(
+      `SELECT se.*, u.full_name as creator_name
+       FROM school_events se
+       LEFT JOIN users u ON se.created_by = u.id
+       WHERE se.institution = $1
+       AND se.end_date >= NOW()
+       ORDER BY se.start_date ASC`,
+      [institution]
+    );
+    
+    res.json({ success: true, events: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/school-events', authMiddleware, async (req, res) => {
+  const { eventType, title, description, startDate, endDate, location, lat, lng, isMandatory, notifyDaysBefore } = req.body;
+  
+  try {
+    const userResult = await pool.query(
+      'SELECT institution FROM users WHERE id = $1',
+      [req.user.userId]
+    );
+    
+    const result = await pool.query(
+      `INSERT INTO school_events 
+       (institution, event_type, title, description, start_date, end_date, 
+        location, location_lat, location_lng, is_mandatory, notify_days_before, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [userResult.rows[0].institution, eventType, title, description, startDate, endDate, 
+       location, lat, lng, isMandatory, notifyDaysBefore, req.user.userId]
+    );
+    
+    res.json({ success: true, event: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/school-events/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM school_events WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// EXAMS & COUNTDOWN
+// ============================================
+
+app.post('/api/exams', authMiddleware, async (req, res) => {
+  const { courseCode, courseName, examDate, duration, location, roomNumber, examType, weight } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `INSERT INTO exam_schedules 
+       (user_id, course_code, course_name, exam_date, exam_duration, location, room_number, exam_type, weight)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [req.user.userId, courseCode, courseName, examDate, duration, location, roomNumber, examType, weight]
+    );
+    
+    const exam = result.rows[0];
+    
+    // 60-day countdown
+    const countdownDate = new Date(examDate);
+    countdownDate.setDate(countdownDate.getDate() - 60);
+    
+    if (countdownDate > new Date()) {
+      await pool.query(
+        `INSERT INTO notifications 
+         (user_id, notification_type, reference_id, title, message, scheduled_time)
+         VALUES ($1, 'exam', $2, $3, $4, $5)`,
+        [
+          req.user.userId,
+          exam.id,
+          '60 Days Until Exam!',
+          `Your ${courseCode} ${examType} exam is in 60 days. Time to start preparing!`,
+          countdownDate
+        ]
+      );
+    }
+    
+    // 7-day reminder
+    const reminderDate = new Date(examDate);
+    reminderDate.setDate(reminderDate.getDate() - 7);
+    
+    if (reminderDate > new Date()) {
+      await pool.query(
+        `INSERT INTO notifications 
+         (user_id, notification_type, reference_id, title, message, scheduled_time)
+         VALUES ($1, 'exam', $2, $3, $4, $5)`,
+        [
+          req.user.userId,
+          exam.id,
+          'Exam Next Week!',
+          `Your ${courseCode} ${examType} is in 7 days. Final review time!`,
+          reminderDate
+        ]
+      );
+    }
+    
+    res.json({ success: true, exam: exam });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/exams', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT e.*, sp.id as study_plan_id, sp.progress_percentage
+       FROM exam_schedules e
+       LEFT JOIN study_plans sp ON e.id = sp.exam_id
+       WHERE e.user_id = $1
+       ORDER BY e.exam_date ASC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, exams: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/exams/countdown', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT *, 
+              EXTRACT(EPOCH FROM (exam_date - NOW())) / 86400 as days_until
+       FROM exam_schedules
+       WHERE user_id = $1
+       AND exam_date > NOW()
+       ORDER BY exam_date ASC
+       LIMIT 5`,
+      [req.user.userId]
+    );
+    res.json({ success: true, exams: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/exams/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM exam_schedules WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// STUDY PLANS
+// ============================================
+
+app.post('/api/exams/:examId/generate-study-plan', authMiddleware, async (req, res) => {
+  const { examId } = req.params;
+  const { topics, totalHours, startDate } = req.body;
+  
+  try {
+    const examResult = await pool.query(
+      'SELECT * FROM exam_schedules WHERE id = $1 AND user_id = $2',
+      [examId, req.user.userId]
+    );
+    
+    if (examResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Exam not found' });
+    }
+    
+    const exam = examResult.rows[0];
+    const examDate = new Date(exam.exam_date);
+    const start = new Date(startDate || Date.now());
+    const daysAvailable = Math.floor((examDate - start) / (1000 * 60 * 60 * 24));
+    
+    if (daysAvailable <= 0) {
+      return res.status(400).json({ success: false, message: 'Exam date has passed' });
+    }
+    
+    const dailyHours = Math.min(totalHours / daysAvailable, 8); // Cap at 8 hours per day
+    
+    const planResult = await pool.query(
+      `INSERT INTO study_plans 
+       (exam_id, user_id, total_study_hours, daily_study_hours, start_date, end_date, topics)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [examId, req.user.userId, totalHours, dailyHours, start, examDate, JSON.stringify(topics)]
+    );
+    
+    const plan = planResult.rows[0];
+    
+    // Generate daily tasks
+    const topicsArray = topics || [];
+    const tasksPerDay = Math.max(1, Math.floor(topicsArray.length / daysAvailable));
+    
+    for (let day = 0; day < daysAvailable; day++) {
+      const taskDate = new Date(start);
+      taskDate.setDate(taskDate.getDate() + day);
+      
+      const topicIndex = Math.floor(day / daysAvailable * topicsArray.length);
+      const topic = topicsArray[topicIndex] || topicsArray[topicsArray.length - 1];
+      
+      await pool.query(
+        `INSERT INTO study_tasks 
+         (study_plan_id, task_date, topic, duration_minutes)
+         VALUES ($1, $2, $3, $4)`,
+        [plan.id, taskDate, topic, dailyHours * 60]
+      );
+    }
+    
+    await pool.query(
+      'UPDATE exam_schedules SET study_plan_generated = true WHERE id = $1',
+      [examId]
+    );
+    
+    res.json({ success: true, studyPlan: plan });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/exams/:examId/study-plan', authMiddleware, async (req, res) => {
+  try {
+    const planResult = await pool.query(
+      `SELECT sp.*, e.course_code, e.course_name, e.exam_date
+       FROM study_plans sp
+       JOIN exam_schedules e ON sp.exam_id = e.id
+       WHERE sp.exam_id = $1 AND sp.user_id = $2`,
+      [req.params.examId, req.user.userId]
+    );
+    
+    if (planResult.rows.length === 0) {
+      return res.json({ success: false, message: 'No study plan found' });
+    }
+    
+    const plan = planResult.rows[0];
+    
+    const tasksResult = await pool.query(
+      `SELECT * FROM study_tasks 
+       WHERE study_plan_id = $1 
+       ORDER BY task_date, id`,
+      [plan.id]
+    );
+    
+    res.json({ 
+      success: true, 
+      studyPlan: plan,
+      tasks: tasksResult.rows 
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/study-tasks/:taskId/complete', authMiddleware, async (req, res) => {
+  const { notes } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `UPDATE study_tasks st
+       SET completed = true, completed_at = NOW(), notes = $1
+       FROM study_plans sp
+       WHERE st.id = $2 AND st.study_plan_id = sp.id AND sp.user_id = $3
+       RETURNING st.*`,
+      [notes, req.params.taskId, req.user.userId]
+    );
+    
+    await pool.query(
+      `UPDATE study_plans sp
+       SET progress_percentage = (
+         SELECT (COUNT(*) FILTER (WHERE completed = true)::DECIMAL / COUNT(*)) * 100
+         FROM study_tasks
+         WHERE study_plan_id = sp.id
+       )
+       WHERE id = (
+         SELECT study_plan_id FROM study_tasks WHERE id = $1
+       )`,
+      [req.params.taskId]
+    );
+    
+    res.json({ success: true, task: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// NOTIFICATIONS
+// ============================================
+
+app.get('/api/notifications', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM notifications
+       WHERE user_id = $1
+       AND scheduled_time <= NOW()
+       ORDER BY scheduled_time DESC
+       LIMIT 50`,
+      [req.user.userId]
+    );
+    res.json({ success: true, notifications: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/notifications/unread-count', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND read = false',
+      [req.user.userId]
+    );
+    res.json({ success: true, count: parseInt(result.rows[0].count) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/notifications/:id/read', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      'UPDATE notifications SET read = true, read_at = NOW() WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/notifications/process', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE notifications
+       SET sent = true, sent_at = NOW()
+       WHERE scheduled_time <= NOW()
+       AND sent = false
+       RETURNING *`
+    );
+    
+    res.json({ success: true, processed: result.rows.length, notifications: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/timetable/setup-notifications', authMiddleware, async (req, res) => {
+  try {
+    const entries = await pool.query(
+      'SELECT * FROM timetables WHERE user_id = $1 AND notification_enabled = true',
+      [req.user.userId]
+    );
+    
+    let scheduled = 0;
+    
+    for (const entry of entries.rows) {
+      const now = new Date();
+      const dayOfWeek = entry.day_of_week;
+      const [hours, minutes] = entry.start_time.split(':');
+      
+      let nextDate = new Date();
+      nextDate.setHours(hours, minutes, 0, 0);
+      
+      while (nextDate.getDay() !== dayOfWeek || nextDate <= now) {
+        nextDate.setDate(nextDate.getDate() + 1);
+      }
+      
+      const notificationTime = new Date(nextDate);
+      notificationTime.setMinutes(notificationTime.getMinutes() - (entry.notification_minutes_before || 30));
+      
+      if (notificationTime > now) {
+        await pool.query(
+          `INSERT INTO notifications 
+           (user_id, notification_type, reference_id, title, message, scheduled_time)
+           VALUES ($1, 'class', $2, $3, $4, $5)
+           ON CONFLICT DO NOTHING`,
+          [
+            req.user.userId,
+            entry.id,
+            `Class Starting Soon: ${entry.title}`,
+            `Your ${entry.course_code || ''} class starts in ${entry.notification_minutes_before || 30} minutes at ${entry.location || 'campus'}`,
+            notificationTime
+          ]
+        );
+        scheduled++;
+      }
+    }
+    
+    res.json({ success: true, scheduled: scheduled });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// RIDESHARE
+// ============================================
+
+app.post('/api/rideshare', authMiddleware, async (req, res) => {
+  const { destinationName, lat, lng, pickupTime, seatsAvailable, isDriver, notes } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `INSERT INTO rideshare_requests 
+       (user_id, destination_name, destination_lat, destination_lng, pickup_time, 
+        seats_available, is_driver, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [req.user.userId, destinationName, lat, lng, pickupTime, seatsAvailable, isDriver, notes]
+    );
+    res.json({ success: true, request: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/rideshare', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT rr.*, u.full_name, u.phone
+       FROM rideshare_requests rr
+       JOIN users u ON rr.user_id = u.id
+       WHERE rr.status = 'active'
+       AND rr.pickup_time > NOW()
+       ORDER BY rr.pickup_time ASC`
+    );
+    res.json({ success: true, requests: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.patch('/api/rideshare/:id/status', authMiddleware, async (req, res) => {
+  const { status } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'UPDATE rideshare_requests SET status = $1 WHERE id = $2 RETURNING *',
+      [status, req.params.id]
+    );
+    res.json({ success: true, request: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// UPDATE EXISTING TIMETABLE ROUTE
+// ============================================
+
+app.patch('/api/timetable/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  
+  try {
+    const fields = [];
+    const values = [];
+    let paramCount = 1;
+    
+    Object.keys(updates).forEach(key => {
+      if (updates[key] !== undefined) {
+        fields.push(`${key} = $${paramCount}`);
+        values.push(updates[key]);
+        paramCount++;
+      }
+    });
+    
+    values.push(id);
+    values.push(req.user.userId);
+    
+    const result = await pool.query(
+      `UPDATE timetables SET ${fields.join(', ')} 
+       WHERE id = $${paramCount} AND user_id = $${paramCount + 1}
+       RETURNING *`,
+      values
+    );
+    
+    res.json({ success: true, entry: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+// ============================================
+// HOMEWORK HELP ROUTES
+// ============================================
+
+app.post('/api/homework-help', authMiddleware, async (req, res) => {
+  const { title, question, subject, classSpaceId } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'INSERT INTO homework_help (student_id, title, question, subject, class_space_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [req.user.userId, title, question, subject, classSpaceId]
+    );
+    res.json({ success: true, helpRequest: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/homework-help', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT hh.*, u.full_name as student_name,
+      (SELECT COUNT(*) FROM homework_responses WHERE help_request_id = hh.id) as response_count
+      FROM homework_help hh 
+      JOIN users u ON hh.student_id = u.id 
+      ORDER BY hh.created_at DESC`
+    );
+    res.json({ success: true, requests: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { response } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'INSERT INTO homework_responses (help_request_id, responder_id, response) VALUES ($1, $2, $3) RETURNING *',
+      [id, req.user.userId, response]
+    );
+    
+    await pool.query(
+      "UPDATE homework_help SET status = 'answered' WHERE id = $1 AND status = 'open'",
+      [id]
+    );
+    
+    res.json({ success: true, response: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Add this before the POST /api/homework-help/:id/respond route
+app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT hr.*, u.full_name as responder_name
+      FROM homework_responses hr 
+      JOIN users u ON hr.responder_id = u.id 
+      WHERE hr.help_request_id = $1 
+      ORDER BY hr.created_at ASC`,
+      [id]
+    );
+    res.json({ success: true, responses: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
 // PDF PARSING — ImageMagick + Groq Vision (parallel)
 // ============================================
 
