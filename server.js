@@ -429,8 +429,11 @@ CREATE TABLE IF NOT EXISTS timetables (
   location VARCHAR(255),
   course_code VARCHAR(50),
   instructor VARCHAR(255),
+  building VARCHAR(100),
+  room_number VARCHAR(50),
   notes TEXT,
   color VARCHAR(7) DEFAULT '#3B82F6',
+  notification_enabled BOOLEAN DEFAULT true,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -531,6 +534,139 @@ CREATE TABLE IF NOT EXISTS program_courses (
 
 CREATE INDEX IF NOT EXISTS idx_programs_user ON programs(user_id);
 CREATE INDEX IF NOT EXISTS idx_program_courses_program ON program_courses(program_id);
+
+-- Student Programs (links a user to a program they enrolled in)
+CREATE TABLE IF NOT EXISTS student_programs (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  program_id INTEGER REFERENCES programs(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, program_id)
+);
+
+-- Timetable Clashes
+CREATE TABLE IF NOT EXISTS timetable_clashes (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  entry1_id INTEGER REFERENCES timetables(id) ON DELETE CASCADE,
+  entry2_id INTEGER REFERENCES timetables(id) ON DELETE CASCADE,
+  clash_type VARCHAR(50) DEFAULT 'overlap',
+  resolved BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(entry1_id, entry2_id)
+);
+
+-- Assignments
+CREATE TABLE IF NOT EXISTS assignments (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  course_code VARCHAR(50),
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  due_date TIMESTAMP,
+  submission_place VARCHAR(255),
+  submission_type VARCHAR(50) DEFAULT 'online',
+  weight DECIMAL(5,2),
+  notification_hours_before INTEGER DEFAULT 24,
+  status VARCHAR(50) DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Exam Schedules
+CREATE TABLE IF NOT EXISTS exam_schedules (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  course_code VARCHAR(50),
+  course_name VARCHAR(255),
+  exam_date TIMESTAMP,
+  exam_duration INTEGER DEFAULT 120,
+  location VARCHAR(255),
+  room_number VARCHAR(50),
+  exam_type VARCHAR(50) DEFAULT 'final',
+  weight DECIMAL(5,2),
+  study_plan_generated BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Study Plans
+CREATE TABLE IF NOT EXISTS study_plans (
+  id SERIAL PRIMARY KEY,
+  exam_id INTEGER REFERENCES exam_schedules(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  total_study_hours DECIMAL(6,2),
+  daily_study_hours DECIMAL(5,2),
+  start_date DATE,
+  end_date DATE,
+  topics JSONB,
+  progress_percentage DECIMAL(5,2) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Study Tasks
+CREATE TABLE IF NOT EXISTS study_tasks (
+  id SERIAL PRIMARY KEY,
+  study_plan_id INTEGER REFERENCES study_plans(id) ON DELETE CASCADE,
+  task_date DATE,
+  topic TEXT,
+  duration_minutes INTEGER DEFAULT 60,
+  completed BOOLEAN DEFAULT false,
+  completed_at TIMESTAMP,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Notifications
+CREATE TABLE IF NOT EXISTS notifications (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  notification_type VARCHAR(50),
+  reference_id INTEGER,
+  title VARCHAR(255),
+  message TEXT,
+  scheduled_time TIMESTAMP,
+  read BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- School Events
+CREATE TABLE IF NOT EXISTS school_events (
+  id SERIAL PRIMARY KEY,
+  institution VARCHAR(255),
+  event_type VARCHAR(50),
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  start_date TIMESTAMP,
+  end_date TIMESTAMP,
+  location VARCHAR(255),
+  location_lat DECIMAL(10,8),
+  location_lng DECIMAL(11,8),
+  is_mandatory BOOLEAN DEFAULT false,
+  notify_days_before INTEGER DEFAULT 1,
+  created_by INTEGER REFERENCES users(id),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Rideshare Requests
+CREATE TABLE IF NOT EXISTS rideshare_requests (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  destination_name VARCHAR(255),
+  destination_lat DECIMAL(10,8),
+  destination_lng DECIMAL(11,8),
+  pickup_time TIMESTAMP,
+  seats_available INTEGER DEFAULT 3,
+  is_driver BOOLEAN DEFAULT true,
+  notes TEXT,
+  status VARCHAR(50) DEFAULT 'active',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_assignments_user ON assignments(user_id);
+CREATE INDEX IF NOT EXISTS idx_exam_schedules_user ON exam_schedules(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_study_plans_exam ON study_plans(exam_id);
+CREATE INDEX IF NOT EXISTS idx_study_tasks_plan ON study_tasks(study_plan_id);
+CREATE INDEX IF NOT EXISTS idx_rideshare_status ON rideshare_requests(status);
 `;
 
 
@@ -2462,6 +2598,60 @@ app.get('/api/timetable', authMiddleware, async (req, res) => {
   }
 });
 
+// ── Bulk-import courses directly into timetables (used by PDF import) ─────────
+// Bypasses the program_courses middle step entirely so there are no silent
+// failures from missing tables or lookup mismatches.
+app.post('/api/timetable/bulk', authMiddleware, async (req, res) => {
+  const { courses } = req.body;
+  if (!courses || !courses.length) {
+    return res.status(400).json({ success: false, error: 'No courses provided' });
+  }
+
+  const inserted = [];
+  const errors   = [];
+
+  for (const course of courses) {
+    try {
+      const location = [course.building, course.room_number]
+        .filter(Boolean).join(' ').trim() || course.location || '';
+
+      const r = await pool.query(
+        `INSERT INTO timetables
+         (user_id, title, day_of_week, start_time, end_time,
+          course_code, instructor, location, color)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING *`,
+        [
+          req.user.userId,
+          course.course_name || course.course_code || 'Untitled',
+          Number(course.day_of_week),
+          course.start_time,
+          course.end_time,
+          String(course.course_code || '').toUpperCase().trim(),
+          course.instructor || '',
+          location,
+          '#3B82F6'
+        ]
+      );
+      inserted.push(r.rows[0]);
+    } catch (err) {
+      console.error(`[timetable/bulk] Failed to insert ${course.course_code}:`, err.message);
+      errors.push({ course_code: course.course_code, error: err.message });
+    }
+  }
+
+  console.log(`[timetable/bulk] Inserted ${inserted.length}/${courses.length} courses for user ${req.user.userId}`);
+
+  res.json({
+    success: true,
+    inserted: inserted.length,
+    total: courses.length,
+    entries: inserted,
+    errors: errors.length ? errors : undefined
+  });
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.delete('/api/timetable/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
   
@@ -2568,31 +2758,62 @@ app.post('/api/timetable/import-from-program', authMiddleware, async (req, res) 
   const { programId, selectedCourses } = req.body;
   
   try {
-    await pool.query(
-      'INSERT INTO student_programs (user_id, program_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [req.user.userId, programId]
-    );
+    // Track the program link (best effort — ignore if table doesn't exist yet)
+    try {
+      await pool.query(
+        'INSERT INTO student_programs (user_id, program_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [req.user.userId, programId]
+      );
+    } catch (e) { /* non-fatal */ }
     
+    // Read from program_courses (where bulk upload writes to)
     const result = await pool.query(
-      `SELECT * FROM master_timetables 
-       WHERE program_id = $1 AND course_code = ANY($2)`,
-      [programId, selectedCourses]
+      `SELECT * FROM program_courses WHERE program_id = $1`,
+      [programId]
     );
+
+    if (!result.rows.length) {
+      return res.json({ success: false, error: 'No courses found for this program. Make sure the PDF was parsed and courses were saved.' });
+    }
+
+    // Filter to selected courses if provided, otherwise import all
+    // selectedCourses is an array of course_code strings
+    const toImport = (selectedCourses && selectedCourses.length > 0)
+      ? result.rows.filter(c => selectedCourses.includes(c.course_code))
+      : result.rows;
+
+    if (!toImport.length) {
+      return res.json({ success: false, error: 'None of the selected course codes matched the stored courses.' });
+    }
+
+    // Insert each course into the user's timetable
+    // Use ON CONFLICT DO NOTHING to avoid duplicates on re-import
+    const importedRows = [];
+    for (const course of toImport) {
+      const location = [course.building, course.room_number].filter(Boolean).join(' ').trim() || course.location || '';
+      try {
+        const r = await pool.query(
+          `INSERT INTO timetables 
+           (user_id, title, day_of_week, start_time, end_time, course_code, instructor, location, color)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING *`,
+          [req.user.userId,
+           course.course_name || course.course_code,
+           course.day_of_week,
+           course.start_time,
+           course.end_time,
+           course.course_code,
+           course.instructor || '',
+           location,
+           '#3B82F6']
+        );
+        importedRows.push(r.rows[0]);
+      } catch (e) {
+        console.error('Skipping course insert:', course.course_code, e.message);
+      }
+    }
     
-    const insertPromises = result.rows.map(course =>
-      pool.query(
-        `INSERT INTO timetables 
-         (user_id, title, day_of_week, start_time, end_time, course_code, instructor, 
-          building, room_number, color, location, notification_enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         RETURNING *`,
-        [req.user.userId, course.course_name, course.day_of_week, course.start_time, 
-         course.end_time, course.course_code, course.instructor, course.building, 
-         course.room_number, '#3B82F6', course.building + ' ' + course.room_number, true]
-      )
-    );
-    
-    const imported = await Promise.all(insertPromises);
+    const imported = { length: importedRows.length };
     
     // Check for clashes
     const clashes = await pool.query(
@@ -3442,7 +3663,7 @@ async function pdfToImages(buffer) {
   try {
     fs.writeFileSync(pdfPath, buffer);
     const result = spawnSync('convert', [
-      '-density', '200', '-quality', '85',
+      '-density', '150', '-quality', '75',
       pdfPath,
       path.join(tmpDir, 'page-%d.jpg')
     ], { timeout: 60000 });
@@ -3464,14 +3685,22 @@ async function pdfToImages(buffer) {
   }
 }
 
-const TIMETABLE_PROMPT = `You are reading a university timetable image. Extract EVERY class session visible.
+const TIMETABLE_PROMPT = `You are a data extraction assistant reading a university timetable grid image.
 
-Return ONLY a raw JSON array — no markdown, no backticks, no explanation.
+STRUCTURE: The timetable is a grid where:
+- ROWS = time slots (e.g. 7:00-7:55, 8:00-8:55, etc.)
+- COLUMNS = departments/programs (e.g. ELECTRICAL, MECHANICAL, CIVIL, COMPUTER, etc.)
+- Each cell contains: course code, course name, location/room, and instructor
+- The DAY (Monday, Tuesday, etc.) is stated in the page heading — all entries on this page share that day
 
-Each object must have exactly these fields:
+YOUR TASK: Read every cell in the grid. For each non-empty cell, output one JSON object.
+
+Return ONLY a raw JSON array. No markdown, no backticks, no explanation — just the array starting with [ and ending with ].
+
+Each object:
 {
   "course_code": "EE 151",
-  "course_name": "EE 151",
+  "course_name": "Electrical Circuits",
   "day_of_week": 1,
   "start_time": "08:00",
   "end_time": "08:55",
@@ -3480,13 +3709,18 @@ Each object must have exactly these fields:
   "program": "ELECTRICAL"
 }
 
-Rules:
-- day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
-- The day (MONDAY/TUESDAY etc.) is in the page heading — apply it to ALL entries on that page
-- Times in 24-hour HH:MM. "8:00-8:55" becomes "08:00" and "08:55"
-- program = the department column (ELECTRICAL, MECHANICAL, CIVIL, COMPUTER, CHEMICAL, AEROSPACE, GEOMATIC, MATERIALS, PETROLEUM, AGRIC)
-- Extract EVERY session — every row, every column, every department
-- Unknown fields = empty string ""`;
+STRICT RULES:
+1. day_of_week: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
+2. Read the day from the page heading and use it for ALL entries on this page
+3. start_time and end_time: 24-hour HH:MM format. Row label "7:00-7:55" → "07:00" and "07:55"
+4. program: the COLUMN HEADER the course appears under — copy it exactly
+5. course_code: the short code in the cell (e.g. "EE 151", "ME 201")
+6. course_name: the longer name if shown, otherwise repeat the course_code
+7. location: room or venue shown in the cell (e.g. "VSLA", "LH 2", "LAB 3")
+8. instructor: lecturer name shown in the cell
+9. If a field is not visible, use empty string ""
+10. DO NOT skip any cell — scan every row, every column systematically
+11. A course spanning multiple time rows = one entry with the full time range`;
 
 app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async (req, res) => {
   try {
@@ -3500,10 +3734,12 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
 
     const timer = ms => new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), ms));
 
-    // Send ALL pages to Groq in parallel — much faster than one at a time
-    console.log(`[PDF] Sending all ${images.length} pages to Groq Vision in parallel...`);
+    // Process pages in batches of 3 to avoid Groq token rate limits
+    const BATCH_SIZE = 3;
+    const BATCH_DELAY_MS = 2000; // 2s pause between batches
+    console.log(`[PDF] Processing ${images.length} pages in batches of ${BATCH_SIZE}...`);
 
-    const pageResults = await Promise.all(images.map(async (imageB64, i) => {
+    async function processPage(imageB64, i) {
       try {
         const groqRes = await Promise.race([
           fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -3519,13 +3755,17 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
                 ]
               }],
               temperature: 0.1,
-              max_tokens: 8192,
+              max_tokens: 4096,
             })
           }),
           timer(60000)
         ]);
         const data = await groqRes.json();
-        if (!groqRes.ok) { console.warn(`[PDF] Groq error page ${i+1}:`, data.error?.message); return []; }
+        if (!groqRes.ok) {
+          // If rate limited, return empty and let other batches proceed
+          console.warn(`[PDF] Groq error page ${i+1}:`, data.error?.message?.split('.')[0]);
+          return [];
+        }
         const text = data.choices?.[0]?.message?.content || '';
         const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '');
         const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
@@ -3537,35 +3777,79 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
         console.warn(`[PDF] Page ${i+1} error:`, e.message);
         return [];
       }
-    }));
+    }
 
-    const allCourses = pageResults.flat();
+    const allResults = [];
+    for (let b = 0; b < images.length; b += BATCH_SIZE) {
+      const batch = images.slice(b, b + BATCH_SIZE);
+      const batchNum = Math.floor(b / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(images.length / BATCH_SIZE);
+      console.log(`[PDF] Batch ${batchNum}/${totalBatches} (pages ${b+1}-${Math.min(b+BATCH_SIZE, images.length)})...`);
+      const batchResults = await Promise.all(batch.map((img, j) => processPage(img, b + j)));
+      allResults.push(...batchResults);
+      if (b + BATCH_SIZE < images.length) {
+        await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+      }
+    }
+
+    const allCourses = allResults.flat();
 
     if (!allCourses.length) {
       return res.status(422).json({ success: false, error: 'Groq could not extract any courses from this PDF.' });
     }
 
+    // Normalize time to HH:MM 24-hour format
+    const normalizeTime = (t) => {
+      if (!t) return null;
+      t = String(t).trim();
+      // Already HH:MM
+      if (/^\d{2}:\d{2}$/.test(t)) return t;
+      // H:MM → 0-pad
+      if (/^\d{1}:\d{2}$/.test(t)) return '0' + t;
+      // Handle HH:MM:SS
+      if (/^\d{2}:\d{2}:\d{2}$/.test(t)) return t.slice(0,5);
+      // Handle 12-hour like "7:00 AM", "1:00 PM"
+      const ampm = t.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+      if (ampm) {
+        let h = parseInt(ampm[1]);
+        const m = ampm[2];
+        const period = ampm[3].toUpperCase();
+        if (period === 'PM' && h < 12) h += 12;
+        if (period === 'AM' && h === 12) h = 0;
+        return String(h).padStart(2,'0') + ':' + m;
+      }
+      return t;
+    };
+
     const seen = new Set();
     const courses = allCourses
       .filter(c => {
+        // Skip entries with no course code or clearly garbage data
+        if (!c.course_code || String(c.course_code).trim().length < 2) return false;
+        if (c.day_of_week === undefined || c.day_of_week === null) return false;
         const key = `${c.course_code}|${c.day_of_week}|${c.start_time}|${c.program}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
       })
-      .map((c, i) => ({
-        id: `parsed-${Date.now()}-${i}`,
-        course_code: String(c.course_code || '').toUpperCase().trim(),
-        course_name: String(c.course_name || c.course_code || '').trim(),
-        program: String(c.program || '').trim(),
-        year: 'Not specified',
-        day_of_week: Number(c.day_of_week) >= 0 ? Number(c.day_of_week) : 1,
-        start_time: String(c.start_time || '08:00'),
-        end_time: String(c.end_time || '09:00'),
-        location: String(c.location || '').trim(),
-        instructor: String(c.instructor || '').trim(),
-        checked: true,
-      }));
+      .map((c, i) => {
+        const st = normalizeTime(c.start_time);
+        const et = normalizeTime(c.end_time);
+        return {
+          id: `parsed-${Date.now()}-${i}`,
+          course_code: String(c.course_code || '').toUpperCase().trim(),
+          course_name: String(c.course_name || c.course_code || '').trim(),
+          program: String(c.program || '').trim(),
+          year: 'Not specified',
+          day_of_week: Number(c.day_of_week),
+          start_time: st || '08:00',
+          end_time: et || '09:00',
+          location: String(c.location || '').trim(),
+          instructor: String(c.instructor || '').trim(),
+          checked: true,
+        };
+      })
+      .filter(c => c.start_time && c.end_time);
 
     console.log(`[PDF] Done — ${courses.length} unique courses from ${images.length} pages`);
     return res.json({ success: true, courses });
@@ -3628,4 +3912,34 @@ app.listen(PORT, () => {
   console.log(`💾 Storage: Supabase Storage`);
   console.log(`📊 Database: PostgreSQL (Supabase)`);
   console.log(`\n✅ Initialize database at: /api/init-db`);
+
+  // ── Keep-alive ping (prevents Render free tier from spinning down) ──────────
+  // Render spins down free services after 15 min of inactivity.
+  // We ping our own /api/health every 14 minutes to stay awake.
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL || process.env.APP_URL;
+
+  if (RENDER_URL) {
+    const PING_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+
+    const pingKeepAlive = async () => {
+      try {
+        const res = await fetch(`${RENDER_URL}/api/health`);
+        const data = await res.json();
+        console.log(`[keep-alive] ping OK — ${new Date().toISOString()} — db: ${data.database}`);
+      } catch (err) {
+        console.warn(`[keep-alive] ping failed — ${err.message}`);
+      }
+    };
+
+    // Kick off the first ping after 1 minute, then every 14 minutes
+    setTimeout(() => {
+      pingKeepAlive();
+      setInterval(pingKeepAlive, PING_INTERVAL_MS);
+    }, 60 * 1000);
+
+    console.log(`💓 Keep-alive enabled — pinging ${RENDER_URL}/api/health every 2 min`);
+  } else {
+    console.log(`💤 Keep-alive disabled — set RENDER_EXTERNAL_URL env var to enable`);
+  }
+  // ────────────────────────────────────────────────────────────────────────────
 });
