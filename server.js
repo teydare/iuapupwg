@@ -2524,7 +2524,8 @@ app.post('/api/study-groups', authMiddleware, async (req, res) => {
   }
 });
 
-
+// ─── PATCH: GET /api/study-groups — include active_session_count ─
+// REPLACE your existing GET /api/study-groups with this:
 app.get('/api/study-groups', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2546,6 +2547,7 @@ app.get('/api/study-groups', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── My Groups ───────────────────────────────────────────────
 app.get('/api/study-groups/my', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2796,37 +2798,6 @@ app.post('/api/study-groups/:id/session/end', authMiddleware, async (req, res) =
       [req.params.id, req.user.userId]
     );
     res.json({ success: true, message: 'Session ended' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Add this after the POST /api/study-groups route
-app.post('/api/study-groups/:id/join', authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  
-  try {
-    const groupCheck = await pool.query('SELECT * FROM study_groups WHERE id = $1', [id]);
-    if (groupCheck.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Group not found' });
-    }
-    
-    // Check if already a member
-    const memberCheck = await pool.query(
-      'SELECT * FROM study_group_members WHERE group_id = $1 AND user_id = $2',
-      [id, req.user.userId]
-    );
-
-    if (memberCheck.rows.length > 0) {
-      return res.status(400).json({ success: false, message: 'You are already a member of this group' });
-    }
-
-    await pool.query(
-      'INSERT INTO study_group_members (group_id, user_id) VALUES ($1, $2)',
-      [id, req.user.userId]
-    );
-    
-    res.json({ success: true, message: 'Joined study group successfully' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
