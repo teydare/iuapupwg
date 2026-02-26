@@ -1162,6 +1162,39 @@ app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res)
   }
 });
 
+app.post('/api/auth/onboarding', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  const { programme, year, subjects, study_style, study_times, goals } = req.body;
+
+  try {
+    await pool.query(
+      `UPDATE users SET
+         programme     = $1,
+         year_of_study = $2,
+         subjects      = $3,
+         study_style   = $4,
+         study_times   = $5,
+         goals         = $6,
+         onboarded_at  = NOW(),
+         updated_at    = NOW()
+       WHERE id = $7`,
+      [
+        programme || null,
+        year      || null,
+        subjects  || [],
+        study_style || null,
+        study_times || [],
+        goals     || [],
+        userId,
+      ]
+    );
+    res.json({ success: true, message: 'Profile saved' });
+  } catch (err) {
+    console.error('Onboarding save error:', err);
+    res.status(500).json({ success: false, message: 'Failed to save profile' });
+  }
+});
+
 app.get('/api/marketplace/favorites', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2504,302 +2537,620 @@ app.post('/api/library/:id/downvote', authMiddleware, async (req, res) => {
 // ============================================
 
 app.post('/api/study-groups', authMiddleware, async (req, res) => {
-  const { name, description, subject, maxMembers, isPrivate, study_mode, program } = req.body;
+  const creatorId = req.user.userId;
+  const { name, description, subject, program, maxMembers, isPrivate, study_mode, year_filter } = req.body;
+
+  if (!name) return res.status(400).json({ success: false, message: 'Group name is required' });
+
   try {
     const result = await pool.query(
       `INSERT INTO study_groups
-         (creator_id, name, description, subject, max_members, is_private, study_mode, program)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [req.user.userId, name, description, subject,
-       maxMembers || 30, isPrivate || false,
-       study_mode || 'social', program || '']
+         (creator_id, name, description, subject, program, max_members, is_private, study_mode, year_filter)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [creatorId, name, description || null, subject || null, program || null,
+       maxMembers || 50, isPrivate || false, study_mode || 'social', year_filter || null]
     );
+    const group = result.rows[0];
+    // Creator joins automatically as admin
     await pool.query(
       'INSERT INTO study_group_members (group_id, user_id, role) VALUES ($1,$2,$3)',
-      [result.rows[0].id, req.user.userId, 'admin']
+      [group.id, creatorId, 'admin']
     );
-    res.json({ success: true, group: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.json({ success: true, group });
+  } catch (err) {
+    console.error('Create group error:', err);
+    res.status(500).json({ success: false, message: 'Failed to create group' });
   }
 });
 
-// ─── PATCH: GET /api/study-groups — include active_session_count ─
-// REPLACE your existing GET /api/study-groups with this:
+// ── 4. UPDATED: GET /api/study-groups ────────────────────────
+// Replaces the existing route — includes program, study_mode, active_session_count
 app.get('/api/study-groups', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT sg.*,
-              u.full_name as creator_name,
-              COUNT(DISTINCT sgm.id) as member_count,
-              COUNT(DISTINCT ss.id) as active_session_count
+      `SELECT
+         sg.*,
+         u.full_name AS creator_name,
+         COUNT(DISTINCT sgm.id)::int AS member_count,
+         COUNT(DISTINCT ss.id)::int  AS active_session_count
        FROM study_groups sg
-       JOIN users u ON sg.creator_id = u.id
+       LEFT JOIN users u             ON u.id = sg.creator_id
        LEFT JOIN study_group_members sgm ON sgm.group_id = sg.id
-       LEFT JOIN study_sessions ss ON ss.group_id = sg.id AND ss.status = 'active'
+       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active'
        WHERE sg.is_private = false
        GROUP BY sg.id, u.full_name
-       ORDER BY active_session_count DESC, sg.created_at DESC`
+       ORDER BY active_session_count DESC, member_count DESC, sg.created_at DESC`
     );
     res.json({ success: true, groups: result.rows });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    console.error('Get groups error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch groups' });
   }
 });
 
-// ─── My Groups ───────────────────────────────────────────────
+// ── 5. GET /api/study-groups/my ─────────────────────────────
 app.get('/api/study-groups/my', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT sg.*,
-              u.full_name as creator_name,
-              COUNT(DISTINCT sgm2.id) as member_count,
-              COUNT(DISTINCT ss.id)  as active_session_count
-       FROM study_groups sg
-       JOIN users u ON sg.creator_id = u.id
-       JOIN study_group_members sgm ON sgm.group_id = sg.id AND sgm.user_id = $1
-       LEFT JOIN study_group_members sgm2 ON sgm2.group_id = sg.id
-       LEFT JOIN study_sessions ss ON ss.group_id = sg.id AND ss.status = 'active'
-       GROUP BY sg.id, u.full_name
-       ORDER BY sg.created_at DESC`,
-      [req.user.userId]
-    );
-    res.json({ success: true, groups: result.rows });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ─── Leave Group ─────────────────────────────────────────────
-app.post('/api/study-groups/:id/leave', authMiddleware, async (req, res) => {
-  try {
-    // End any active session first
-    await pool.query(
-      `UPDATE study_sessions SET status='ended', ended_at=NOW()
-       WHERE group_id=$1 AND user_id=$2 AND status='active'`,
-      [req.params.id, req.user.userId]
-    );
-    await pool.query(
-      'DELETE FROM study_group_members WHERE group_id=$1 AND user_id=$2',
-      [req.params.id, req.user.userId]
-    );
-    res.json({ success: true, message: 'Left group' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ─── Group Members (with active status & program) ────────────
-app.get('/api/study-groups/:id/members', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
   try {
     const result = await pool.query(
       `SELECT
-         sgm.user_id as id,
-         u.full_name,
-         u.institution,
-         u.profile_image_url,
-         sgm.role,
-         sgm.joined_at,
-         EXISTS(
-           SELECT 1 FROM study_sessions ss
-           WHERE ss.group_id=$1 AND ss.user_id=sgm.user_id AND ss.status='active'
-         ) as is_active
-       FROM study_group_members sgm
-       JOIN users u ON u.id = sgm.user_id
-       LEFT JOIN timetables t ON t.user_id = sgm.user_id
-       WHERE sgm.group_id=$1
-       GROUP BY sgm.user_id, u.full_name, u.institution, u.profile_image_url, sgm.role, sgm.joined_at
-       ORDER BY sgm.role DESC, sgm.joined_at ASC`,
-      [req.params.id]
+         sg.*,
+         u.full_name AS creator_name,
+         COUNT(DISTINCT sgm2.id)::int AS member_count,
+         COUNT(DISTINCT ss.id)::int   AS active_session_count,
+         mym.role
+       FROM study_groups sg
+       JOIN study_group_members mym  ON mym.group_id = sg.id AND mym.user_id = $1
+       LEFT JOIN users u             ON u.id = sg.creator_id
+       LEFT JOIN study_group_members sgm2 ON sgm2.group_id = sg.id
+       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active'
+       GROUP BY sg.id, u.full_name, mym.role
+       ORDER BY sg.created_at DESC`,
+      [userId]
     );
-
-    // Try to figure out program from timetable course codes
-    const members = result.rows.map(m => ({
-      ...m,
-      program: m.program || null, // could be enriched later
-    }));
-
-    res.json({ success: true, members });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.json({ success: true, groups: result.rows });
+  } catch (err) {
+    console.error('Get my groups error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch groups' });
   }
 });
 
-// ─── Group Chat ──────────────────────────────────────────────
+// ── 6. POST /api/study-groups/:id/leave ─────────────────────
+app.post('/api/study-groups/:id/leave', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  try {
+    // End session first
+    await pool.query(
+      `UPDATE study_sessions SET status='ended', ended_at=NOW() WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+      [id, userId]
+    );
+    await pool.query('DELETE FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Leave group error:', err);
+    res.status(500).json({ success: false, message: 'Failed to leave group' });
+  }
+});
+
+// ── 7. GET /api/study-groups/:id/members ────────────────────
+app.get('/api/study-groups/:id/members', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT
+         u.id, u.full_name, u.institution, u.profile_image_url,
+         sgm.role, sgm.joined_at,
+         CASE WHEN ss.id IS NOT NULL THEN true ELSE false END AS is_active
+       FROM study_group_members sgm
+       JOIN users u ON u.id = sgm.user_id
+       LEFT JOIN study_sessions ss
+         ON ss.group_id = $1 AND ss.user_id = u.id AND ss.status = 'active'
+       WHERE sgm.group_id = $1
+       ORDER BY is_active DESC, sgm.joined_at ASC`,
+      [id]
+    );
+    res.json({ success: true, members: result.rows });
+  } catch (err) {
+    console.error('Get members error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch members' });
+  }
+});
+
+// ── 8. GET /api/study-groups/:id/chat ───────────────────────
 app.get('/api/study-groups/:id/chat', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
   try {
     // Verify membership
-    const mem = await pool.query(
-      'SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2',
-      [req.params.id, req.user.userId]
-    );
-    if (!mem.rows.length) return res.status(403).json({ success: false, message: 'Not a member' });
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
 
     const result = await pool.query(
-      `SELECT cm.*, u.full_name as sender_name, u.profile_image_url as sender_image
+      `SELECT cm.id, cm.message, cm.created_at, cm.sender_id, u.full_name AS sender_name
        FROM chat_messages cm
        JOIN users u ON u.id = cm.sender_id
        WHERE cm.group_id = $1
        ORDER BY cm.created_at ASC
        LIMIT 100`,
-      [req.params.id]
+      [id]
     );
     res.json({ success: true, messages: result.rows });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    console.error('Get chat error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch chat' });
   }
 });
 
+// ── 9. POST /api/study-groups/:id/chat ──────────────────────
 app.post('/api/study-groups/:id/chat', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
   const { message } = req.body;
   if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
-
   try {
-    const mem = await pool.query(
-      'SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2',
-      [req.params.id, req.user.userId]
-    );
-    if (!mem.rows.length) return res.status(403).json({ success: false, message: 'Not a member' });
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
 
-    const result = await pool.query(
-      `INSERT INTO chat_messages (sender_id, group_id, message, message_type)
-       VALUES ($1,$2,$3,'text') RETURNING *`,
-      [req.user.userId, req.params.id, message.trim()]
-    );
-    res.json({ success: true, message: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ─── Session Goals ───────────────────────────────────────────
-app.get('/api/study-groups/:id/goals', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT sg.*,
-              u.full_name as created_by_name,
-              cb.full_name as completed_by_name
-       FROM session_goals sg
-       JOIN users u ON u.id = sg.created_by
-       LEFT JOIN users cb ON cb.id = sg.completed_by
-       WHERE sg.group_id=$1
-         AND sg.goal_date = CURRENT_DATE
-       ORDER BY sg.created_at ASC`,
-      [req.params.id]
-    );
-    res.json({ success: true, goals: result.rows });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/api/study-groups/:id/goals', authMiddleware, async (req, res) => {
-  const { goal_text } = req.body;
-  if (!goal_text?.trim()) return res.status(400).json({ success: false, message: 'Goal text required' });
-
-  try {
-    const mem = await pool.query(
-      'SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2',
-      [req.params.id, req.user.userId]
-    );
-    if (!mem.rows.length) return res.status(403).json({ success: false, message: 'Not a member' });
-
-    const result = await pool.query(
-      `INSERT INTO session_goals (group_id, created_by, goal_text)
-       VALUES ($1,$2,$3) RETURNING *`,
-      [req.params.id, req.user.userId, goal_text.trim()]
-    );
-    res.json({ success: true, goal: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.patch('/api/study-groups/:id/goals/:goalId', authMiddleware, async (req, res) => {
-  const { completed } = req.body;
-  try {
-    const result = await pool.query(
-      `UPDATE session_goals
-       SET completed=$1,
-           completed_by = CASE WHEN $1 THEN $2 ELSE NULL END,
-           completed_at = CASE WHEN $1 THEN NOW() ELSE NULL END
-       WHERE id=$3 AND group_id=$4
-       RETURNING *`,
-      [completed, req.user.userId, req.params.goalId, req.params.id]
-    );
-    res.json({ success: true, goal: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.delete('/api/study-groups/:id/goals/:goalId', authMiddleware, async (req, res) => {
-  try {
     await pool.query(
-      'DELETE FROM session_goals WHERE id=$1 AND group_id=$2 AND created_by=$3',
-      [req.params.goalId, req.params.id, req.user.userId]
+      'INSERT INTO chat_messages (sender_id, group_id, message) VALUES ($1,$2,$3)',
+      [userId, id, message.trim()]
     );
     res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    console.error('Send chat error:', err);
+    res.status(500).json({ success: false, message: 'Failed to send message' });
   }
 });
 
-// ─── Study Sessions (who's studying right now) ──────────────
-app.get('/api/study-groups/:id/session', authMiddleware, async (req, res) => {
+// ── 10. GET /api/study-groups/:id/goals ─────────────────────
+app.get('/api/study-groups/:id/goals', authMiddleware, async (req, res) => {
+  const { id } = req.params;
   try {
-    const active = await pool.query(
-      `SELECT COUNT(*) as active_count FROM study_sessions
-       WHERE group_id=$1 AND status='active'`,
-      [req.params.id]
+    const result = await pool.query(
+      `SELECT g.*, u.full_name AS creator_name, uc.full_name AS completed_by_name
+       FROM session_goals g
+       JOIN users u ON u.id = g.created_by
+       LEFT JOIN users uc ON uc.id = g.completed_by
+       WHERE g.group_id = $1 AND g.goal_date = CURRENT_DATE
+       ORDER BY g.created_at ASC`,
+      [id]
     );
-    const isMember = await pool.query(
-      `SELECT EXISTS(
-         SELECT 1 FROM study_sessions
-         WHERE group_id=$1 AND user_id=$2 AND status='active'
-       ) as is_active_member`,
-      [req.params.id, req.user.userId]
+    res.json({ success: true, goals: result.rows });
+  } catch (err) {
+    console.error('Get goals error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch goals' });
+  }
+});
+
+// ── 11. POST /api/study-groups/:id/goals ────────────────────
+app.post('/api/study-groups/:id/goals', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  const { goal_text } = req.body;
+  if (!goal_text?.trim()) return res.status(400).json({ success: false, message: 'Goal text required' });
+  try {
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
+
+    await pool.query(
+      'INSERT INTO session_goals (group_id, created_by, goal_text) VALUES ($1,$2,$3)',
+      [id, userId, goal_text.trim()]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Add goal error:', err);
+    res.status(500).json({ success: false, message: 'Failed to add goal' });
+  }
+});
+
+// ── 12. PATCH /api/study-groups/:id/goals/:goalId ───────────
+app.patch('/api/study-groups/:id/goals/:goalId', authMiddleware, async (req, res) => {
+  const { goalId } = req.params;
+  const userId      = req.user.userId;
+  const { completed } = req.body;
+  try {
+    await pool.query(
+      `UPDATE session_goals SET
+         completed    = $1,
+         completed_by = $2,
+         completed_at = $3
+       WHERE id = $4`,
+      [completed, completed ? userId : null, completed ? new Date() : null, goalId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Toggle goal error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update goal' });
+  }
+});
+
+// ── 13. DELETE /api/study-groups/:id/goals/:goalId ──────────
+app.delete('/api/study-groups/:id/goals/:goalId', authMiddleware, async (req, res) => {
+  const { goalId } = req.params;
+  const userId      = req.user.userId;
+  try {
+    await pool.query(
+      'DELETE FROM session_goals WHERE id=$1 AND created_by=$2',
+      [goalId, userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete goal error:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete goal' });
+  }
+});
+
+// ── 14. GET /api/study-groups/:id/session ───────────────────
+app.get('/api/study-groups/:id/session', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  try {
+    const activeCount = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM study_sessions WHERE group_id=$1 AND status='active'`,
+      [id]
+    );
+    const userSess = await pool.query(
+      `SELECT id FROM study_sessions WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+      [id, userId]
     );
     res.json({
       success: true,
       session: {
-        active_count: parseInt(active.rows[0].active_count),
-        is_active_member: isMember.rows[0].is_active_member,
-      }
+        active_count:      activeCount.rows[0].count,
+        is_active_member:  userSess.rows.length > 0,
+      },
     });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    console.error('Get session error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch session' });
   }
 });
 
+// ── 15. POST /api/study-groups/:id/session/start ────────────
 app.post('/api/study-groups/:id/session/start', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
   try {
-    // End any previous dangling sessions for this user in this group
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
+
     await pool.query(
-      `UPDATE study_sessions SET status='ended', ended_at=NOW()
-       WHERE group_id=$1 AND user_id=$2 AND status='active'`,
-      [req.params.id, req.user.userId]
+      `INSERT INTO study_sessions (group_id, user_id, status)
+       VALUES ($1,$2,'active')
+       ON CONFLICT (group_id, user_id, status) DO NOTHING`,
+      [id, userId]
     );
-    await pool.query(
-      `INSERT INTO study_sessions (group_id, user_id) VALUES ($1,$2)`,
-      [req.params.id, req.user.userId]
-    );
-    res.json({ success: true, message: 'Session started' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Start session error:', err);
+    res.status(500).json({ success: false, message: 'Failed to start session' });
   }
 });
 
+// ── 16. POST /api/study-groups/:id/session/end ──────────────
 app.post('/api/study-groups/:id/session/end', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
   try {
     await pool.query(
       `UPDATE study_sessions SET status='ended', ended_at=NOW()
        WHERE group_id=$1 AND user_id=$2 AND status='active'`,
-      [req.params.id, req.user.userId]
+      [id, userId]
     );
-    res.json({ success: true, message: 'Session ended' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('End session error:', err);
+    res.status(500).json({ success: false, message: 'Failed to end session' });
+  }
+});app.post('/api/study-groups', authMiddleware, async (req, res) => {
+  const creatorId = req.user.userId;
+  const { name, description, subject, program, maxMembers, isPrivate, study_mode, year_filter } = req.body;
+
+  if (!name) return res.status(400).json({ success: false, message: 'Group name is required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO study_groups
+         (creator_id, name, description, subject, program, max_members, is_private, study_mode, year_filter)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [creatorId, name, description || null, subject || null, program || null,
+       maxMembers || 50, isPrivate || false, study_mode || 'social', year_filter || null]
+    );
+    const group = result.rows[0];
+    // Creator joins automatically as admin
+    await pool.query(
+      'INSERT INTO study_group_members (group_id, user_id, role) VALUES ($1,$2,$3)',
+      [group.id, creatorId, 'admin']
+    );
+    res.json({ success: true, group });
+  } catch (err) {
+    console.error('Create group error:', err);
+    res.status(500).json({ success: false, message: 'Failed to create group' });
+  }
+});
+
+// ── 4. UPDATED: GET /api/study-groups ────────────────────────
+// Replaces the existing route — includes program, study_mode, active_session_count
+app.get('/api/study-groups', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         sg.*,
+         u.full_name AS creator_name,
+         COUNT(DISTINCT sgm.id)::int AS member_count,
+         COUNT(DISTINCT ss.id)::int  AS active_session_count
+       FROM study_groups sg
+       LEFT JOIN users u             ON u.id = sg.creator_id
+       LEFT JOIN study_group_members sgm ON sgm.group_id = sg.id
+       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active'
+       WHERE sg.is_private = false
+       GROUP BY sg.id, u.full_name
+       ORDER BY active_session_count DESC, member_count DESC, sg.created_at DESC`
+    );
+    res.json({ success: true, groups: result.rows });
+  } catch (err) {
+    console.error('Get groups error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch groups' });
+  }
+});
+
+// ── 5. GET /api/study-groups/my ─────────────────────────────
+app.get('/api/study-groups/my', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    const result = await pool.query(
+      `SELECT
+         sg.*,
+         u.full_name AS creator_name,
+         COUNT(DISTINCT sgm2.id)::int AS member_count,
+         COUNT(DISTINCT ss.id)::int   AS active_session_count,
+         mym.role
+       FROM study_groups sg
+       JOIN study_group_members mym  ON mym.group_id = sg.id AND mym.user_id = $1
+       LEFT JOIN users u             ON u.id = sg.creator_id
+       LEFT JOIN study_group_members sgm2 ON sgm2.group_id = sg.id
+       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active'
+       GROUP BY sg.id, u.full_name, mym.role
+       ORDER BY sg.created_at DESC`,
+      [userId]
+    );
+    res.json({ success: true, groups: result.rows });
+  } catch (err) {
+    console.error('Get my groups error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch groups' });
+  }
+});
+
+// ── 6. POST /api/study-groups/:id/leave ─────────────────────
+app.post('/api/study-groups/:id/leave', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  try {
+    // End session first
+    await pool.query(
+      `UPDATE study_sessions SET status='ended', ended_at=NOW() WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+      [id, userId]
+    );
+    await pool.query('DELETE FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Leave group error:', err);
+    res.status(500).json({ success: false, message: 'Failed to leave group' });
+  }
+});
+
+// ── 7. GET /api/study-groups/:id/members ────────────────────
+app.get('/api/study-groups/:id/members', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT
+         u.id, u.full_name, u.institution, u.profile_image_url,
+         sgm.role, sgm.joined_at,
+         CASE WHEN ss.id IS NOT NULL THEN true ELSE false END AS is_active
+       FROM study_group_members sgm
+       JOIN users u ON u.id = sgm.user_id
+       LEFT JOIN study_sessions ss
+         ON ss.group_id = $1 AND ss.user_id = u.id AND ss.status = 'active'
+       WHERE sgm.group_id = $1
+       ORDER BY is_active DESC, sgm.joined_at ASC`,
+      [id]
+    );
+    res.json({ success: true, members: result.rows });
+  } catch (err) {
+    console.error('Get members error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch members' });
+  }
+});
+
+// ── 8. GET /api/study-groups/:id/chat ───────────────────────
+app.get('/api/study-groups/:id/chat', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  try {
+    // Verify membership
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
+
+    const result = await pool.query(
+      `SELECT cm.id, cm.message, cm.created_at, cm.sender_id, u.full_name AS sender_name
+       FROM chat_messages cm
+       JOIN users u ON u.id = cm.sender_id
+       WHERE cm.group_id = $1
+       ORDER BY cm.created_at ASC
+       LIMIT 100`,
+      [id]
+    );
+    res.json({ success: true, messages: result.rows });
+  } catch (err) {
+    console.error('Get chat error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch chat' });
+  }
+});
+
+// ── 9. POST /api/study-groups/:id/chat ──────────────────────
+app.post('/api/study-groups/:id/chat', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  const { message } = req.body;
+  if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
+  try {
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
+
+    await pool.query(
+      'INSERT INTO chat_messages (sender_id, group_id, message) VALUES ($1,$2,$3)',
+      [userId, id, message.trim()]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Send chat error:', err);
+    res.status(500).json({ success: false, message: 'Failed to send message' });
+  }
+});
+
+// ── 10. GET /api/study-groups/:id/goals ─────────────────────
+app.get('/api/study-groups/:id/goals', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT g.*, u.full_name AS creator_name, uc.full_name AS completed_by_name
+       FROM session_goals g
+       JOIN users u ON u.id = g.created_by
+       LEFT JOIN users uc ON uc.id = g.completed_by
+       WHERE g.group_id = $1 AND g.goal_date = CURRENT_DATE
+       ORDER BY g.created_at ASC`,
+      [id]
+    );
+    res.json({ success: true, goals: result.rows });
+  } catch (err) {
+    console.error('Get goals error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch goals' });
+  }
+});
+
+// ── 11. POST /api/study-groups/:id/goals ────────────────────
+app.post('/api/study-groups/:id/goals', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  const { goal_text } = req.body;
+  if (!goal_text?.trim()) return res.status(400).json({ success: false, message: 'Goal text required' });
+  try {
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
+
+    await pool.query(
+      'INSERT INTO session_goals (group_id, created_by, goal_text) VALUES ($1,$2,$3)',
+      [id, userId, goal_text.trim()]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Add goal error:', err);
+    res.status(500).json({ success: false, message: 'Failed to add goal' });
+  }
+});
+
+// ── 12. PATCH /api/study-groups/:id/goals/:goalId ───────────
+app.patch('/api/study-groups/:id/goals/:goalId', authMiddleware, async (req, res) => {
+  const { goalId } = req.params;
+  const userId      = req.user.userId;
+  const { completed } = req.body;
+  try {
+    await pool.query(
+      `UPDATE session_goals SET
+         completed    = $1,
+         completed_by = $2,
+         completed_at = $3
+       WHERE id = $4`,
+      [completed, completed ? userId : null, completed ? new Date() : null, goalId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Toggle goal error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update goal' });
+  }
+});
+
+// ── 13. DELETE /api/study-groups/:id/goals/:goalId ──────────
+app.delete('/api/study-groups/:id/goals/:goalId', authMiddleware, async (req, res) => {
+  const { goalId } = req.params;
+  const userId      = req.user.userId;
+  try {
+    await pool.query(
+      'DELETE FROM session_goals WHERE id=$1 AND created_by=$2',
+      [goalId, userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete goal error:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete goal' });
+  }
+});
+
+// ── 14. GET /api/study-groups/:id/session ───────────────────
+app.get('/api/study-groups/:id/session', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  try {
+    const activeCount = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM study_sessions WHERE group_id=$1 AND status='active'`,
+      [id]
+    );
+    const userSess = await pool.query(
+      `SELECT id FROM study_sessions WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+      [id, userId]
+    );
+    res.json({
+      success: true,
+      session: {
+        active_count:      activeCount.rows[0].count,
+        is_active_member:  userSess.rows.length > 0,
+      },
+    });
+  } catch (err) {
+    console.error('Get session error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch session' });
+  }
+});
+
+// ── 15. POST /api/study-groups/:id/session/start ────────────
+app.post('/api/study-groups/:id/session/start', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  try {
+    const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
+    if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
+
+    await pool.query(
+      `INSERT INTO study_sessions (group_id, user_id, status)
+       VALUES ($1,$2,'active')
+       ON CONFLICT (group_id, user_id, status) DO NOTHING`,
+      [id, userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Start session error:', err);
+    res.status(500).json({ success: false, message: 'Failed to start session' });
+  }
+});
+
+// ── 16. POST /api/study-groups/:id/session/end ──────────────
+app.post('/api/study-groups/:id/session/end', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId  = req.user.userId;
+  try {
+    await pool.query(
+      `UPDATE study_sessions SET status='ended', ended_at=NOW()
+       WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+      [id, userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('End session error:', err);
+    res.status(500).json({ success: false, message: 'Failed to end session' });
   }
 });
 // ============================================
