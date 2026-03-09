@@ -474,7 +474,7 @@ CREATE TABLE IF NOT EXISTS homework_responses (
   responder_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   response TEXT NOT NULL,
   attachment_url TEXT,
-  is_ai_response BOOLEAN DEFAULT false,
+  is_expert_response BOOLEAN DEFAULT false,
   helpful_count INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -4270,7 +4270,7 @@ async function pdfToImages(buffer) {
   }
 }
 
-const TIMETABLE_PROMPT = `You are a data extraction assistant reading a university timetable grid image.
+const TIMETABLE_PROMPT = `Read a university timetable grid image.
 
 STRUCTURE: The timetable is a grid where:
 - ROWS = time slots (e.g. 7:00-7:55, 8:00-8:55, etc.)
@@ -4448,6 +4448,1654 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
   }
 });
 
+
+
+// ============================================================================
+// STUDENTHUB — BACKEND ADDITIONS v2
+// Drop this entire block into server.js JUST BEFORE the 404 handler.
+// Also run POST /api/migrate-v2 once after deploy to apply the schema changes.
+// ============================================================================
+
+// ── Missing path import (required by uploadToSupabase) ───────────────────────
+const path = require('path');
+
+// ============================================================================
+// MIGRATION — Run POST /api/migrate-v2 once to add all new tables + columns
+// ============================================================================
+
+const migrationSQL = `
+-- Extend users table with XP / gamification fields
+ALTER TABLE users ADD COLUMN IF NOT EXISTS xp_points        INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS level            VARCHAR(20) DEFAULT 'Bronze';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS login_streak     INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_date  DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS programme        VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS year_of_study    VARCHAR(10);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subjects         TEXT[] DEFAULT '{}';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style      VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS study_times      TEXT[] DEFAULT '{}';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS goals            TEXT[] DEFAULT '{}';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at     TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation_score INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS rank_percentile  DECIMAL(5,2) DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS store_views      INTEGER DEFAULT 0;
+
+-- Extend library_resources with extra columns used in routes
+ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS category      VARCHAR(100) DEFAULT 'Lecture Notes';
+ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS thumbnail_url TEXT;
+
+-- Extend study_groups with fields used in routes
+ALTER TABLE study_groups ADD COLUMN IF NOT EXISTS program     VARCHAR(100);
+ALTER TABLE study_groups ADD COLUMN IF NOT EXISTS study_mode  VARCHAR(50) DEFAULT 'social';
+ALTER TABLE study_groups ADD COLUMN IF NOT EXISTS year_filter VARCHAR(10);
+
+-- Extend notifications with sent tracking
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sent     BOOLEAN DEFAULT false;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sent_at  TIMESTAMP;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at  TIMESTAMP;
+
+-- Extend assignments with submitted_at
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;
+
+-- Extend timetables with notification_minutes_before
+ALTER TABLE timetables ADD COLUMN IF NOT EXISTS notification_minutes_before INTEGER DEFAULT 30;
+
+-- Study sessions (for study groups)
+CREATE TABLE IF NOT EXISTS study_sessions (
+  id          SERIAL PRIMARY KEY,
+  group_id    INTEGER REFERENCES study_groups(id) ON DELETE CASCADE,
+  user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  status      VARCHAR(20) DEFAULT 'active',
+  started_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ended_at    TIMESTAMP,
+  UNIQUE(group_id, user_id, status)
+);
+
+-- Session goals (for study groups)
+CREATE TABLE IF NOT EXISTS session_goals (
+  id           SERIAL PRIMARY KEY,
+  group_id     INTEGER REFERENCES study_groups(id) ON DELETE CASCADE,
+  created_by   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  goal_text    TEXT NOT NULL,
+  goal_date    DATE DEFAULT CURRENT_DATE,
+  completed    BOOLEAN DEFAULT false,
+  completed_by INTEGER REFERENCES users(id),
+  completed_at TIMESTAMP,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Library comments
+CREATE TABLE IF NOT EXISTS library_comments (
+  id          SERIAL PRIMARY KEY,
+  resource_id INTEGER REFERENCES library_resources(id) ON DELETE CASCADE,
+  user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  parent_id   INTEGER REFERENCES library_comments(id) ON DELETE CASCADE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Library comment likes
+CREATE TABLE IF NOT EXISTS library_comment_likes (
+  id         SERIAL PRIMARY KEY,
+  comment_id INTEGER REFERENCES library_comments(id) ON DELETE CASCADE,
+  user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(comment_id, user_id)
+);
+
+-- Stores table
+CREATE TABLE IF NOT EXISTS stores (
+  id           SERIAL PRIMARY KEY,
+  user_id      INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  owner_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  store_name   VARCHAR(255),
+  slug         VARCHAR(100) UNIQUE,
+  description  TEXT,
+  banner_url   TEXT,
+  category     VARCHAR(100),
+  location     VARCHAR(255),
+  phone        VARCHAR(50),
+  email        VARCHAR(255),
+  website      TEXT,
+  rating       DECIMAL(3,2) DEFAULT 0,
+  status       VARCHAR(20) DEFAULT 'active',
+  store_views  INTEGER DEFAULT 0,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Store followers
+CREATE TABLE IF NOT EXISTS store_followers (
+  id         SERIAL PRIMARY KEY,
+  store_id   INTEGER REFERENCES stores(id) ON DELETE CASCADE,
+  user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(store_id, user_id)
+);
+
+-- Seller followers (direct user follows for sellers)
+CREATE TABLE IF NOT EXISTS seller_followers (
+  id          SERIAL PRIMARY KEY,
+  seller_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(seller_id, follower_id)
+);
+
+-- Store reviews
+CREATE TABLE IF NOT EXISTS store_reviews (
+  id          SERIAL PRIMARY KEY,
+  store_id    INTEGER REFERENCES stores(id) ON DELETE CASCADE,
+  reviewer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  rating      INTEGER CHECK (rating >= 1 AND rating <= 5),
+  review_text TEXT,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(store_id, reviewer_id)
+);
+
+-- Classroom locations
+CREATE TABLE IF NOT EXISTS classroom_locations (
+  id            SERIAL PRIMARY KEY,
+  user_id       INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  building      VARCHAR(100),
+  room_number   VARCHAR(50),
+  location_name VARCHAR(255),
+  location_lat  DECIMAL(10,8),
+  location_lng  DECIMAL(11,8),
+  notes         TEXT,
+  is_public     BOOLEAN DEFAULT false,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, building, room_number)
+);
+
+-- ── NEW REWARD SYSTEM TABLES ──────────────────────────────────────────────
+
+-- Badges catalogue
+CREATE TABLE IF NOT EXISTS badges (
+  id          SERIAL PRIMARY KEY,
+  slug        VARCHAR(60) UNIQUE NOT NULL,
+  name        VARCHAR(100) NOT NULL,
+  description TEXT,
+  icon        VARCHAR(10),
+  tier        VARCHAR(20) DEFAULT 'bronze',
+  xp_reward   INTEGER DEFAULT 0,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Badges earned by users
+CREATE TABLE IF NOT EXISTS user_badges (
+  id         SERIAL PRIMARY KEY,
+  user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  badge_id   INTEGER REFERENCES badges(id) ON DELETE CASCADE,
+  earned_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, badge_id)
+);
+
+-- XP transaction ledger
+CREATE TABLE IF NOT EXISTS point_transactions (
+  id          SERIAL PRIMARY KEY,
+  user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  action      VARCHAR(60) NOT NULL,
+  points      INTEGER NOT NULL,
+  reference   TEXT,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- User follows (who follows whom)
+CREATE TABLE IF NOT EXISTS user_follows (
+  id          SERIAL PRIMARY KEY,
+  follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(follower_id, following_id)
+);
+
+-- Direct messages
+CREATE TABLE IF NOT EXISTS direct_messages (
+  id          SERIAL PRIMARY KEY,
+  sender_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  is_read     BOOLEAN DEFAULT false,
+  read_at     TIMESTAMP,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Event RSVPs
+CREATE TABLE IF NOT EXISTS event_rsvps (
+  id         SERIAL PRIMARY KEY,
+  event_id   INTEGER REFERENCES school_events(id) ON DELETE CASCADE,
+  user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  status     VARCHAR(20) DEFAULT 'going',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(event_id, user_id)
+);
+
+-- Bounty fulfillments
+CREATE TABLE IF NOT EXISTS bounty_fulfillments (
+  id           SERIAL PRIMARY KEY,
+  bounty_id    INTEGER REFERENCES library_bounties(id) ON DELETE CASCADE,
+  fulfiller_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  resource_id  INTEGER REFERENCES library_resources(id) ON DELETE CASCADE,
+  note         TEXT,
+  accepted     BOOLEAN DEFAULT false,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Marketplace service images
+ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS images TEXT[] DEFAULT '{}';
+
+-- Indexes for new tables
+CREATE INDEX IF NOT EXISTS idx_point_tx_user    ON point_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_badges_user ON user_badges(user_id);
+CREATE INDEX IF NOT EXISTS idx_dm_sender        ON direct_messages(sender_id);
+CREATE INDEX IF NOT EXISTS idx_dm_receiver      ON direct_messages(receiver_id);
+CREATE INDEX IF NOT EXISTS idx_user_follows_fr  ON user_follows(follower_id);
+CREATE INDEX IF NOT EXISTS idx_user_follows_fg  ON user_follows(following_id);
+CREATE INDEX IF NOT EXISTS idx_event_rsvps      ON event_rsvps(event_id);
+CREATE INDEX IF NOT EXISTS idx_session_goals    ON session_goals(group_id);
+CREATE INDEX IF NOT EXISTS idx_study_sessions   ON study_sessions(group_id);
+CREATE INDEX IF NOT EXISTS idx_library_comments ON library_comments(resource_id);
+`;
+
+app.post('/api/migrate-v2', async (req, res) => {
+  try {
+    const statements = migrationSQL
+      .split(';')
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+
+    const results = [];
+    for (const sql of statements) {
+      try {
+        await pool.query(sql);
+        results.push({ ok: true, sql: sql.slice(0, 60) });
+      } catch (err) {
+        results.push({ ok: false, sql: sql.slice(0, 60), err: err.message });
+      }
+    }
+
+    await seedBadges();
+    res.json({ success: true, results });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// REWARD SYSTEM — XP ACTIONS, LEVELS, HELPERS
+// ============================================================================
+
+const XP_ACTIONS = {
+  resource_upload:      20,
+  upvote_received:       5,
+  homework_answered:    15,
+  study_task_completed: 10,
+  assignment_submitted:  5,
+  daily_login:          10,
+  class_joined:          3,
+  study_group_created:  15,
+  study_group_joined:    5,
+  item_listed:          10,
+  review_given:          5,
+  library_upvote_given:  2,
+  bounty_fulfilled:     30,
+  login_streak_7:       50,
+  login_streak_30:     200,
+};
+
+function calcLevel(xp) {
+  if (xp >= 2000) return 'Diamond';
+  if (xp >= 800)  return 'Platinum';
+  if (xp >= 400)  return 'Gold';
+  if (xp >= 150)  return 'Silver';
+  return 'Bronze';
+}
+
+// Non-blocking — never delays a response
+async function awardXP(userId, action, reference = null) {
+  const points = XP_ACTIONS[action];
+  if (!points) return;
+  try {
+    await pool.query(
+      `INSERT INTO point_transactions (user_id, action, points, reference)
+       VALUES ($1, $2, $3, $4)`,
+      [userId, action, points, reference]
+    );
+    const result = await pool.query(
+      `UPDATE users
+       SET xp_points = xp_points + $1,
+           level     = $2,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING xp_points`,
+      [points, calcLevel((await pool.query('SELECT xp_points FROM users WHERE id=$1', [userId])).rows[0]?.xp_points + points || points), userId]
+    );
+    const newXp = result.rows[0]?.xp_points || 0;
+    // Update level correctly after increment
+    await pool.query(
+      'UPDATE users SET level = $1 WHERE id = $2',
+      [calcLevel(newXp), userId]
+    );
+    await checkBadges(userId);
+  } catch (err) {
+    console.error('[XP] award error:', err.message);
+  }
+}
+
+async function checkBadges(userId) {
+  try {
+    const [uploads, answers, groups, reviews, streak, xp] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM library_resources WHERE uploader_id=$1', [userId]),
+      pool.query('SELECT COUNT(*) FROM homework_responses WHERE responder_id=$1', [userId]),
+      pool.query('SELECT COUNT(*) FROM study_group_members WHERE user_id=$1', [userId]),
+      pool.query('SELECT COUNT(*) FROM reviews WHERE reviewer_id=$1', [userId]),
+      pool.query('SELECT login_streak FROM users WHERE id=$1', [userId]),
+      pool.query('SELECT xp_points FROM users WHERE id=$1', [userId]),
+    ]);
+
+    const u  = parseInt(uploads.rows[0].count);
+    const a  = parseInt(answers.rows[0].count);
+    const g  = parseInt(groups.rows[0].count);
+    const rv = parseInt(reviews.rows[0].count);
+    const ls = parseInt(streak.rows[0]?.login_streak || 0);
+    const xpv = parseInt(xp.rows[0]?.xp_points || 0);
+
+    const toAward = [];
+    if (u >= 1)   toAward.push('first_upload');
+    if (u >= 5)   toAward.push('bookworm');
+    if (u >= 20)  toAward.push('scholar');
+    if (a >= 1)   toAward.push('first_helper');
+    if (a >= 10)  toAward.push('mentor');
+    if (a >= 50)  toAward.push('sage');
+    if (g >= 1)   toAward.push('study_buddy');
+    if (g >= 5)   toAward.push('team_player');
+    if (g >= 10)  toAward.push('social_butterfly');
+    if (rv >= 1)  toAward.push('reviewer');
+    if (ls >= 7)  toAward.push('streak_7');
+    if (ls >= 30) toAward.push('streak_30');
+    if (xpv >= 500)  toAward.push('rising_star');
+    if (xpv >= 2000) toAward.push('legend');
+
+    for (const slug of toAward) {
+      const badge = await pool.query('SELECT id FROM badges WHERE slug=$1', [slug]);
+      if (!badge.rows.length) continue;
+      const badgeId = badge.rows[0].id;
+      const already = await pool.query(
+        'SELECT id FROM user_badges WHERE user_id=$1 AND badge_id=$2',
+        [userId, badgeId]
+      );
+      if (!already.rows.length) {
+        await pool.query(
+          'INSERT INTO user_badges (user_id, badge_id) VALUES ($1,$2)',
+          [userId, badgeId]
+        );
+        // Notify
+        await pool.query(
+          `INSERT INTO notifications (user_id, notification_type, title, message, scheduled_time)
+           VALUES ($1, 'badge', $2, $3, NOW())`,
+          [userId, `Badge Unlocked!`,
+           `You earned the "${slug.replace(/_/g,' ')}" badge. Keep it up.`]
+        );
+      }
+    }
+  } catch (err) {
+    console.error('[Badge] check error:', err.message);
+  }
+}
+
+async function seedBadges() {
+  const badges = [
+    { slug: 'first_upload',      name: 'First Upload',        icon: '📄', tier: 'bronze',   xp: 10,  desc: 'Uploaded your first resource.' },
+    { slug: 'bookworm',          name: 'Bookworm',             icon: '📚', tier: 'silver',   xp: 25,  desc: 'Uploaded 5 resources.' },
+    { slug: 'scholar',           name: 'Scholar',              icon: '🎓', tier: 'gold',     xp: 75,  desc: 'Uploaded 20 resources.' },
+    { slug: 'first_helper',      name: 'First Helper',         icon: '🙋', tier: 'bronze',   xp: 15,  desc: 'Answered a homework question.' },
+    { slug: 'mentor',            name: 'Mentor',               icon: '🧑‍🏫', tier: 'silver', xp: 40,  desc: 'Answered 10 homework questions.' },
+    { slug: 'sage',              name: 'Sage',                 icon: '🦉', tier: 'platinum', xp: 150, desc: 'Answered 50 homework questions.' },
+    { slug: 'study_buddy',       name: 'Study Buddy',          icon: '🤝', tier: 'bronze',   xp: 10,  desc: 'Joined your first study group.' },
+    { slug: 'team_player',       name: 'Team Player',          icon: '🏆', tier: 'silver',   xp: 30,  desc: 'Joined 5 study groups.' },
+    { slug: 'social_butterfly',  name: 'Social Butterfly',     icon: '🦋', tier: 'gold',     xp: 75,  desc: 'Active in 10+ study groups.' },
+    { slug: 'marketplace_debut', name: 'Marketplace Debut',    icon: '🛍️', tier: 'bronze',   xp: 15,  desc: 'Listed your first item.' },
+    { slug: 'top_seller',        name: 'Top Seller',           icon: '💎', tier: 'gold',     xp: 100, desc: 'Listed 20+ items.' },
+    { slug: 'streak_7',          name: '7-Day Streak',         icon: '🔥', tier: 'silver',   xp: 50,  desc: 'Logged in 7 days in a row.' },
+    { slug: 'streak_30',         name: 'Monthly Grind',        icon: '⚡', tier: 'platinum', xp: 200, desc: 'Logged in 30 days in a row.' },
+    { slug: 'reviewer',          name: 'Reviewer',             icon: '⭐', tier: 'bronze',   xp: 10,  desc: 'Left your first review.' },
+    { slug: 'rising_star',       name: 'Rising Star',          icon: '🌟', tier: 'gold',     xp: 50,  desc: 'Reached 500 XP.' },
+    { slug: 'legend',            name: 'Legend',               icon: '👑', tier: 'diamond',  xp: 300, desc: 'Reached 2000 XP.' },
+  ];
+
+  for (const b of badges) {
+    await pool.query(
+      `INSERT INTO badges (slug, name, description, icon, tier, xp_reward)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (slug) DO UPDATE
+         SET name=$2, description=$3, icon=$4, tier=$5, xp_reward=$6`,
+      [b.slug, b.name, b.desc, b.icon, b.tier, b.xp]
+    );
+  }
+}
+
+// ============================================================================
+// REWARDS ROUTES
+// ============================================================================
+
+// GET /api/rewards/me — own XP summary
+app.get('/api/rewards/me', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const user = await pool.query(
+      `SELECT id, full_name, xp_points, level, login_streak, reputation_score, rank_percentile
+       FROM users WHERE id=$1`,
+      [uid]
+    );
+    if (!user.rows.length) return res.status(404).json({ success: false, message: 'Not found' });
+
+    const badges = await pool.query(
+      `SELECT b.slug, b.name, b.icon, b.tier, b.description, ub.earned_at
+       FROM user_badges ub
+       JOIN badges b ON b.id = ub.badge_id
+       WHERE ub.user_id=$1
+       ORDER BY ub.earned_at DESC`,
+      [uid]
+    );
+
+    const history = await pool.query(
+      `SELECT action, points, reference, created_at
+       FROM point_transactions
+       WHERE user_id=$1
+       ORDER BY created_at DESC
+       LIMIT 30`,
+      [uid]
+    );
+
+    const rank = await pool.query(
+      `SELECT COUNT(*)+1 AS rank FROM users WHERE xp_points > (SELECT xp_points FROM users WHERE id=$1)`,
+      [uid]
+    );
+
+    res.json({
+      success: true,
+      rewards: {
+        ...user.rows[0],
+        badges: badges.rows,
+        recentHistory: history.rows,
+        globalRank: parseInt(rank.rows[0].rank),
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/rewards/leaderboard?institution=&limit=20
+app.get('/api/rewards/leaderboard', authMiddleware, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const institution = req.query.institution;
+
+    const params = institution ? [institution, limit] : [limit];
+    const where  = institution ? 'WHERE institution=$1' : '';
+    const lParam = institution ? '$2' : '$1';
+
+    const result = await pool.query(
+      `SELECT id, full_name, institution, profile_image_url, xp_points, level, login_streak,
+              ROW_NUMBER() OVER (ORDER BY xp_points DESC) AS rank
+       FROM users
+       ${where}
+       ORDER BY xp_points DESC
+       LIMIT ${lParam}`,
+      params
+    );
+
+    // Highlight current user's position
+    const myRank = await pool.query(
+      `SELECT COUNT(*)+1 AS rank FROM users WHERE xp_points > (SELECT xp_points FROM users WHERE id=$1)`,
+      [req.user.userId]
+    );
+
+    res.json({
+      success: true,
+      leaderboard: result.rows,
+      myRank: parseInt(myRank.rows[0].rank),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/rewards/badges — all badges + which ones you have
+app.get('/api/rewards/badges', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT b.*,
+              CASE WHEN ub.id IS NOT NULL THEN true ELSE false END AS earned,
+              ub.earned_at
+       FROM badges b
+       LEFT JOIN user_badges ub ON ub.badge_id = b.id AND ub.user_id=$1
+       ORDER BY b.tier DESC, b.xp_reward DESC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, badges: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/rewards/history?limit=50
+app.get('/api/rewards/history', authMiddleware, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const result = await pool.query(
+      `SELECT action, points, reference, created_at
+       FROM point_transactions
+       WHERE user_id=$1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [req.user.userId, limit]
+    );
+    res.json({ success: true, history: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// DASHBOARD STATS
+// ============================================================================
+
+app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const [user, uploads, groups, assignments, exams, unread, upcoming] = await Promise.all([
+      pool.query(
+        `SELECT xp_points, level, login_streak, reputation_score FROM users WHERE id=$1`,
+        [uid]
+      ),
+      pool.query('SELECT COUNT(*) FROM library_resources WHERE uploader_id=$1', [uid]),
+      pool.query('SELECT COUNT(*) FROM study_group_members WHERE user_id=$1', [uid]),
+      pool.query(
+        `SELECT COUNT(*) FROM assignments WHERE user_id=$1 AND status='pending' AND due_date > NOW()`,
+        [uid]
+      ),
+      pool.query(
+        `SELECT COUNT(*) FROM exam_schedules WHERE user_id=$1 AND exam_date > NOW()`,
+        [uid]
+      ),
+      pool.query(
+        `SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND read=false AND scheduled_time<=NOW()`,
+        [uid]
+      ),
+      pool.query(
+        `SELECT title, due_date FROM assignments
+         WHERE user_id=$1 AND status='pending' AND due_date > NOW()
+         ORDER BY due_date ASC LIMIT 5`,
+        [uid]
+      ),
+    ]);
+
+    const rank = await pool.query(
+      `SELECT COUNT(*)+1 AS rank FROM users WHERE xp_points > (SELECT xp_points FROM users WHERE id=$1)`,
+      [uid]
+    );
+
+    res.json({
+      success: true,
+      stats: {
+        xp:              parseInt(user.rows[0]?.xp_points || 0),
+        level:           user.rows[0]?.level || 'Bronze',
+        loginStreak:     parseInt(user.rows[0]?.login_streak || 0),
+        reputation:      parseInt(user.rows[0]?.reputation_score || 0),
+        globalRank:      parseInt(rank.rows[0].rank),
+        uploads:         parseInt(uploads.rows[0].count),
+        studyGroups:     parseInt(groups.rows[0].count),
+        pendingAssignments: parseInt(assignments.rows[0].count),
+        upcomingExams:   parseInt(exams.rows[0].count),
+        unreadNotifications: parseInt(unread.rows[0].count),
+        upcomingDeadlines: upcoming.rows,
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// USER SEARCH + PROFILES + FOLLOWS
+// ============================================================================
+
+// GET /api/users/search?q=&institution=
+app.get('/api/users/search', authMiddleware, async (req, res) => {
+  const { q, institution } = req.query;
+  if (!q || q.length < 2) {
+    return res.status(400).json({ success: false, message: 'Search query too short' });
+  }
+  try {
+    const term = `%${q}%`;
+    const params = institution
+      ? [term, term, term, institution, req.user.userId]
+      : [term, term, term, req.user.userId];
+    const institutionClause = institution ? 'AND u.institution=$4' : '';
+    const uidParam = institution ? '$5' : '$4';
+
+    const result = await pool.query(
+      `SELECT u.id, u.full_name, u.student_id, u.institution, u.profile_image_url,
+              u.xp_points, u.level, u.bio,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=${uidParam} AND following_id=u.id) AS is_following
+       FROM users u
+       WHERE (u.full_name ILIKE $1 OR u.student_id ILIKE $2 OR u.institution ILIKE $3)
+       ${institutionClause}
+       AND u.id != ${uidParam}
+       ORDER BY u.xp_points DESC
+       LIMIT 30`,
+      params
+    );
+    res.json({ success: true, users: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/users/:id/profile — public profile
+app.get('/api/users/:id/profile', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  if (isNaN(id)) return res.status(400).json({ success: false, message: 'Invalid ID' });
+  try {
+    const user = await pool.query(
+      `SELECT u.id, u.full_name, u.institution, u.profile_image_url, u.bio,
+              u.xp_points, u.level, u.login_streak, u.reputation_score,
+              u.created_at,
+              (SELECT COUNT(*) FROM library_resources WHERE uploader_id=u.id) AS uploads,
+              (SELECT COUNT(*) FROM study_group_members WHERE user_id=u.id) AS groups_joined,
+              (SELECT COUNT(*) FROM user_follows WHERE following_id=u.id) AS followers,
+              (SELECT COUNT(*) FROM user_follows WHERE follower_id=u.id) AS following,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$2 AND following_id=u.id) AS is_following
+       FROM users u WHERE u.id=$1`,
+      [id, req.user.userId]
+    );
+    if (!user.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const badges = await pool.query(
+      `SELECT b.slug, b.name, b.icon, b.tier FROM user_badges ub
+       JOIN badges b ON b.id=ub.badge_id WHERE ub.user_id=$1 ORDER BY ub.earned_at DESC LIMIT 6`,
+      [id]
+    );
+
+    const recentUploads = await pool.query(
+      `SELECT id, title, subject, created_at FROM library_resources
+       WHERE uploader_id=$1 AND is_public=true ORDER BY created_at DESC LIMIT 5`,
+      [id]
+    );
+
+    res.json({
+      success: true,
+      profile: user.rows[0],
+      badges: badges.rows,
+      recentUploads: recentUploads.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/users/:id/follow — toggle follow
+app.post('/api/users/:id/follow', authMiddleware, async (req, res) => {
+  const targetId = parseInt(req.params.id);
+  const uid = req.user.userId;
+  if (isNaN(targetId)) return res.status(400).json({ success: false, message: 'Invalid ID' });
+  if (targetId === uid) return res.status(400).json({ success: false, message: 'Cannot follow yourself' });
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM user_follows WHERE follower_id=$1 AND following_id=$2',
+      [uid, targetId]
+    );
+    if (existing.rows.length) {
+      await pool.query('DELETE FROM user_follows WHERE follower_id=$1 AND following_id=$2', [uid, targetId]);
+      return res.json({ success: true, following: false });
+    }
+    await pool.query(
+      'INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2)',
+      [uid, targetId]
+    );
+    res.json({ success: true, following: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/users/me/followers
+app.get('/api/users/me/followers', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.full_name, u.profile_image_url, u.institution, u.level, uf.created_at
+       FROM user_follows uf
+       JOIN users u ON u.id = uf.follower_id
+       WHERE uf.following_id=$1
+       ORDER BY uf.created_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, followers: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/users/me/following
+app.get('/api/users/me/following', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.full_name, u.profile_image_url, u.institution, u.level, uf.created_at
+       FROM user_follows uf
+       JOIN users u ON u.id = uf.following_id
+       WHERE uf.follower_id=$1
+       ORDER BY uf.created_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ success: true, following: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// DIRECT MESSAGES
+// ============================================================================
+
+// GET /api/messages/inbox — list of conversations
+app.get('/api/messages/inbox', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const result = await pool.query(
+      `SELECT DISTINCT ON (other_id)
+         other_id,
+         other_name,
+         other_image,
+         content AS last_message,
+         created_at AS last_at,
+         unread_count
+       FROM (
+         SELECT
+           CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END AS other_id,
+           CASE WHEN dm.sender_id=$1 THEN ru.full_name    ELSE su.full_name   END AS other_name,
+           CASE WHEN dm.sender_id=$1 THEN ru.profile_image_url ELSE su.profile_image_url END AS other_image,
+           dm.content,
+           dm.created_at,
+           (SELECT COUNT(*) FROM direct_messages
+            WHERE sender_id=(CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END)
+              AND receiver_id=$1 AND is_read=false) AS unread_count
+         FROM direct_messages dm
+         JOIN users su ON su.id = dm.sender_id
+         JOIN users ru ON ru.id = dm.receiver_id
+         WHERE dm.sender_id=$1 OR dm.receiver_id=$1
+         ORDER BY dm.created_at DESC
+       ) t
+       ORDER BY other_id, last_at DESC`,
+      [uid]
+    );
+    res.json({ success: true, conversations: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/messages/:userId — thread with a specific user
+app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
+  const other = parseInt(req.params.userId);
+  const uid = req.user.userId;
+  if (isNaN(other)) return res.status(400).json({ success: false, message: 'Invalid user ID' });
+  try {
+    // Mark received messages as read
+    await pool.query(
+      `UPDATE direct_messages SET is_read=true, read_at=NOW()
+       WHERE sender_id=$1 AND receiver_id=$2 AND is_read=false`,
+      [other, uid]
+    );
+    const messages = await pool.query(
+      `SELECT dm.*, u.full_name AS sender_name, u.profile_image_url AS sender_image
+       FROM direct_messages dm
+       JOIN users u ON u.id = dm.sender_id
+       WHERE (dm.sender_id=$1 AND dm.receiver_id=$2)
+          OR (dm.sender_id=$2 AND dm.receiver_id=$1)
+       ORDER BY dm.created_at ASC
+       LIMIT 200`,
+      [uid, other]
+    );
+    // Get other user's info
+    const otherUser = await pool.query(
+      'SELECT id, full_name, profile_image_url, institution FROM users WHERE id=$1',
+      [other]
+    );
+    res.json({ success: true, messages: messages.rows, user: otherUser.rows[0] || null });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/messages — send a DM
+app.post('/api/messages', authMiddleware, async (req, res) => {
+  const { receiverId, content } = req.body;
+  const uid = req.user.userId;
+  if (!receiverId || !content?.trim()) {
+    return res.status(400).json({ success: false, message: 'Receiver and content required' });
+  }
+  if (parseInt(receiverId) === uid) {
+    return res.status(400).json({ success: false, message: 'Cannot message yourself' });
+  }
+  try {
+    const receiver = await pool.query('SELECT id FROM users WHERE id=$1', [receiverId]);
+    if (!receiver.rows.length) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    const result = await pool.query(
+      `INSERT INTO direct_messages (sender_id, receiver_id, content)
+       VALUES ($1,$2,$3) RETURNING *`,
+      [uid, receiverId, content.trim()]
+    );
+    // Deliver a notification to receiver
+    await pool.query(
+      `INSERT INTO notifications (user_id, notification_type, reference_id, title, message, scheduled_time)
+       VALUES ($1,'message',$2,$3,$4,NOW())`,
+      [receiverId, uid, 'New Message',
+       (await pool.query('SELECT full_name FROM users WHERE id=$1',[uid])).rows[0]?.full_name + ' sent you a message']
+    );
+    res.json({ success: true, message: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/messages/:id — delete own message
+app.delete('/api/messages/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM direct_messages WHERE id=$1 AND sender_id=$2 RETURNING id',
+      [req.params.id, req.user.userId]
+    );
+    if (!result.rowCount) return res.status(403).json({ success: false, message: 'Not found or unauthorized' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// LIBRARY BOUNTIES (FULL IMPLEMENTATION)
+// ============================================================================
+
+// GET /api/library/bounties
+app.get('/api/library/bounties', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT lb.*, u.full_name AS requester_name, u.profile_image_url AS requester_image,
+              (SELECT COUNT(*) FROM bounty_fulfillments WHERE bounty_id=lb.id) AS fulfillment_count
+       FROM library_bounties lb
+       JOIN users u ON u.id = lb.requester_id
+       WHERE lb.status='open'
+       ORDER BY lb.reward_points DESC, lb.created_at DESC`,
+    );
+    res.json({ success: true, bounties: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/library/bounties — create a bounty request
+app.post('/api/library/bounties', authMiddleware, async (req, res) => {
+  const { courseCode, description, rewardPoints } = req.body;
+  if (!courseCode) return res.status(400).json({ success: false, message: 'Course code required' });
+  try {
+    const result = await pool.query(
+      `INSERT INTO library_bounties (requester_id, course_code, description, reward_points)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.user.userId, courseCode.toUpperCase().trim(), description || '', rewardPoints || 0]
+    );
+    res.json({ success: true, bounty: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/library/bounties/:id/fulfill — fulfill a bounty
+app.post('/api/library/bounties/:id/fulfill', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const bountyId = parseInt(req.params.id);
+  const { resourceId, note } = req.body;
+  if (!resourceId) return res.status(400).json({ success: false, message: 'Resource ID required' });
+  try {
+    const bounty = await pool.query('SELECT * FROM library_bounties WHERE id=$1', [bountyId]);
+    if (!bounty.rows.length) return res.status(404).json({ success: false, message: 'Bounty not found' });
+    if (bounty.rows[0].status !== 'open') {
+      return res.status(400).json({ success: false, message: 'Bounty is already closed' });
+    }
+    if (bounty.rows[0].requester_id === uid) {
+      return res.status(400).json({ success: false, message: 'Cannot fulfill your own bounty' });
+    }
+    // Check resource belongs to fulfiller
+    const res2 = await pool.query(
+      'SELECT id FROM library_resources WHERE id=$1 AND uploader_id=$2',
+      [resourceId, uid]
+    );
+    if (!res2.rows.length) {
+      return res.status(403).json({ success: false, message: 'You must own the resource to fulfill a bounty' });
+    }
+    // Insert fulfillment
+    const fulfillment = await pool.query(
+      `INSERT INTO bounty_fulfillments (bounty_id, fulfiller_id, resource_id, note)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [bountyId, uid, resourceId, note || '']
+    );
+    // Close the bounty
+    await pool.query('UPDATE library_bounties SET status=$1 WHERE id=$2', ['fulfilled', bountyId]);
+    // Award XP for bounty fulfillment
+    setImmediate(() => awardXP(uid, 'bounty_fulfilled', `bounty:${bountyId}`));
+    // Notify requester
+    await pool.query(
+      `INSERT INTO notifications (user_id, notification_type, reference_id, title, message, scheduled_time)
+       VALUES ($1,'bounty',$2,'Bounty Fulfilled',$3,NOW())`,
+      [bounty.rows[0].requester_id, bountyId,
+       `Someone uploaded a resource for your ${bounty.rows[0].course_code} bounty.`]
+    );
+    res.json({ success: true, fulfillment: fulfillment.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/library/bounties/:id — requester cancels
+app.delete('/api/library/bounties/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM library_bounties WHERE id=$1 AND requester_id=$2 RETURNING id`,
+      [req.params.id, req.user.userId]
+    );
+    if (!result.rowCount) return res.status(403).json({ success: false, message: 'Not found or unauthorized' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// EVENT RSVPs
+// ============================================================================
+
+// POST /api/school-events/:id/rsvp — going / maybe / not_going
+app.post('/api/school-events/:id/rsvp', authMiddleware, async (req, res) => {
+  const { status } = req.body;
+  const validStatuses = ['going', 'maybe', 'not_going'];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ success: false, message: 'Invalid RSVP status' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO event_rsvps (event_id, user_id, status)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (event_id, user_id) DO UPDATE SET status=$3
+       RETURNING *`,
+      [req.params.id, req.user.userId, status]
+    );
+    // Count updated attendance
+    const counts = await pool.query(
+      `SELECT status, COUNT(*) FROM event_rsvps WHERE event_id=$1 GROUP BY status`,
+      [req.params.id]
+    );
+    res.json({ success: true, rsvp: result.rows[0], counts: counts.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/school-events/:id/rsvps
+app.get('/api/school-events/:id/rsvps', authMiddleware, async (req, res) => {
+  try {
+    const counts = await pool.query(
+      `SELECT status, COUNT(*) FROM event_rsvps WHERE event_id=$1 GROUP BY status`,
+      [req.params.id]
+    );
+    const myRsvp = await pool.query(
+      `SELECT status FROM event_rsvps WHERE event_id=$1 AND user_id=$2`,
+      [req.params.id, req.user.userId]
+    );
+    res.json({
+      success: true,
+      counts: counts.rows,
+      myStatus: myRsvp.rows[0]?.status || null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// NOTIFICATIONS — read-all
+// ============================================================================
+
+app.post('/api/notifications/read-all', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE notifications SET read=true, read_at=NOW()
+       WHERE user_id=$1 AND read=false`,
+      [req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/notifications/:id
+app.delete('/api/notifications/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM notifications WHERE id=$1 AND user_id=$2',
+      [req.params.id, req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// MARKETPLACE — MISSING / ENHANCED ROUTES
+// ============================================================================
+
+// GET /api/marketplace/services/:id
+app.get('/api/marketplace/services/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query('UPDATE marketplace_services SET views=views+1 WHERE id=$1', [req.params.id]);
+    const result = await pool.query(
+      `SELECT ms.*, u.full_name AS provider_name, u.phone AS provider_phone,
+              u.profile_image_url AS provider_image,
+              (SELECT AVG(rating)::numeric(10,1) FROM reviews WHERE reviewed_user_id=ms.provider_id) AS provider_rating,
+              (SELECT COUNT(*) FROM reviews WHERE reviewed_user_id=ms.provider_id) AS provider_review_count
+       FROM marketplace_services ms
+       JOIN users u ON u.id=ms.provider_id
+       WHERE ms.id=$1`,
+      [req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Service not found' });
+    res.json({ success: true, service: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PUT /api/marketplace/services/:id
+app.put('/api/marketplace/services/:id', authMiddleware, async (req, res) => {
+  const { title, description, price, category, serviceCategory, duration, availability } = req.body;
+  try {
+    const check = await pool.query('SELECT provider_id FROM marketplace_services WHERE id=$1', [req.params.id]);
+    if (!check.rows.length) return res.status(404).json({ success: false, message: 'Not found' });
+    if (check.rows[0].provider_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Unauthorized' });
+    }
+    const result = await pool.query(
+      `UPDATE marketplace_services
+       SET title=$1, description=$2, price=$3, category=$4,
+           service_category=$5, duration=$6, availability=$7
+       WHERE id=$8 RETURNING *`,
+      [title, description, price, category, serviceCategory || 'general', duration, availability, req.params.id]
+    );
+    res.json({ success: true, service: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/marketplace/services/:id/images — upload images for a service
+app.post('/api/marketplace/services/:id/images', authMiddleware, imageUpload.array('images', 5), async (req, res) => {
+  try {
+    const check = await pool.query('SELECT provider_id FROM marketplace_services WHERE id=$1', [req.params.id]);
+    if (!check.rows.length) return res.status(404).json({ success: false, message: 'Not found' });
+    if (check.rows[0].provider_id !== req.user.userId) return res.status(403).json({ success: false, message: 'Unauthorized' });
+    const urls = [];
+    for (const file of (req.files || [])) {
+      urls.push(await uploadToSupabase(file, 'marketplace-images', 'services/'));
+    }
+    await pool.query(
+      `UPDATE marketplace_services SET images=array_cat(images, $1::text[]) WHERE id=$2`,
+      [urls, req.params.id]
+    );
+    res.json({ success: true, urls });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/marketplace/my-listings — current user's goods + services
+app.get('/api/marketplace/my-listings', authMiddleware, async (req, res) => {
+  try {
+    const [goods, services] = await Promise.all([
+      pool.query(
+        'SELECT * FROM marketplace_goods WHERE seller_id=$1 ORDER BY created_at DESC',
+        [req.user.userId]
+      ),
+      pool.query(
+        'SELECT * FROM marketplace_services WHERE provider_id=$1 ORDER BY created_at DESC',
+        [req.user.userId]
+      ),
+    ]);
+    res.json({ success: true, goods: goods.rows, services: services.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// UPDATED AUTH ROUTES — Login with streak + XP, Profile with XP fields
+// These REPLACE the originals that are earlier in the file.
+// Express uses the LAST matching route, so placing these here overrides them.
+// ============================================================================
+
+// OVERRIDE: POST /api/auth/login — adds streak tracking + daily login XP
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password required' });
+  }
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase().trim()]);
+    if (!result.rows.length) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+    const user = result.rows[0];
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    // Streak logic
+    const today = new Date().toISOString().slice(0, 10);
+    const lastLogin = user.last_login_date ? user.last_login_date.toISOString().slice(0, 10) : null;
+    let newStreak = user.login_streak || 0;
+    let awardedStreak = false;
+
+    if (lastLogin !== today) {
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yday = yesterday.toISOString().slice(0, 10);
+      newStreak = lastLogin === yday ? newStreak + 1 : 1;
+      await pool.query(
+        'UPDATE users SET login_streak=$1, last_login_date=$2 WHERE id=$3',
+        [newStreak, today, user.id]
+      );
+      awardedStreak = true;
+      setImmediate(async () => {
+        await awardXP(user.id, 'daily_login');
+        if (newStreak === 7)  await awardXP(user.id, 'login_streak_7',  'streak:7');
+        if (newStreak === 30) await awardXP(user.id, 'login_streak_30', 'streak:30');
+      });
+    }
+
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET || 'fallback-change-this',
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id:              user.id,
+        email:           user.email,
+        fullName:        user.full_name,
+        studentId:       user.student_id,
+        institution:     user.institution,
+        phone:           user.phone,
+        bio:             user.bio,
+        isCourseRep:     user.is_course_rep,
+        profileImageUrl: user.profile_image_url,
+        xpPoints:        user.xp_points || 0,
+        level:           user.level || 'Bronze',
+        loginStreak:     newStreak,
+        onboarded:       !!user.onboarded_at,
+        programme:       user.programme,
+        yearOfStudy:     user.year_of_study,
+      }
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: GET /api/auth/profile — includes XP fields
+app.get('/api/auth/profile', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, email, full_name, student_id, institution, phone, bio,
+              profile_image_url, is_course_rep, xp_points, level,
+              login_streak, reputation_score, rank_percentile, onboarded_at,
+              programme, year_of_study, subjects, study_style, study_times, goals
+       FROM users WHERE id=$1`,
+      [req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// XP HOOKS — Wrapper routes that award XP on key actions
+// These are new routes placed AFTER the originals for the actions below.
+// Because some originals already handle the logic, we wrap via middleware.
+// ============================================================================
+
+// OVERRIDE: POST /api/library — award XP for resource upload
+app.post('/api/library', authMiddleware, libraryUpload.fields([
+  { name: 'file', maxCount: 1 },
+  { name: 'thumbnail', maxCount: 1 }
+]), async (req, res) => {
+  const { title, description, subject, category } = req.body;
+  try {
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+    const mainFile = req.files.file[0];
+    const thumbnailFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
+    const fileUrl = await uploadToSupabase(mainFile, 'library-resources', 'documents/');
+    let thumbnailUrl = null;
+    if (thumbnailFile) {
+      thumbnailUrl = await uploadToSupabase(thumbnailFile, 'library-resources', 'thumbnails/');
+    }
+    const result = await pool.query(
+      `INSERT INTO library_resources
+       (uploader_id, title, description, subject, category, file_url, thumbnail_url, file_type, file_size)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [req.user.userId, title, description, subject,
+       category || 'Lecture Notes', fileUrl, thumbnailUrl,
+       mainFile.mimetype, mainFile.size]
+    );
+    setImmediate(() => {
+      awardXP(req.user.userId, 'resource_upload', `resource:${result.rows[0].id}`);
+      updateStudentRank(req.user.userId);
+    });
+    res.json({ success: true, resource: result.rows[0] });
+  } catch (err) {
+    console.error('Library upload error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/homework-help/:id/respond — award XP for answering
+app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { response } = req.body;
+  if (!response?.trim()) return res.status(400).json({ success: false, message: 'Response required' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO homework_responses (help_request_id, responder_id, response) VALUES ($1,$2,$3) RETURNING *',
+      [id, req.user.userId, response.trim()]
+    );
+    await pool.query(
+      "UPDATE homework_help SET status='answered' WHERE id=$1 AND status='open'",
+      [id]
+    );
+    // Notify question asker
+    const question = await pool.query('SELECT student_id, title FROM homework_help WHERE id=$1', [id]);
+    if (question.rows.length) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, notification_type, reference_id, title, message, scheduled_time)
+         VALUES ($1,'homework',$2,'New Answer',$3,NOW())`,
+        [question.rows[0].student_id, parseInt(id),
+         `Someone answered your question: "${question.rows[0].title}"`]
+      );
+    }
+    setImmediate(() => awardXP(req.user.userId, 'homework_answered', `help:${id}`));
+    res.json({ success: true, response: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/study-groups — award XP for creating
+app.post('/api/study-groups', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { name, description, subject, program, maxMembers, isPrivate, study_mode, year_filter } = req.body;
+  if (!name) return res.status(400).json({ success: false, message: 'Group name required' });
+  try {
+    const result = await pool.query(
+      `INSERT INTO study_groups
+         (creator_id, name, description, subject, program, max_members, is_private, study_mode, year_filter)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [uid, name, description||null, subject||null, program||null,
+       maxMembers||50, isPrivate||false, study_mode||'social', year_filter||null]
+    );
+    const group = result.rows[0];
+    await pool.query(
+      'INSERT INTO study_group_members (group_id, user_id, role) VALUES ($1,$2,$3)',
+      [group.id, uid, 'admin']
+    );
+    setImmediate(() => awardXP(uid, 'study_group_created', `group:${group.id}`));
+    res.json({ success: true, group });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/class-spaces/:id/join — award XP for joining
+app.post('/api/class-spaces/:id/join', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const classExists = await pool.query('SELECT id FROM class_spaces WHERE id=$1', [id]);
+    if (!classExists.rows.length) {
+      return res.status(404).json({ success: false, message: 'Class not found' });
+    }
+    const existing = await pool.query(
+      'SELECT id FROM class_space_members WHERE class_space_id=$1 AND user_id=$2',
+      [id, req.user.userId]
+    );
+    const alreadyMember = existing.rows.length > 0;
+    await pool.query(
+      'INSERT INTO class_space_members (class_space_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [id, req.user.userId]
+    );
+    if (!alreadyMember) {
+      setImmediate(() => awardXP(req.user.userId, 'class_joined', `class:${id}`));
+    }
+    res.json({ success: true, message: 'Joined class space' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/marketplace/goods — award XP for listing
+app.post('/api/marketplace/goods', authMiddleware, imageUpload.array('images', 5), async (req, res) => {
+  const { title, description, price, category, condition, location } = req.body;
+  try {
+    const imageUrls = [];
+    for (const file of (req.files || [])) {
+      imageUrls.push(await uploadToSupabase(file, 'marketplace-images', 'goods/'));
+    }
+    const result = await pool.query(
+      'INSERT INTO marketplace_goods (seller_id, title, description, price, category, condition, location, images) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+      [req.user.userId, title, description, price, category, condition, location, imageUrls]
+    );
+    setImmediate(() => awardXP(req.user.userId, 'item_listed', `good:${result.rows[0].id}`));
+    res.json({ success: true, item: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/reviews — award XP for leaving a review
+app.post('/api/reviews', authMiddleware, async (req, res) => {
+  const { itemId, rating, comment, reviewedUserId } = req.body;
+  if (!itemId || !rating) return res.status(400).json({ success: false, message: 'Item ID and rating required' });
+  try {
+    const insert = await pool.query(
+      `INSERT INTO reviews (marketplace_item_id, reviewer_id, reviewed_user_id, rating, comment)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id, marketplace_item_id, reviewer_id, rating, comment, created_at`,
+      [itemId, req.user.userId, reviewedUserId, rating, comment]
+    );
+    const review = insert.rows[0];
+    const withUser = await pool.query(
+      `SELECT $1::int AS id, $2::int AS reviewer_id, $3::int AS marketplace_item_id,
+              $4::int AS rating, $5::text AS comment, $6::timestamp AS created_at,
+              u.full_name AS reviewer_name, u.profile_image_url AS reviewer_image
+       FROM users u WHERE u.id=$2`,
+      [review.id, review.reviewer_id, review.marketplace_item_id,
+       review.rating, review.comment, review.created_at]
+    );
+    setImmediate(() => awardXP(req.user.userId, 'review_given', `review:${review.id}`));
+    res.json({ success: true, review: withUser.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/assignments/:id/submit — award XP
+app.post('/api/assignments/:id/submit', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE assignments SET status='submitted', submitted_at=NOW()
+       WHERE id=$1 AND user_id=$2 RETURNING *`,
+      [req.params.id, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Assignment not found' });
+    setImmediate(() => awardXP(req.user.userId, 'assignment_submitted', `assignment:${req.params.id}`));
+    res.json({ success: true, assignment: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/study-tasks/:taskId/complete — award XP
+app.post('/api/study-tasks/:taskId/complete', authMiddleware, async (req, res) => {
+  const { notes } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE study_tasks st
+       SET completed=true, completed_at=NOW(), notes=$1
+       FROM study_plans sp
+       WHERE st.id=$2 AND st.study_plan_id=sp.id AND sp.user_id=$3
+       RETURNING st.*`,
+      [notes, req.params.taskId, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Task not found' });
+    await pool.query(
+      `UPDATE study_plans sp
+       SET progress_percentage=(
+         SELECT (COUNT(*) FILTER (WHERE completed=true)::DECIMAL / COUNT(*))*100
+         FROM study_tasks WHERE study_plan_id=sp.id
+       )
+       WHERE id=(SELECT study_plan_id FROM study_tasks WHERE id=$1)`,
+      [req.params.taskId]
+    );
+    setImmediate(() => awardXP(req.user.userId, 'study_task_completed', `task:${req.params.taskId}`));
+    res.json({ success: true, task: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OVERRIDE: POST /api/library/:id/upvote — award XP to uploader when upvoted
+app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const existing = await pool.query(
+      "SELECT id FROM library_interactions WHERE user_id=$1 AND resource_id=$2 AND interaction_type='upvote'",
+      [req.user.userId, id]
+    );
+    if (existing.rows.length) {
+      await pool.query('DELETE FROM library_interactions WHERE id=$1', [existing.rows[0].id]);
+      return res.json({ success: true, action: 'removed' });
+    }
+    await pool.query(
+      "INSERT INTO library_interactions (user_id, resource_id, interaction_type) VALUES ($1,$2,'upvote')",
+      [req.user.userId, id]
+    );
+    // Award XP to uploader
+    const uploader = await pool.query('SELECT uploader_id FROM library_resources WHERE id=$1', [id]);
+    if (uploader.rows.length && uploader.rows[0].uploader_id !== req.user.userId) {
+      setImmediate(() => {
+        awardXP(uploader.rows[0].uploader_id, 'upvote_received', `resource:${id}`);
+        awardXP(req.user.userId, 'library_upvote_given', `resource:${id}`);
+      });
+    }
+    res.json({ success: true, action: 'added' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// STUDY GROUPS — JOIN (separate from create, awards join XP)
+// ============================================================================
+app.post('/api/study-groups/:id/join', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const uid = req.user.userId;
+  try {
+    const group = await pool.query(
+      'SELECT id, max_members FROM study_groups WHERE id=$1',
+      [id]
+    );
+    if (!group.rows.length) return res.status(404).json({ success: false, message: 'Group not found' });
+    const memberCount = await pool.query(
+      'SELECT COUNT(*) FROM study_group_members WHERE group_id=$1',
+      [id]
+    );
+    if (parseInt(memberCount.rows[0].count) >= group.rows[0].max_members) {
+      return res.status(400).json({ success: false, message: 'Group is full' });
+    }
+    const existing = await pool.query(
+      'SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2',
+      [id, uid]
+    );
+    if (existing.rows.length) {
+      return res.status(400).json({ success: false, message: 'Already a member' });
+    }
+    await pool.query(
+      'INSERT INTO study_group_members (group_id, user_id, role) VALUES ($1,$2,$3)',
+      [id, uid, 'member']
+    );
+    setImmediate(() => awardXP(uid, 'study_group_joined', `group:${id}`));
+    res.json({ success: true, message: 'Joined group' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// COMMENT LIKES
+// ============================================================================
+
+app.post('/api/library/comments/:id/like', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM library_comment_likes WHERE comment_id=$1 AND user_id=$2',
+      [req.params.id, uid]
+    );
+    if (existing.rows.length) {
+      await pool.query('DELETE FROM library_comment_likes WHERE id=$1', [existing.rows[0].id]);
+      return res.json({ success: true, liked: false });
+    }
+    await pool.query(
+      'INSERT INTO library_comment_likes (comment_id, user_id) VALUES ($1,$2)',
+      [req.params.id, uid]
+    );
+    res.json({ success: true, liked: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// PROFILE — update with all onboarding + extended fields
+// ============================================================================
+
+app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
+  const { fullName, studentId, institution, phone, bio, programme, yearOfStudy } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE users
+       SET full_name=$1, student_id=$2, institution=$3, phone=$4, bio=$5,
+           programme=$6, year_of_study=$7, updated_at=NOW()
+       WHERE id=$8
+       RETURNING id, email, full_name, student_id, institution, phone, bio,
+                 is_course_rep, programme, year_of_study, xp_points, level`,
+      [fullName, studentId, institution, phone, bio,
+       programme||null, yearOfStudy||null, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({ success: true, user: result.rows[0], message: 'Profile updated' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// TIMETABLE — PATCH (missing in original, added here properly)
+// ============================================================================
+
+app.patch('/api/timetable/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  const allowed = ['title','day_of_week','start_time','end_time','location',
+                   'course_code','instructor','notes','color','notification_enabled',
+                   'notification_minutes_before','building','room_number'];
+  try {
+    const fields = [];
+    const values = [];
+    let n = 1;
+    for (const key of allowed) {
+      if (updates[key] !== undefined) {
+        fields.push(`${key}=$${n++}`);
+        values.push(updates[key]);
+      }
+    }
+    if (!fields.length) return res.status(400).json({ success: false, message: 'No valid fields provided' });
+    values.push(id, req.user.userId);
+    const result = await pool.query(
+      `UPDATE timetables SET ${fields.join(',')}
+       WHERE id=$${n} AND user_id=$${n+1} RETURNING *`,
+      values
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Entry not found' });
+    res.json({ success: true, entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================================
+// MISC UTILITY ROUTES
+// ============================================================================
+
+// GET /api/stats/platform — public platform stats
+app.get('/api/stats/platform', async (req, res) => {
+  try {
+    const [users, resources, groups, events] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM users'),
+      pool.query('SELECT COUNT(*) FROM library_resources WHERE is_public=true'),
+      pool.query('SELECT COUNT(*) FROM study_groups WHERE is_private=false'),
+      pool.query('SELECT COUNT(*) FROM school_events'),
+    ]);
+    res.json({
+      success: true,
+      stats: {
+        totalUsers:     parseInt(users.rows[0].count),
+        totalResources: parseInt(resources.rows[0].count),
+        totalGroups:    parseInt(groups.rows[0].count),
+        totalEvents:    parseInt(events.rows[0].count),
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/library/:id — get single resource detail
+app.get('/api/library/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT lr.*, u.full_name AS uploader_name, u.profile_image_url AS uploader_image,
+              (SELECT COUNT(*) FROM library_interactions WHERE resource_id=lr.id AND interaction_type='upvote') AS upvotes,
+              (SELECT COUNT(*) FROM library_interactions WHERE resource_id=lr.id AND interaction_type='downvote') AS downvotes,
+              EXISTS(SELECT 1 FROM library_interactions WHERE resource_id=lr.id AND user_id=$2 AND interaction_type='upvote') AS has_upvoted,
+              EXISTS(SELECT 1 FROM library_bookmarks WHERE resource_id=lr.id AND user_id=$2) AS is_bookmarked
+       FROM library_resources lr
+       JOIN users u ON u.id=lr.uploader_id
+       WHERE lr.id=$1 AND (lr.is_public=true OR lr.uploader_id=$2)`,
+      [req.params.id, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Resource not found' });
+    // Increment download counter on fetch
+    await pool.query('UPDATE library_resources SET downloads=downloads+1 WHERE id=$1', [req.params.id]);
+    res.json({ success: true, resource: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Seed badges on startup (non-blocking)
+setImmediate(async () => {
+  try { await seedBadges(); } catch (_) {}
+});
 
 app.use((req, res) => {
   res.status(404).json({ 
