@@ -6708,42 +6708,7 @@ app.post('/api/migrate-v4', async (req, res) => {
     res.json({ success: true, message: 'V4 migration complete' });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
-
-// ── ONBOARDING ───────────────────────────────────────────────────────────────
-app.post('/api/onboarding', authMiddleware, async (req, res) => {
-  const { yearOfStudy, department, courses, academicGoals, studyStyle, noisePref, socialPref, studyHours, interests, notificationsEnabled } = req.body;
-  try {
-    await pool.query(
-      `UPDATE users SET year_of_study=$1, department=$2, study_style=$3, noise_pref=$4,
-       social_pref=$5, study_hours=$6, interests=$7, onboarding_complete=TRUE, updated_at=NOW()
-       WHERE id=$8`,
-      [yearOfStudy, department, studyStyle, noisePref, socialPref, studyHours,
-       JSON.stringify(interests||[]), req.user.userId]
-    );
-    await pool.query(
-      `INSERT INTO user_preferences(user_id, study_style, noise_pref, social_pref, study_hours,
-         interests, academic_goals, courses, notifications_enabled, updated_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-       ON CONFLICT(user_id) DO UPDATE SET
-         study_style=$2, noise_pref=$3, social_pref=$4, study_hours=$5, interests=$6,
-         academic_goals=$7, courses=$8, notifications_enabled=$9, updated_at=NOW()`,
-      [req.user.userId, studyStyle, noisePref, socialPref, studyHours,
-       JSON.stringify(interests||[]), JSON.stringify(academicGoals||[]),
-       JSON.stringify(courses||[]), notificationsEnabled !== false]
-    );
-    // Award onboarding XP
-    await pool.query(`UPDATE users SET xp_points=xp_points+25 WHERE id=$1`, [req.user.userId]);
-    await pool.query(
-      `INSERT INTO activity_log(user_id,action_type,description,xp_delta) VALUES($1,'onboarding_complete','Completed profile setup',25)`,
-      [req.user.userId]
-    );
-    const { rows } = await pool.query(
-      'SELECT id,email,full_name,department,year_of_study,onboarding_complete,xp_points FROM users WHERE id=$1',
-      [req.user.userId]
-    );
-    res.json({ success: true, user: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
-});
+;
 
 // ── PREFERENCES ──────────────────────────────────────────────────────────────
 app.get('/api/preferences', authMiddleware, async (req, res) => {
