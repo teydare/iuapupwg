@@ -8041,5 +8041,528 @@ app.get('/api/library/:id', authMiddleware, async (req, res) => {
 
 // Seed badges on startup (non-blocking)
 setImmediate(async () => {
-  try { await seedBadges(); } catch (_) {}
+
+// ============================================================================
+// MIGRATE-V4 — preferences, contacts, tour, admin
+// ============================================================================
+app.post('/api/migrate-v4', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        user_id       INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        study_style   VARCHAR(30)  DEFAULT 'visual',
+        noise_pref    VARCHAR(20)  DEFAULT 'quiet',
+        collab_pref   VARCHAR(20)  DEFAULT 'both',
+        interests     JSONB        DEFAULT '[]',
+        study_times   JSONB        DEFAULT '[]',
+        goals         JSONB        DEFAULT '[]',
+        notifications_enabled BOOLEAN DEFAULT TRUE,
+        updated_at    TIMESTAMPTZ  DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS user_tour_progress (
+        user_id      INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        completed    BOOLEAN  DEFAULT FALSE,
+        steps_seen   JSONB    DEFAULT '[]',
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS phone_contacts (
+        id            SERIAL PRIMARY KEY,
+        user_id       INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        contact_phone VARCHAR(50)  NOT NULL,
+        contact_name  VARCHAR(200),
+        found_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at    TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, contact_phone)
+      );
+      CREATE TABLE IF NOT EXISTS admin_uploads (
+        id           SERIAL PRIMARY KEY,
+        admin_id     INTEGER REFERENCES users(id),
+        type         VARCHAR(30) NOT NULL,
+        title        VARCHAR(300),
+        program      VARCHAR(200),
+        institution  VARCHAR(200),
+        year         VARCHAR(10),
+        semester     VARCHAR(20),
+        file_url     TEXT,
+        description  TEXT,
+        meta         JSONB DEFAULT '{}',
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin       BOOLEAN  DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS interests      JSONB    DEFAULT '[]';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style    VARCHAR(30);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS noise_pref     VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS collab_pref    VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS university     VARCHAR(300);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS program_name   VARCHAR(300);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone          VARCHAR(50);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS login_streak   INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS xp_points      INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active    TIMESTAMPTZ DEFAULT NOW();
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS status_emoji   VARCHAR(8)  DEFAULT '📚';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS status_text    VARCHAR(100);
+    `);
+    res.json({ success: true, message: 'V4 migration complete' });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// USER PREFERENCES
+// ============================================================================
+app.get('/api/preferences', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM user_preferences WHERE user_id=$1', [req.user.userId]);
+    res.json({ success: true, preferences: rows[0] || null });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.put('/api/preferences', authMiddleware, async (req, res) => {
+  const { studyStyle, noisePref, collabPref, interests, studyTimes, goals } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO user_preferences(user_id,study_style,noise_pref,collab_pref,interests,study_times,goals,updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT(user_id) DO UPDATE SET
+         study_style=$2,noise_pref=$3,collab_pref=$4,interests=$5,study_times=$6,goals=$7,updated_at=NOW()`,
+      [req.user.userId, studyStyle||'visual', noisePref||'quiet', collabPref||'both',
+       JSON.stringify(interests||[]), JSON.stringify(studyTimes||[]), JSON.stringify(goals||[])]
+    );
+    if (interests?.length) {
+      await pool.query('UPDATE users SET interests=$1 WHERE id=$2', [JSON.stringify(interests), req.user.userId]);
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.patch('/api/onboarding/complete', authMiddleware, async (req, res) => {
+  const { university, programName, studyStyle, noisePref, collabPref, interests, studyTimes, goals } = req.body;
+  try {
+    await pool.query(
+      `UPDATE users SET onboarding_complete=TRUE, university=$2, program_name=$3,
+         study_style=$4, noise_pref=$5, collab_pref=$6, interests=$7
+       WHERE id=$1`,
+      [req.user.userId, university||null, programName||null, studyStyle||null,
+       noisePref||null, collabPref||null, JSON.stringify(interests||[])]
+    );
+    if (studyTimes || goals) {
+      await pool.query(
+        `INSERT INTO user_preferences(user_id,study_times,goals,study_style,noise_pref,collab_pref,interests)
+         VALUES($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT(user_id) DO UPDATE SET study_times=$2,goals=$3,study_style=$4,noise_pref=$5,collab_pref=$6,interests=$7`,
+        [req.user.userId, JSON.stringify(studyTimes||[]), JSON.stringify(goals||[]),
+         studyStyle||'visual', noisePref||'quiet', collabPref||'both', JSON.stringify(interests||[])]
+      );
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// PLATFORM TOUR
+// ============================================================================
+app.get('/api/tour', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM user_tour_progress WHERE user_id=$1', [req.user.userId]);
+    res.json({ success: true, tour: rows[0] || null });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.post('/api/tour/complete', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO user_tour_progress(user_id,completed) VALUES($1,TRUE)
+       ON CONFLICT(user_id) DO UPDATE SET completed=TRUE`,
+      [req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// PHONE-BASED CONTACTS
+// ============================================================================
+
+// POST /api/contacts/sync — client sends list of phone numbers, server returns matched users
+app.post('/api/contacts/sync', authMiddleware, async (req, res) => {
+  const { contacts } = req.body; // [{name, phone}]
+  if (!Array.isArray(contacts) || contacts.length === 0) {
+    return res.json({ success: true, matches: [] });
+  }
+  try {
+    const phones = contacts.map(c => c.phone?.replace(/\s|-|\(|\)/g, '') || '').filter(Boolean);
+    if (!phones.length) return res.json({ success: true, matches: [] });
+
+    const { rows: matches } = await pool.query(
+      `SELECT u.id, u.full_name, u.profile_image_url, u.university, u.program_name,
+              u.status_emoji, u.xp_points, u.phone,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id) AS is_following
+       FROM users u
+       WHERE REGEXP_REPLACE(u.phone, '[\\s\\-\\(\\)]', '', 'g') = ANY($2)
+         AND u.id != $1`,
+      [req.user.userId, phones]
+    );
+
+    // Store the matches for quick lookup later
+    for (const c of contacts) {
+      const phone = c.phone?.replace(/\s|-|\(|\)/g, '') || '';
+      if (!phone) continue;
+      const found = matches.find(m => m.phone?.replace(/\s|-|\(|\)/g, '') === phone);
+      await pool.query(
+        `INSERT INTO phone_contacts(user_id,contact_phone,contact_name,found_user_id)
+         VALUES($1,$2,$3,$4) ON CONFLICT(user_id,contact_phone) DO UPDATE SET
+           contact_name=$3, found_user_id=$4`,
+        [req.user.userId, phone, c.name || null, found?.id || null]
+      );
+    }
+
+    res.json({ success: true, matches });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// GET /api/contacts/matches — get previously synced matches
+app.get('/api/contacts/matches', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT pc.contact_name, pc.contact_phone,
+              u.id, u.full_name, u.profile_image_url, u.university, u.program_name, u.status_emoji,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id) AS is_following,
+              EXISTS(SELECT 1 FROM direct_messages WHERE (sender_id=$1 AND receiver_id=u.id) OR (sender_id=u.id AND receiver_id=$1) LIMIT 1) AS has_chat
+       FROM phone_contacts pc
+       JOIN users u ON u.id = pc.found_user_id
+       WHERE pc.user_id=$1 AND pc.found_user_id IS NOT NULL
+       ORDER BY u.full_name`,
+      [req.user.userId]
+    );
+    res.json({ success: true, contacts: rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// UNIVERSAL SEARCH
+// ============================================================================
+app.get('/api/search', authMiddleware, async (req, res) => {
+  const { q, type = 'all' } = req.query;
+  if (!q || q.trim().length < 2) return res.json({ success: true, results: {} });
+  const term = `%${q.trim()}%`;
+  const uid = req.user.userId;
+  try {
+    const results = {};
+
+    if (type === 'all' || type === 'users') {
+      const { rows } = await pool.query(
+        `SELECT id, full_name, profile_image_url, university, program_name, xp_points, status_emoji,
+                EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$2 AND following_id=u.id) AS is_following
+         FROM users u WHERE full_name ILIKE $1 AND id!=$2 LIMIT 8`,
+        [term, uid]
+      );
+      results.users = rows;
+    }
+
+    if (type === 'all' || type === 'resources') {
+      const { rows } = await pool.query(
+        `SELECT lr.id, lr.title, lr.file_type, lr.file_url, lr.resource_type, lr.upvotes,
+                u.full_name AS uploader
+         FROM library_resources lr JOIN users u ON u.id=lr.uploader_id
+         WHERE (lr.title ILIKE $1 OR lr.tags ILIKE $1 OR lr.description ILIKE $1) LIMIT 8`,
+        [term]
+      );
+      results.resources = rows;
+    }
+
+    if (type === 'all' || type === 'classes') {
+      const { rows } = await pool.query(
+        `SELECT cs.id, cs.course_name, cs.course_code, cs.institution, cs.semester,
+                COUNT(csm.user_id)::int AS members,
+                EXISTS(SELECT 1 FROM class_space_members WHERE user_id=$2 AND class_space_id=cs.id) AS joined
+         FROM class_spaces cs LEFT JOIN class_space_members csm ON csm.class_space_id=cs.id
+         WHERE cs.course_name ILIKE $1 OR cs.course_code ILIKE $1
+         GROUP BY cs.id LIMIT 8`,
+        [term, uid]
+      );
+      results.classes = rows;
+    }
+
+    if (type === 'all' || type === 'groups') {
+      const { rows } = await pool.query(
+        `SELECT sg.id, sg.name, sg.description, sg.subject, sg.is_public,
+                COUNT(sgm.user_id)::int AS members,
+                EXISTS(SELECT 1 FROM study_group_members WHERE user_id=$2 AND group_id=sg.id) AS joined
+         FROM study_groups sg LEFT JOIN study_group_members sgm ON sgm.group_id=sg.id
+         WHERE (sg.name ILIKE $1 OR sg.subject ILIKE $1 OR sg.description ILIKE $1)
+           AND sg.is_public=TRUE
+         GROUP BY sg.id LIMIT 6`,
+        [term, uid]
+      );
+      results.groups = rows;
+    }
+
+    if (type === 'all' || type === 'posts') {
+      const { rows } = await pool.query(
+        `SELECT cp.id, cp.text, cp.category, cp.created_at, cp.likes,
+                u.full_name, u.profile_image_url
+         FROM campus_pulse_posts cp JOIN users u ON u.id=cp.user_id
+         WHERE cp.text ILIKE $1
+         ORDER BY cp.created_at DESC LIMIT 6`,
+        [term]
+      );
+      results.posts = rows;
+    }
+
+    if (type === 'all' || type === 'marketplace') {
+      const { rows } = await pool.query(
+        `SELECT id, title, description, price, condition, images
+         FROM marketplace_goods WHERE title ILIKE $1 OR description ILIKE $1 LIMIT 6`,
+        [term]
+      );
+      results.goods = rows;
+    }
+
+    if (type === 'all' || type === 'assignments') {
+      const { rows } = await pool.query(
+        `SELECT id, title, subject, due_date, status, priority
+         FROM assignments WHERE user_id=$2 AND (title ILIKE $1 OR subject ILIKE $1) LIMIT 6`,
+        [term, uid]
+      );
+      results.assignments = rows;
+    }
+
+    res.json({ success: true, results, query: q.trim() });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// PEOPLE RECOMMENDATIONS (based on same uni + program + interests)
+// ============================================================================
+app.get('/api/recommendations/people', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    const { rows: me } = await pool.query(
+      'SELECT university, program_name, interests FROM users WHERE id=$1', [uid]
+    );
+    if (!me.length) return res.json({ success: true, people: [] });
+    const { university, program_name } = me[0];
+
+    const { rows } = await pool.query(
+      `SELECT u.id, u.full_name, u.profile_image_url, u.university, u.program_name,
+              u.xp_points, u.status_emoji, u.phone,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id) AS is_following,
+              CASE WHEN u.university=$2 AND u.program_name=$3 THEN 3
+                   WHEN u.university=$2 THEN 2
+                   ELSE 1 END AS match_score
+       FROM users u
+       WHERE u.id != $1
+         AND (u.university=$2 OR u.program_name=$3)
+         AND NOT EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id)
+       ORDER BY match_score DESC, u.xp_points DESC
+       LIMIT 20`,
+      [uid, university, program_name]
+    );
+    res.json({ success: true, people: rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// ADMIN PANEL
+// ============================================================================
+
+// Admin middleware
+const adminMiddleware = (req, res, next) => {
+  if (!req.user?.userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+  pool.query('SELECT is_admin FROM users WHERE id=$1', [req.user.userId])
+    .then(({ rows }) => {
+      if (!rows[0]?.is_admin) return res.status(403).json({ success: false, message: 'Admin access required' });
+      next();
+    })
+    .catch(e => res.status(500).json({ success: false, error: e.message }));
+};
+
+// POST /api/admin/make-admin  { userId } — dev only, no auth check
+app.post('/api/admin/make-admin', async (req, res) => {
+  const { userId, secret } = req.body;
+  if (secret !== (process.env.ADMIN_SECRET || 'studenthub_admin_2024')) {
+    return res.status(403).json({ success: false, message: 'Invalid secret' });
+  }
+  try {
+    await pool.query('UPDATE users SET is_admin=TRUE WHERE id=$1', [userId]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// GET /api/admin/stats
+app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const queries = [
+      pool.query('SELECT COUNT(*)::int AS total FROM users'),
+      pool.query(`SELECT COUNT(*)::int AS today FROM users WHERE created_at >= CURRENT_DATE`),
+      pool.query('SELECT COUNT(*)::int AS total FROM class_spaces'),
+      pool.query('SELECT COUNT(*)::int AS total FROM library_resources'),
+      pool.query('SELECT COUNT(*)::int AS total FROM assignments'),
+      pool.query(`SELECT COUNT(*)::int AS active FROM users WHERE last_active >= NOW()-INTERVAL '24 hours'`),
+      pool.query(`SELECT COUNT(*)::int AS total FROM campus_pulse_posts`),
+      pool.query(`SELECT COUNT(*)::int AS total FROM study_groups`),
+    ];
+    const results = await Promise.all(queries);
+    res.json({
+      success: true,
+      stats: {
+        totalUsers:      results[0].rows[0].total,
+        newUsersToday:   results[1].rows[0].today,
+        totalClasses:    results[2].rows[0].total,
+        totalResources:  results[3].rows[0].total,
+        totalAssignments:results[4].rows[0].total,
+        activeUsers24h:  results[5].rows[0].active,
+        totalPosts:      results[6].rows[0].total,
+        totalGroups:     results[7].rows[0].total,
+      }
+    });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// GET /api/admin/users?limit=50&page=1
+app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+  const { limit = 50, page = 1, q } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    const term = q ? `%${q}%` : null;
+    const { rows } = await pool.query(
+      `SELECT id, full_name, email, university, program_name, is_admin,
+              xp_points, login_streak, created_at, last_active, onboarding_complete,
+              (SELECT COUNT(*)::int FROM class_space_members WHERE user_id=u.id) AS classes_joined
+       FROM users u
+       ${term ? 'WHERE full_name ILIKE $3 OR email ILIKE $3 OR university ILIKE $3' : ''}
+       ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+      term ? [limit, offset, term] : [limit, offset]
+    );
+    const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS total FROM users`);
+    res.json({ success: true, users: rows, total: cnt[0].total });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// POST /api/admin/upload-timetable — upload program timetable
+app.post('/api/admin/upload-timetable', authMiddleware, adminMiddleware, async (req, res) => {
+  const { title, program, institution, year, semester, timetableData, description } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO admin_uploads(admin_id, type, title, program, institution, year, semester, description, meta)
+       VALUES($1,'timetable',$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.user.userId, title, program, institution, year, semester, description,
+       JSON.stringify(timetableData || {})]
+    );
+
+    // If timetableData has entries, create actual timetable entries for students in the program
+    if (timetableData?.entries?.length) {
+      const { rows: students } = await pool.query(
+        'SELECT id FROM users WHERE program_name ILIKE $1 AND university ILIKE $2',
+        [`%${program}%`, `%${institution}%`]
+      );
+      let created = 0;
+      for (const student of students) {
+        for (const entry of timetableData.entries) {
+          try {
+            await pool.query(
+              `INSERT INTO timetables(user_id, day_of_week, start_time, end_time, title, location_name, color)
+               VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,
+              [student.id, entry.day, entry.startTime, entry.endTime,
+               entry.courseName, entry.location || null, entry.color || '#5b4efa']
+            );
+            created++;
+          } catch {}
+        }
+      }
+      rows[0].studentsUpdated = students.length;
+      rows[0].entriesCreated = created;
+    }
+
+    res.json({ success: true, upload: rows[0] });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// POST /api/admin/upload-material — upload course material for students
+app.post('/api/admin/upload-material', authMiddleware, adminMiddleware, async (req, res) => {
+  const { title, program, institution, year, semester, fileUrl, description, courseCode } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO admin_uploads(admin_id,type,title,program,institution,year,semester,description,file_url,meta)
+       VALUES($1,'material',$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [req.user.userId, title, program, institution, year, semester, description,
+       fileUrl || null, JSON.stringify({ courseCode: courseCode || null })]
+    );
+
+    // Also add to library_resources as admin-uploaded
+    if (fileUrl) {
+      await pool.query(
+        `INSERT INTO library_resources(uploader_id, title, description, course_code, resource_type, file_url, is_public)
+         VALUES($1,$2,$3,$4,'admin_upload',$5,TRUE)`,
+        [req.user.userId, title, description || null, courseCode || null, fileUrl]
+      ).catch(() => {});
+    }
+
+    res.json({ success: true, upload: rows[0] });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// GET /api/admin/uploads — list all admin uploads
+app.get('/api/admin/uploads', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT au.*, u.full_name AS admin_name
+       FROM admin_uploads au JOIN users u ON u.id=au.admin_id
+       ORDER BY au.created_at DESC LIMIT 100`
+    );
+    res.json({ success: true, uploads: rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// DELETE /api/admin/uploads/:id
+app.delete('/api/admin/uploads/:id', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM admin_uploads WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// POST /api/admin/announcement  — send notification to all users or specific program
+app.post('/api/admin/announcement', authMiddleware, adminMiddleware, async (req, res) => {
+  const { title, message, program, institution } = req.body;
+  if (!title || !message) return res.status(400).json({ success: false, message: 'Title and message required' });
+  try {
+    let q = 'SELECT id FROM users';
+    const params = [];
+    if (program) {
+      q += ' WHERE program_name ILIKE $1';
+      params.push(`%${program}%`);
+      if (institution) { q += ' AND university ILIKE $2'; params.push(`%${institution}%`); }
+    }
+    const { rows: users } = await pool.query(q, params);
+    let sent = 0;
+    for (const u of users) {
+      await pool.query(
+        `INSERT INTO notifications(user_id, type, title, message) VALUES($1,'announcement',$2,$3)`,
+        [u.id, title, message]
+      ).catch(() => {});
+      sent++;
+    }
+    res.json({ success: true, sent });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// SHARE RESOURCE AS DM
+// ============================================================================
+app.post('/api/share/resource-dm', authMiddleware, async (req, res) => {
+  const { resourceId, recipientId, message } = req.body;
+  try {
+    const { rows: resource } = await pool.query('SELECT * FROM library_resources WHERE id=$1', [resourceId]);
+    if (!resource.length) return res.status(404).json({ success: false });
+    const shareText = `📚 Shared a resource: *${resource[0].title}* ${message ? `\n${message}` : ''}\n[View in Library: /library/${resourceId}]`;
+    const { rows } = await pool.query(
+      `INSERT INTO direct_messages(sender_id, receiver_id, message, message_type, meta)
+       VALUES($1,$2,$3,'resource',$4) RETURNING *`,
+      [req.user.userId, recipientId, shareText, JSON.stringify({ resourceId, title: resource[0].title, fileUrl: resource[0].file_url })]
+    );
+    res.json({ success: true, message: rows[0] });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// CLOSING
+// ============================================================================
 });
