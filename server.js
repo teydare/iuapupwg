@@ -1772,52 +1772,6 @@ const uploadFields = [
   { name: 'thumbnail', maxCount: 1 }
 ];
 
-]), async (req, res) => {
-  const { title, description, subject, category } = req.body;
-  
-  try {
-    if (!req.files || !req.files.file) {
-      return res.status(400).json({ success: false, message: 'No file uploaded' });
-    }
-
-    const mainFile = req.files.file[0];
-    const thumbnailFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
-
-    // Upload main file to Supabase Storage (Bucket: library-resources)
-    const fileUrl = await uploadToSupabase(mainFile, 'library-resources', 'documents/');
-    
-    // Upload thumbnail if provided
-    let thumbnailUrl = null;
-    if (thumbnailFile) {
-      thumbnailUrl = await uploadToSupabase(thumbnailFile, 'library-resources', 'thumbnails/');
-    }
-    
-    const result = await pool.query(
-      `INSERT INTO library_resources 
-       (uploader_id, title, description, subject, category, file_url, thumbnail_url, file_type, file_size) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [
-        req.user.userId, 
-        title, 
-        description, 
-        subject, 
-        category || 'Lecture Notes', 
-        fileUrl, 
-        thumbnailUrl,
-        mainFile.mimetype, 
-        mainFile.size
-      ]
-    );
-    
-    // Update user reputation
-    await updateStudentRank(req.user.userId);
-    
-    res.json({ success: true, resource: result.rows[0] });
-  } catch (error) {
-    console.error('Error uploading library resource:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 
 
 // Handle Upvote/Downvote logic
@@ -3991,37 +3945,6 @@ async function seedBadges() {
 // Because some originals already handle the logic, we wrap via middleware.
 // ============================================================================
 
-]), async (req, res) => {
-  const { title, description, subject, category } = req.body;
-  try {
-    if (!req.files || !req.files.file) {
-      return res.status(400).json({ success: false, message: 'No file uploaded' });
-    }
-    const mainFile = req.files.file[0];
-    const thumbnailFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
-    const fileUrl = await uploadToSupabase(mainFile, 'library-resources', 'documents/');
-    let thumbnailUrl = null;
-    if (thumbnailFile) {
-      thumbnailUrl = await uploadToSupabase(thumbnailFile, 'library-resources', 'thumbnails/');
-    }
-    const result = await pool.query(
-      `INSERT INTO library_resources
-       (uploader_id, title, description, subject, category, file_url, thumbnail_url, file_type, file_size)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [req.user.userId, title, description, subject,
-       category || 'Lecture Notes', fileUrl, thumbnailUrl,
-       mainFile.mimetype, mainFile.size]
-    );
-    setImmediate(() => {
-      awardXP(req.user.userId, 'resource_upload', `resource:${result.rows[0].id}`);
-      updateStudentRank(req.user.userId);
-    });
-    res.json({ success: true, resource: result.rows[0] });
-  } catch (err) {
-    console.error('Library upload error:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
 
 // ============================================================================
 // COMMENT LIKES
