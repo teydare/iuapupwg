@@ -6145,7 +6145,340 @@ app.get('/api/library/:id', authMiddleware, async (req, res) => {
 setImmediate(async () => {
   try { await seedBadges(); } catch (_) {}
 });
+// ============================================================
+// MISSING ROUTES PATCH
+// Paste this block BEFORE the `app.use((req, res) => { 404... })` line
+// ============================================================
 
+// ── DAILY QUESTS ─────────────────────────────────────────────
+app.get('/api/daily-quests', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    // Seed default quests for today if none exist
+    await pool.query(`
+      INSERT INTO daily_quests (user_id, quest_type, label, target, progress, date)
+      VALUES
+        ($1, 'upload_resource',   'Upload a resource',       1, 0, $2),
+        ($1, 'join_study_group',  'Join a study session',    1, 0, $2),
+        ($1, 'send_message',      'Send 5 messages',         5, 0, $2),
+        ($1, 'complete_task',     'Complete 3 tasks',        3, 0, $2),
+        ($1, 'daily_login',       'Log in today',            1, 1, $2)
+      ON CONFLICT (user_id, quest_type, date) DO NOTHING
+    `, [userId, today]);
+
+    const { rows } = await pool.query(
+      `SELECT * FROM daily_quests WHERE user_id = $1 AND date = $2 ORDER BY id`,
+      [userId, today]
+    );
+    res.json({ success: true, quests: rows });
+  } catch (err) {
+    // Table may not exist yet — return empty gracefully
+    console.error('daily-quests error:', err.message);
+    res.json({ success: true, quests: [] });
+  }
+});
+
+app.post('/api/daily-quests/progress', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  const { questType, increment = 1 } = req.body;
+  const today = new Date().toISOString().split('T')[0];
+  try {
+    await pool.query(`
+      UPDATE daily_quests
+      SET progress = LEAST(progress + $1, target)
+      WHERE user_id = $2 AND quest_type = $3 AND date = $4
+    `, [increment, userId, questType, today]);
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: true });
+  }
+});
+
+// Ensure daily_quests table exists
+pool.query(`
+  CREATE TABLE IF NOT EXISTS daily_quests (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    quest_type VARCHAR(60) NOT NULL,
+    label      TEXT NOT NULL,
+    target     INTEGER DEFAULT 1,
+    progress   INTEGER DEFAULT 0,
+    xp_reward  INTEGER DEFAULT 20,
+    date       DATE NOT NULL DEFAULT CURRENT_DATE,
+    UNIQUE(user_id, quest_type, date)
+  )
+`).catch(() => {});
+
+// ── HABITS ───────────────────────────────────────────────────
+app.get('/api/habits', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    // Seed default habits if user has none
+    await pool.query(`
+      INSERT INTO habits (user_id, label, icon, frequency)
+      VALUES
+        ($1, 'Review notes',     '📖', 'daily'),
+        ($1, 'Drink water',      '💧', 'daily'),
+        ($1, 'Exercise',         '🏃', 'daily'),
+        ($1, 'Read ahead',       '📚', 'daily')
+      ON CONFLICT DO NOTHING
+    `, [userId]);
+
+    const today = new Date().toISOString().split('T')[0];
+    const { rows } = await pool.query(`
+      SELECT h.*,
+        EXISTS(
+          SELECT 1 FROM habit_logs hl
+          WHERE hl.habit_id = h.id AND hl.date = $2
+        ) AS completed_today
+      FROM habits h
+      WHERE h.user_id = $1
+      ORDER BY h.id
+    `, [userId, today]);
+    res.json({ success: true, habits: rows });
+  } catch (err) {
+    console.error('habits error:', err.message);
+    res.json({ success: true, habits: [] });
+  }
+});
+
+app.post('/api/habits/toggle', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  const { habitId } = req.body;
+  const today = new Date().toISOString().split('T')[0];
+  try {
+    const existing = await pool.query(
+      `SELECT id FROM habit_logs WHERE habit_id = $1 AND date = $2`,
+      [habitId, today]
+    );
+    if (existing.rows.length) {
+      await pool.query(`DELETE FROM habit_logs WHERE habit_id = $1 AND date = $2`, [habitId, today]);
+      res.json({ success: true, completed: false });
+    } else {
+      await pool.query(`INSERT INTO habit_logs (habit_id, user_id, date) VALUES ($1,$2,$3)`, [habitId, userId, today]);
+      res.json({ success: true, completed: true });
+    }
+  } catch (err) {
+    res.json({ success: true, completed: false });
+  }
+});
+
+// Ensure habits tables exist
+pool.query(`
+  CREATE TABLE IF NOT EXISTS habits (
+    id        SERIAL PRIMARY KEY,
+    user_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    label     VARCHAR(120) NOT NULL,
+    icon      VARCHAR(10) DEFAULT '✅',
+    frequency VARCHAR(20) DEFAULT 'daily',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS habit_logs (
+    id        SERIAL PRIMARY KEY,
+    habit_id  INTEGER REFERENCES habits(id) ON DELETE CASCADE,
+    user_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    date      DATE NOT NULL DEFAULT CURRENT_DATE,
+    UNIQUE(habit_id, date)
+  );
+`).catch(() => {});
+
+// ── ACTIVITY FEED ─────────────────────────────────────────────
+app.get('/api/activity/feed', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+  try {
+    const { rows } = await pool.query(`
+      SELECT al.*, u.full_name, u.avatar_url
+      FROM activity_logs al
+      JOIN users u ON al.user_id = u.id
+      WHERE al.user_id = $1
+         OR al.user_id IN (
+           SELECT friend_id FROM friendships WHERE user_id = $1 AND status = 'accepted'
+           UNION
+           SELECT user_id FROM friendships WHERE friend_id = $1 AND status = 'accepted'
+         )
+      ORDER BY al.created_at DESC
+      LIMIT $2
+    `, [userId, limit]);
+    res.json({ success: true, feed: rows });
+  } catch (err) {
+    console.error('activity feed error:', err.message);
+    res.json({ success: true, feed: [] });
+  }
+});
+
+app.get('/api/activity/me', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM activity_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+      [userId, limit]
+    );
+    res.json({ success: true, activity: rows });
+  } catch (err) {
+    res.json({ success: true, activity: [] });
+  }
+});
+
+app.post('/api/activity', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  const { action, label, meta } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO activity_logs (user_id, action, label, meta) VALUES ($1,$2,$3,$4)`,
+      [userId, action, label, JSON.stringify(meta || {})]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: true });
+  }
+});
+
+// Ensure activity_logs table exists
+pool.query(`
+  CREATE TABLE IF NOT EXISTS activity_logs (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    action     VARCHAR(80),
+    label      TEXT,
+    meta       JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`).catch(() => {});
+
+// ── DASHBOARD ─────────────────────────────────────────────────
+app.get('/api/dashboard', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    const [userRes, tasksRes, eventsRes] = await Promise.all([
+      pool.query(
+        `SELECT id, full_name, avatar_url, xp_points, level, login_streak, department, year_of_study
+         FROM users WHERE id = $1`, [userId]
+      ),
+      pool.query(
+        `SELECT id, title, due_date, status FROM assignments
+         WHERE user_id = $1 AND status != 'completed'
+         ORDER BY due_date ASC LIMIT 5`, [userId]
+      ).catch(() => ({ rows: [] })),
+      pool.query(
+        `SELECT id, title, event_date FROM events
+         WHERE user_id = $1 AND event_date >= NOW()
+         ORDER BY event_date ASC LIMIT 3`, [userId]
+      ).catch(() => ({ rows: [] })),
+    ]);
+
+    res.json({
+      success: true,
+      user: userRes.rows[0] || {},
+      upcomingTasks: tasksRes.rows,
+      upcomingEvents: eventsRes.rows,
+    });
+  } catch (err) {
+    console.error('dashboard error:', err.message);
+    res.json({ success: true, user: {}, upcomingTasks: [], upcomingEvents: [] });
+  }
+});
+
+// ── SUGGESTIONS ───────────────────────────────────────────────
+app.get('/api/suggestions', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    // Suggest people in same department/year not yet friends
+    const { rows } = await pool.query(`
+      SELECT u.id, u.full_name, u.avatar_url, u.department, u.year_of_study, u.level
+      FROM users u
+      WHERE u.id != $1
+        AND u.id NOT IN (
+          SELECT friend_id FROM friendships WHERE user_id = $1
+          UNION SELECT user_id FROM friendships WHERE friend_id = $1
+        )
+        AND (
+          u.department = (SELECT department FROM users WHERE id = $1)
+          OR u.year_of_study = (SELECT year_of_study FROM users WHERE id = $1)
+        )
+      ORDER BY RANDOM()
+      LIMIT 6
+    `, [userId]);
+    res.json({ success: true, suggestions: rows });
+  } catch (err) {
+    console.error('suggestions error:', err.message);
+    res.json({ success: true, suggestions: [] });
+  }
+});
+
+// ── CLASS SPACE CHAT ──────────────────────────────────────────
+app.get('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
+  const { classId } = req.params;
+  const userId = req.user.userId;
+  try {
+    // Verify membership
+    const member = await pool.query(
+      `SELECT 1 FROM class_space_members WHERE class_space_id = $1 AND user_id = $2`,
+      [classId, userId]
+    );
+    if (!member.rows.length) {
+      return res.status(403).json({ success: false, message: 'Not a member of this class' });
+    }
+    const { rows } = await pool.query(`
+      SELECT cm.*, u.full_name AS sender_name, u.avatar_url AS sender_avatar
+      FROM chat_messages cm
+      JOIN users u ON cm.sender_id = u.id
+      WHERE cm.group_id = $1
+      ORDER BY cm.created_at ASC
+      LIMIT 100
+    `, [classId]);
+    res.json({ success: true, messages: rows });
+  } catch (err) {
+    console.error('class messages error:', err.message);
+    res.json({ success: true, messages: [] });
+  }
+});
+
+app.post('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
+  const { classId } = req.params;
+  const userId = req.user.userId;
+  const { message } = req.body;
+  if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO chat_messages (sender_id, group_id, message) VALUES ($1,$2,$3) RETURNING *`,
+      [userId, classId, message.trim()]
+    );
+    res.json({ success: true, message: rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── DAILY LOGIN TRACK (for Navigation.js trackDailyLogin) ─────
+app.post('/api/daily-login', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    await pool.query(`
+      UPDATE users SET
+        last_login = NOW(),
+        login_streak = CASE
+          WHEN DATE(last_login) = CURRENT_DATE - INTERVAL '1 day' THEN login_streak + 1
+          WHEN DATE(last_login) = CURRENT_DATE THEN login_streak
+          ELSE 1
+        END
+      WHERE id = $1
+    `, [userId]);
+    // Award XP
+    await pool.query(
+      `UPDATE users SET xp_points = xp_points + 10 WHERE id = $1`, [userId]
+    ).catch(() => {});
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: true });
+  }
+});
+
+// ============================================================
+// END MISSING ROUTES PATCH
+// ============================================================
 app.use((req, res) => {
   res.status(404).json({ 
     success: false, 
