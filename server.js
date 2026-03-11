@@ -6612,6 +6612,26 @@ app.post('/api/migrate-v4', async (req, res) => {
         result_count INTEGER DEFAULT 0,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      -- Core user profile columns (safe to add if missing)
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS institution VARCHAR(255);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(100);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS year_of_study VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_image_url TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_course_rep BOOLEAN DEFAULT false;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS xp_points INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS level VARCHAR(20) DEFAULT 'Bronze';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS login_streak INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMPTZ;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS status_emoji VARCHAR(10);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS status_text VARCHAR(100);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS study_times JSONB DEFAULT '[]';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS academic_goals JSONB DEFAULT '[]';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS weekly_focus_goal_mins INTEGER DEFAULT 600;
+      -- V4 specific
       ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT false;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS interests JSONB DEFAULT '[]';
       ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style VARCHAR(30);
