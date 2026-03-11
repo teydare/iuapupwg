@@ -6188,6 +6188,815 @@ app.use((err, req, res, next) => {
 // START SERVER
 // ============================================
 
+// ============================================================================
+// V4: PEER RECOMMENDATIONS ENGINE
+// ============================================================================
+
+app.get('/api/recommendations/peers', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    // Get current user's profile
+    const { rows: [me] } = await pool.query(
+      `SELECT department, year_of_study, institution, study_style, noise_pref, interests, study_times, academic_goals
+       FROM users WHERE id = $1`, [uid]
+    );
+    if (!me) return res.json({ success: true, peers: [] });
+
+    const interests = me.interests || [];
+    const goals = me.academic_goals || [];
+    const studyTimes = me.study_times || [];
+
+    // Find candidates in same institution + department, exclude self + already following
+    const { rows: candidates } = await pool.query(
+      `SELECT u.id, u.full_name, u.department, u.year_of_study, u.institution, u.bio,
+              u.study_style, u.noise_pref, u.interests, u.study_times, u.academic_goals,
+              u.xp_points, u.level, u.profile_image_url, u.phone,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id) AS is_following
+       FROM users u
+       WHERE u.id != $1
+         AND u.institution ILIKE $2
+       ORDER BY u.xp_points DESC
+       LIMIT 100`,
+      [uid, `%${me.institution || ''}%`]
+    );
+
+    // Score each candidate
+    const scored = candidates.map(p => {
+      let score = 0;
+      const reasons = [];
+
+      if (p.department === me.department) { score += 35; reasons.push('Same dept'); }
+      if (p.year_of_study === me.year_of_study) { score += 20; reasons.push('Same year'); }
+      if (p.study_style === me.study_style && p.study_style) { score += 15; reasons.push('Same study style'); }
+      if (p.noise_pref === me.noise_pref && p.noise_pref) { score += 10; reasons.push('Same environment'); }
+
+      // Shared interests
+      const pInterests = Array.isArray(p.interests) ? p.interests : (JSON.parse(p.interests || '[]'));
+      const shared = pInterests.filter(i => interests.includes(i));
+      if (shared.length > 0) { score += Math.min(shared.length * 5, 15); reasons.push(`${shared.length} shared interests`); }
+
+      // Shared study times
+      const pTimes = Array.isArray(p.study_times) ? p.study_times : (JSON.parse(p.study_times || '[]'));
+      const sharedTimes = pTimes.filter(t => studyTimes.includes(t));
+      if (sharedTimes.length > 0) { score += 5; reasons.push('Similar schedule'); }
+
+      // Shared goals
+      const pGoals = Array.isArray(p.academic_goals) ? p.academic_goals : (JSON.parse(p.academic_goals || '[]'));
+      const sharedGoals = pGoals.filter(g => goals.includes(g));
+      if (sharedGoals.length > 0) { score += Math.min(sharedGoals.length * 3, 10); }
+
+      return { ...p, match_score: Math.min(score, 100), match_reasons: reasons.slice(0,3) };
+    });
+
+    // Sort by score, exclude 0-score results
+    const sorted = scored.filter(p => p.match_score > 10).sort((a,b) => b.match_score - a.match_score).slice(0, 20);
+    res.json({ success: true, peers: sorted });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// V4: PHONE CONTACTS MATCHING
+// ============================================================================
+
+app.post('/api/contacts/find', authMiddleware, async (req, res) => {
+  const { phones } = req.body;
+  if (!Array.isArray(phones) || phones.length === 0) {
+    return res.status(400).json({ success: false, message: 'phones array required' });
+  }
+  const uid = req.user.userId;
+  try {
+    // Normalise phones — strip spaces and dashes
+    const normalised = phones.map(p => p.replace(/[\s\-().]/g, ''));
+    const { rows } = await pool.query(
+      `SELECT u.id, u.full_name, u.department, u.year_of_study, u.institution, u.bio,
+              u.phone, u.xp_points, u.level,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id) AS is_following
+       FROM users u
+       WHERE u.id != $1 AND replace(replace(replace(u.phone,' ',''),'-',''),'(','') = ANY($2::text[])`,
+      [uid, normalised]
+    );
+    res.json({ success: true, matches: rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// V4: USER PREFERENCES
+// ============================================================================
+
+app.get('/api/preferences', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM user_preferences WHERE user_id=$1', [req.user.userId]);
+    res.json({ success: true, preferences: rows[0] || null });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.put('/api/preferences', authMiddleware, async (req, res) => {
+  const { studyStyle, noisePref, collabPref, interests, studyTimes, goals, notificationsEnabled, focusLockEnabled, weeklyFocusGoalMins } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO user_preferences(user_id, study_style, noise_pref, collab_pref, interests, study_times, goals,
+         notifications_enabled, focus_lock_enabled, weekly_focus_goal_mins, updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+       ON CONFLICT(user_id) DO UPDATE SET
+         study_style=$2, noise_pref=$3, collab_pref=$4, interests=$5, study_times=$6, goals=$7,
+         notifications_enabled=$8, focus_lock_enabled=$9, weekly_focus_goal_mins=$10, updated_at=NOW()
+       RETURNING *`,
+      [req.user.userId, studyStyle||'visual', noisePref||'quiet', collabPref||'both',
+       JSON.stringify(interests||[]), JSON.stringify(studyTimes||[]), JSON.stringify(goals||[]),
+       notificationsEnabled!==false, focusLockEnabled||false, weeklyFocusGoalMins||600]
+    );
+    if (interests) await pool.query('UPDATE users SET interests=$1 WHERE id=$2', [JSON.stringify(interests), req.user.userId]);
+    if (studyStyle) await pool.query('UPDATE users SET study_style=$1 WHERE id=$2', [studyStyle, req.user.userId]);
+    res.json({ success: true, preferences: rows[0] });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// V4: ADMIN EXAM SCHEDULES
+// ============================================================================
+
+app.post('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
+  const { rows: [admin] } = await pool.query('SELECT is_admin FROM users WHERE id=$1', [req.user.userId]);
+  if (!admin?.is_admin) return res.status(403).json({ success: false, message: 'Admin only' });
+
+  const { institution, department, program, yearOfStudy, semester, academicYear, exams } = req.body;
+  if (!institution || !Array.isArray(exams)) return res.status(400).json({ success: false, message: 'institution + exams required' });
+
+  try {
+    const inserted = [];
+    for (const e of exams) {
+      const { rows } = await pool.query(
+        `INSERT INTO admin_exam_schedules(admin_id, course_code, course_name, institution, department, program,
+           year_of_study, exam_date, start_time, end_time, venue, semester, academic_year, notes)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        [req.user.userId, e.courseCode||null, e.courseName, institution, department||null, program||null,
+         yearOfStudy||null, e.examDate||null, e.startTime||null, e.endTime||null, e.venue||null,
+         semester||null, academicYear||null, e.notes||null]
+      );
+      inserted.push(rows[0].id);
+    }
+    // Push notifications to matching students
+    if (program || department) {
+      const { rows: students } = await pool.query(
+        `SELECT id FROM users WHERE institution ILIKE $1 AND (department=$2 OR year_of_study=$3) AND id != $4 LIMIT 500`,
+        [`%${institution}%`, department||'', yearOfStudy||'', req.user.userId]
+      );
+      for (const s of students) {
+        await pool.query(
+          `INSERT INTO notifications(user_id, type, title, body, link_page)
+           VALUES($1,'exam_schedule','📝 New Exam Schedule','Admin has uploaded a new exam schedule for your program. Check your timetable.','timetable')`,
+          [s.id]
+        );
+      }
+    }
+    res.json({ success: true, inserted: inserted.length });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
+  const { rows: [admin] } = await pool.query('SELECT is_admin FROM users WHERE id=$1', [req.user.userId]);
+  if (!admin?.is_admin) return res.status(403).json({ success: false, message: 'Admin only' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT aes.*, u.full_name as admin_name,
+              COUNT(aes.id) OVER (PARTITION BY aes.institution, aes.program, aes.semester) as exam_count
+       FROM admin_exam_schedules aes
+       LEFT JOIN users u ON aes.admin_id = u.id
+       ORDER BY aes.created_at DESC LIMIT 100`
+    );
+    res.json({ success: true, schedules: rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// GET /api/my-exam-schedule — student's exam schedule from admin uploads
+app.get('/api/my-exam-schedule', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    const { rows: [me] } = await pool.query('SELECT institution, department, year_of_study FROM users WHERE id=$1', [uid]);
+    if (!me) return res.json({ success: true, exams: [] });
+
+    const { rows } = await pool.query(
+      `SELECT * FROM admin_exam_schedules
+       WHERE institution ILIKE $1
+         AND (department IS NULL OR department = $2)
+         AND (year_of_study IS NULL OR year_of_study = $3)
+       ORDER BY exam_date ASC`,
+      [`%${me.institution||''}%`, me.department||'', me.year_of_study||'']
+    );
+    res.json({ success: true, exams: rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// V4: ONBOARDING ENDPOINT
+// ============================================================================
+
+app.post('/api/onboarding', authMiddleware, async (req, res) => {
+  const {
+    department, yearOfStudy, program, courses, studyTimes, studyStyle,
+    noisePref, collabPref, interests, academicGoals, phone, notificationPrefs, bio, onboardingComplete
+  } = req.body;
+  const uid = req.user.userId;
+  try {
+    // Update core user fields
+    await pool.query(
+      `UPDATE users SET
+         department = COALESCE($1, department),
+         year_of_study = COALESCE($2, year_of_study),
+         study_style = COALESCE($3, study_style),
+         noise_pref = COALESCE($4, noise_pref),
+         collab_pref = COALESCE($5, collab_pref),
+         interests = COALESCE($6::jsonb, interests),
+         study_times = COALESCE($7::jsonb, study_times),
+         academic_goals = COALESCE($8::jsonb, academic_goals),
+         bio = COALESCE($9, bio),
+         onboarding_complete = COALESCE($10, onboarding_complete),
+         updated_at = NOW()
+       WHERE id = $11`,
+      [department||null, yearOfStudy||null, studyStyle||null, noisePref||null, collabPref||null,
+       interests||null, studyTimes||null, academicGoals||null, bio||null, onboardingComplete||null, uid]
+    );
+
+    // Update phone if provided (check uniqueness)
+    if (phone) {
+      const { rows: existing } = await pool.query('SELECT id FROM users WHERE phone=$1 AND id!=$2', [phone, uid]);
+      if (!existing.length) {
+        await pool.query('UPDATE users SET phone=$1 WHERE id=$2', [phone, uid]);
+      }
+    }
+
+    // Save preferences
+    await pool.query(
+      `INSERT INTO user_preferences(user_id, study_style, noise_pref, collab_pref, interests, study_times, goals, updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT(user_id) DO UPDATE SET
+         study_style=$2, noise_pref=$3, collab_pref=$4, interests=$5, study_times=$6, goals=$7, updated_at=NOW()`,
+      [uid, studyStyle||'visual', noisePref||'quiet', collabPref||'both',
+       interests||'[]', studyTimes||'[]', academicGoals||'[]']
+    );
+
+    // Get updated user
+    const { rows: [user] } = await pool.query(
+      'SELECT id, email, full_name, student_id, institution, phone, bio, department, year_of_study, onboarding_complete, xp_points, level FROM users WHERE id=$1',
+      [uid]
+    );
+    res.json({ success: true, user });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// V4: UNIVERSAL SEARCH
+// ============================================================================
+
+app.get('/api/search', authMiddleware, async (req, res) => {
+  const { q, types } = req.query;
+  if (!q || q.length < 2) return res.status(400).json({ success: false, message: 'Query too short' });
+  const uid = req.user.userId;
+  const term = `%${q}%`;
+
+  try {
+    const results = {};
+
+    // Users
+    const { rows: users } = await pool.query(
+      `SELECT id, full_name, department, year_of_study, institution, bio, xp_points, level
+       FROM users WHERE (full_name ILIKE $1 OR student_id ILIKE $1) AND id!=$2 LIMIT 5`,
+      [term, uid]
+    );
+    results.users = users;
+
+    // Library resources
+    const { rows: resources } = await pool.query(
+      `SELECT id, title, description, subject, course_code, resource_type, download_count, upvotes
+       FROM library_resources WHERE title ILIKE $1 OR subject ILIKE $1 OR course_code ILIKE $1 ORDER BY upvotes DESC LIMIT 5`,
+      [term]
+    );
+    results.resources = resources;
+
+    // Homework help
+    const { rows: questions } = await pool.query(
+      `SELECT hh.id, hh.title, hh.status, hh.subject, u.full_name as student_name
+       FROM homework_help hh JOIN users u ON hh.student_id=u.id
+       WHERE hh.title ILIKE $1 OR hh.question ILIKE $1 ORDER BY hh.created_at DESC LIMIT 5`,
+      [term]
+    );
+    results.questions = questions;
+
+    // Study groups
+    const { rows: groups } = await pool.query(
+      `SELECT sg.id, sg.name, sg.description, sg.subject, sg.meeting_style,
+              COUNT(sgm.user_id) as member_count
+       FROM study_groups sg LEFT JOIN study_group_members sgm ON sg.id=sgm.study_group_id
+       WHERE sg.name ILIKE $1 OR sg.subject ILIKE $1
+       GROUP BY sg.id ORDER BY member_count DESC LIMIT 5`,
+      [term]
+    );
+    results.groups = groups;
+
+    // Class spaces
+    const { rows: classes } = await pool.query(
+      `SELECT id, course_code, course_name, description, semester
+       FROM class_spaces WHERE course_name ILIKE $1 OR course_code ILIKE $1 LIMIT 5`,
+      [term]
+    );
+    results.classes = classes;
+
+    // Campus posts
+    const { rows: posts } = await pool.query(
+      `SELECT cp.id, cp.content, cp.created_at, u.full_name as author_name
+       FROM campus_posts cp JOIN users u ON cp.author_id=u.id
+       WHERE cp.content ILIKE $1 ORDER BY cp.created_at DESC LIMIT 5`,
+      [term]
+    );
+    results.posts = posts;
+
+    // Log search
+    await pool.query(
+      'INSERT INTO search_history(user_id, query, result_count) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',
+      [uid, q, Object.values(results).reduce((s, a) => s + a.length, 0)]
+    ).catch(() => {});
+
+    res.json({ success: true, query: q, results });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// V4: HOMEWORK RESPONSE UPVOTE + MARK ANSWERED
+// ============================================================================
+
+app.post('/api/homework-responses/:id/upvote', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows: existing } = await pool.query(
+      'SELECT 1 FROM homework_response_upvotes WHERE response_id=$1 AND user_id=$2', [id, req.user.userId]
+    );
+    if (existing.length) {
+      await pool.query('DELETE FROM homework_response_upvotes WHERE response_id=$1 AND user_id=$2', [id, req.user.userId]);
+      await pool.query('UPDATE homework_responses SET upvotes=GREATEST(upvotes-1,0) WHERE id=$1', [id]);
+      return res.json({ success: true, action: 'removed' });
+    }
+    await pool.query('INSERT INTO homework_response_upvotes(response_id, user_id) VALUES($1,$2)', [id, req.user.userId]);
+    await pool.query('UPDATE homework_responses SET upvotes=upvotes+1 WHERE id=$1', [id]);
+    res.json({ success: true, action: 'added' });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/homework-help/:id/mark-answered', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { responseId } = req.body;
+  try {
+    await pool.query('UPDATE homework_responses SET is_accepted=false WHERE help_request_id=$1', [id]);
+    if (responseId) await pool.query('UPDATE homework_responses SET is_accepted=true WHERE id=$1', [responseId]);
+    await pool.query("UPDATE homework_help SET status='answered' WHERE id=$1 AND student_id=$2", [id, req.user.userId]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============================================================================
+// V4: MIGRATE
+// ============================================================================
+
+app.post('/api/migrate-v4', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        study_style VARCHAR(30) DEFAULT 'visual',
+        noise_pref VARCHAR(20) DEFAULT 'quiet',
+        collab_pref VARCHAR(20) DEFAULT 'both',
+        interests JSONB DEFAULT '[]',
+        study_times JSONB DEFAULT '[]',
+        goals JSONB DEFAULT '[]',
+        notifications_enabled BOOLEAN DEFAULT true,
+        focus_lock_enabled BOOLEAN DEFAULT false,
+        weekly_focus_goal_mins INTEGER DEFAULT 600,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS phone_contacts (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        contact_phone VARCHAR(50) NOT NULL,
+        contact_name VARCHAR(200),
+        found_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, contact_phone)
+      );
+      CREATE TABLE IF NOT EXISTS admin_exam_schedules (
+        id SERIAL PRIMARY KEY,
+        admin_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        course_code VARCHAR(50),
+        course_name VARCHAR(255) NOT NULL,
+        institution VARCHAR(255),
+        department VARCHAR(100),
+        program VARCHAR(100),
+        year_of_study VARCHAR(20),
+        exam_date TIMESTAMPTZ,
+        start_time TIME,
+        end_time TIME,
+        venue VARCHAR(255),
+        semester VARCHAR(50),
+        academic_year VARCHAR(20),
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS homework_response_upvotes (
+        id SERIAL PRIMARY KEY,
+        response_id INTEGER REFERENCES homework_responses(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(response_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS search_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        query VARCHAR(255) NOT NULL,
+        result_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT false;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS interests JSONB DEFAULT '[]';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style VARCHAR(30);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS noise_pref VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS collab_pref VARCHAR(20);
+      ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0;
+      ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS is_accepted BOOLEAN DEFAULT false;
+    `);
+    res.json({ success: true, message: 'V4 migration complete' });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+
+
+// ============================================================================
+// V4 ROUTES: Onboarding, Preferences, Tour, Exam Schedules, Contacts, Recommendations
+// ============================================================================
+
+// ── MIGRATE V4 ──────────────────────────────────────────────────────────────
+app.post('/api/migrate-v4', async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS interests JSONB DEFAULT '[]';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style VARCHAR(30);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS noise_pref VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS social_pref VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS study_hours VARCHAR(10);
+      ALTER TABLE homework_help ADD COLUMN IF NOT EXISTS urgency VARCHAR(20) DEFAULT 'normal';
+      
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        study_style VARCHAR(30), noise_pref VARCHAR(20), social_pref VARCHAR(20),
+        study_hours VARCHAR(10), interests JSONB DEFAULT '[]',
+        academic_goals JSONB DEFAULT '[]', courses JSONB DEFAULT '[]',
+        notifications_enabled BOOLEAN DEFAULT TRUE, focus_lock_enabled BOOLEAN DEFAULT FALSE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS user_tour_progress (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        completed BOOLEAN DEFAULT FALSE, steps_seen JSONB DEFAULT '[]',
+        completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS admin_exam_schedules (
+        id SERIAL PRIMARY KEY, admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL, institution VARCHAR(255), department VARCHAR(100),
+        program VARCHAR(255), year_level VARCHAR(10), semester VARCHAR(50),
+        academic_year VARCHAR(20), exams JSONB DEFAULT '[]', file_url TEXT,
+        is_published BOOLEAN DEFAULT true, created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS admin_timetables (
+        id SERIAL PRIMARY KEY, admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL, institution VARCHAR(255), department VARCHAR(100),
+        program VARCHAR(255), year_level VARCHAR(10), semester VARCHAR(50),
+        academic_year VARCHAR(20), timetable_type VARCHAR(30) DEFAULT 'weekly',
+        entries JSONB DEFAULT '[]', is_published BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS phone_contacts (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        contact_phone VARCHAR(50) NOT NULL, contact_name VARCHAR(200),
+        found_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, contact_phone)
+      );
+      CREATE TABLE IF NOT EXISTS peer_recommendations (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        recommended_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        score DECIMAL(5,4) DEFAULT 0, reasons JSONB DEFAULT '[]',
+        is_dismissed BOOLEAN DEFAULT false, created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, recommended_id)
+      );
+    `);
+    res.json({ success: true, message: 'V4 migration complete' });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── ONBOARDING ───────────────────────────────────────────────────────────────
+app.post('/api/onboarding', authMiddleware, async (req, res) => {
+  const { yearOfStudy, department, courses, academicGoals, studyStyle, noisePref, socialPref, studyHours, interests, notificationsEnabled } = req.body;
+  try {
+    await pool.query(
+      `UPDATE users SET year_of_study=$1, department=$2, study_style=$3, noise_pref=$4,
+       social_pref=$5, study_hours=$6, interests=$7, onboarding_complete=TRUE, updated_at=NOW()
+       WHERE id=$8`,
+      [yearOfStudy, department, studyStyle, noisePref, socialPref, studyHours,
+       JSON.stringify(interests||[]), req.user.userId]
+    );
+    await pool.query(
+      `INSERT INTO user_preferences(user_id, study_style, noise_pref, social_pref, study_hours,
+         interests, academic_goals, courses, notifications_enabled, updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+       ON CONFLICT(user_id) DO UPDATE SET
+         study_style=$2, noise_pref=$3, social_pref=$4, study_hours=$5, interests=$6,
+         academic_goals=$7, courses=$8, notifications_enabled=$9, updated_at=NOW()`,
+      [req.user.userId, studyStyle, noisePref, socialPref, studyHours,
+       JSON.stringify(interests||[]), JSON.stringify(academicGoals||[]),
+       JSON.stringify(courses||[]), notificationsEnabled !== false]
+    );
+    // Award onboarding XP
+    await pool.query(`UPDATE users SET xp_points=xp_points+25 WHERE id=$1`, [req.user.userId]);
+    await pool.query(
+      `INSERT INTO activity_log(user_id,action_type,description,xp_delta) VALUES($1,'onboarding_complete','Completed profile setup',25)`,
+      [req.user.userId]
+    );
+    const { rows } = await pool.query(
+      'SELECT id,email,full_name,department,year_of_study,onboarding_complete,xp_points FROM users WHERE id=$1',
+      [req.user.userId]
+    );
+    res.json({ success: true, user: rows[0] });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── PREFERENCES ──────────────────────────────────────────────────────────────
+app.get('/api/preferences', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM user_preferences WHERE user_id=$1', [req.user.userId]);
+    res.json({ success: true, preferences: rows[0] || null });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.put('/api/preferences', authMiddleware, async (req, res) => {
+  const { studyStyle, noisePref, socialPref, studyHours, interests, academicGoals, courses, notificationsEnabled, focusLockEnabled } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO user_preferences(user_id,study_style,noise_pref,social_pref,study_hours,interests,academic_goals,courses,notifications_enabled,focus_lock_enabled,updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+       ON CONFLICT(user_id) DO UPDATE SET
+         study_style=COALESCE($2,user_preferences.study_style), noise_pref=COALESCE($3,user_preferences.noise_pref),
+         social_pref=COALESCE($4,user_preferences.social_pref), study_hours=COALESCE($5,user_preferences.study_hours),
+         interests=COALESCE($6,user_preferences.interests), academic_goals=COALESCE($7,user_preferences.academic_goals),
+         courses=COALESCE($8,user_preferences.courses), notifications_enabled=COALESCE($9,user_preferences.notifications_enabled),
+         focus_lock_enabled=COALESCE($10,user_preferences.focus_lock_enabled), updated_at=NOW()
+       RETURNING *`,
+      [req.user.userId, studyStyle, noisePref, socialPref, studyHours,
+       interests?JSON.stringify(interests):null, academicGoals?JSON.stringify(academicGoals):null,
+       courses?JSON.stringify(courses):null, notificationsEnabled, focusLockEnabled]
+    );
+    res.json({ success: true, preferences: rows[0] });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── TOUR ─────────────────────────────────────────────────────────────────────
+app.get('/api/tour', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM user_tour_progress WHERE user_id=$1', [req.user.userId]);
+    res.json({ success: true, tour: rows[0] || null });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/tour/step', authMiddleware, async (req, res) => {
+  const { stepId } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO user_tour_progress(user_id, steps_seen) VALUES($1,$2)
+       ON CONFLICT(user_id) DO UPDATE SET steps_seen = user_tour_progress.steps_seen || $2::jsonb`,
+      [req.user.userId, JSON.stringify([stepId])]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/tour/complete', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO user_tour_progress(user_id, completed, completed_at) VALUES($1, TRUE, NOW())
+       ON CONFLICT(user_id) DO UPDATE SET completed=TRUE, completed_at=NOW()`,
+      [req.user.userId]
+    );
+    await pool.query(`UPDATE users SET xp_points=xp_points+50 WHERE id=$1`, [req.user.userId]);
+    await pool.query(
+      `INSERT INTO activity_log(user_id,action_type,description,xp_delta) VALUES($1,'tour_complete','Completed platform tour',50)`,
+      [req.user.userId]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── PHONE CONTACTS LOOKUP ────────────────────────────────────────────────────
+app.post('/api/contacts/find', authMiddleware, async (req, res) => {
+  const { phones } = req.body;
+  if (!phones || !phones.length) return res.json({ success: true, found: [] });
+  try {
+    // Normalize phones: strip spaces and dashes
+    const normalized = phones.map(p => p.replace(/[\s\-\(\)]/g, ''));
+    // Find users by phone (try exact and partial matches)
+    const result = await pool.query(
+      `SELECT id, full_name, profile_image_url, department, institution, xp_points, level, phone,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=users.id) AS is_following
+       FROM users
+       WHERE phone = ANY($2) OR REPLACE(REPLACE(REPLACE(phone,' ',''),'-',''),'(','') = ANY($2)
+       AND id != $1`,
+      [req.user.userId, normalized]
+    );
+    // Save contacts
+    for (const row of result.rows) {
+      await pool.query(
+        `INSERT INTO phone_contacts(user_id, contact_phone, contact_name, found_user_id)
+         VALUES($1,$2,$3,$4) ON CONFLICT(user_id,contact_phone) DO UPDATE SET found_user_id=$4`,
+        [req.user.userId, row.phone, row.full_name, row.id]
+      ).catch(()=>{});
+    }
+    res.json({ success: true, found: result.rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── PEER RECOMMENDATIONS ─────────────────────────────────────────────────────
+app.get('/api/recommendations/peers', authMiddleware, async (req, res) => {
+  try {
+    const meResult = await pool.query(
+      'SELECT institution, department, year_of_study, study_style, social_pref, interests FROM users WHERE id=$1',
+      [req.user.userId]
+    );
+    const me = meResult.rows[0];
+    if (!me) return res.json({ success: true, peers: [] });
+
+    // Algorithm: score by shared institution + dept + year + interests
+    const result = await pool.query(
+      `SELECT u.id, u.full_name, u.profile_image_url, u.department, u.institution,
+              u.year_of_study, u.study_style, u.xp_points, u.level, u.bio,
+              EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id) AS is_following,
+              (CASE WHEN u.institution=$2 THEN 3 ELSE 0 END +
+               CASE WHEN u.department=$3 THEN 3 ELSE 0 END +
+               CASE WHEN u.year_of_study=$4 THEN 2 ELSE 0 END +
+               CASE WHEN u.study_style=$5 THEN 1 ELSE 0 END) AS match_score
+       FROM users u
+       WHERE u.id != $1
+         AND u.institution = $2
+         AND u.onboarding_complete = TRUE
+         AND u.id NOT IN (SELECT following_id FROM user_follows WHERE follower_id=$1)
+       ORDER BY match_score DESC, u.xp_points DESC
+       LIMIT 15`,
+      [req.user.userId, me.institution, me.department, me.year_of_study, me.study_style]
+    );
+    res.json({ success: true, peers: result.rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── ADMIN EXAM SCHEDULES ──────────────────────────────────────────────────────
+app.post('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
+  const { title, institution, department, program, yearLevel, semester, academicYear, exams } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO admin_exam_schedules(admin_id,title,institution,department,program,year_level,semester,academic_year,exams,is_published)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE) RETURNING *`,
+      [req.user.userId, title, institution, department, program, yearLevel, semester, academicYear, JSON.stringify(exams||[])]
+    );
+    // Push exams to matching users
+    let updated = 0;
+    if (exams && exams.length > 0) {
+      const matchUsers = await pool.query(
+        `SELECT id FROM users WHERE institution ILIKE $1 ${department?'AND department ILIKE $2':''}`,
+        department ? [`%${institution}%`, `%${department}%`] : [`%${institution}%`]
+      );
+      for (const user of matchUsers.rows) {
+        for (const exam of exams) {
+          if (!exam.subject || !exam.date) continue;
+          await pool.query(
+            `INSERT INTO exams(user_id,title,subject,exam_date,location,duration_mins,notes)
+             VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,
+            [user.id, exam.subject, exam.subject, exam.date+(exam.time?' '+exam.time:''),
+             exam.location||'', parseInt(exam.duration)||120, `From admin schedule: ${title}`]
+          ).catch(()=>{});
+          updated++;
+        }
+      }
+    }
+    res.json({ success: true, schedule: rows[0], studentsUpdated: updated });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM admin_exam_schedules ORDER BY created_at DESC');
+    res.json({ success: true, schedules: rows, uploads: rows.map(r => ({...r, type:'exam_schedule'})) });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/admin/uploads', authMiddleware, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
+  try {
+    const [t, e] = await Promise.all([
+      pool.query('SELECT *,\'timetable\' as type FROM admin_timetables ORDER BY created_at DESC'),
+      pool.query('SELECT *,\'exam_schedule\' as type FROM admin_exam_schedules ORDER BY created_at DESC'),
+    ]);
+    res.json({ success: true, uploads: [...t.rows, ...e.rows].sort((a,b) => new Date(b.created_at)-new Date(a.created_at)) });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── UNIVERSAL SEARCH ──────────────────────────────────────────────────────────
+app.get('/api/search', authMiddleware, async (req, res) => {
+  const { q, type } = req.query;
+  if (!q || q.length < 2) return res.json({ success: true, results: {} });
+  const term = `%${q}%`;
+  try {
+    const results = {};
+    const include = (t) => !type || type === 'all' || type === t;
+
+    if (include('people')) {
+      const r = await pool.query(
+        `SELECT id,full_name,profile_image_url,department,institution,xp_points,level FROM users
+         WHERE (full_name ILIKE $1 OR student_id ILIKE $1 OR institution ILIKE $1) AND id!=$2 LIMIT 8`,
+        [term, req.user.userId]
+      );
+      results.people = r.rows;
+    }
+    if (include('resources')) {
+      const r = await pool.query(
+        `SELECT id,title,subject,course_code,upvotes,file_type FROM library_resources
+         WHERE (title ILIKE $1 OR subject ILIKE $1 OR course_code ILIKE $1) LIMIT 8`,
+        [term]
+      );
+      results.resources = r.rows;
+    }
+    if (include('questions')) {
+      const r = await pool.query(
+        `SELECT hh.id,hh.title,hh.subject,hh.status,
+                COUNT(hr.id) as response_count
+         FROM homework_help hh
+         LEFT JOIN homework_responses hr ON hr.help_request_id=hh.id
+         WHERE hh.title ILIKE $1 OR hh.question ILIKE $1
+         GROUP BY hh.id LIMIT 6`,
+        [term]
+      );
+      results.questions = r.rows;
+    }
+    if (include('posts')) {
+      const r = await pool.query(
+        `SELECT cp.id,cp.content,cp.likes,u.full_name as author_name
+         FROM campus_posts cp JOIN users u ON cp.author_id=u.id
+         WHERE cp.content ILIKE $1 LIMIT 6`,
+        [term]
+      );
+      results.posts = r.rows;
+    }
+    if (include('groups')) {
+      const r = await pool.query(
+        `SELECT id,name,subject,description FROM study_groups
+         WHERE name ILIKE $1 OR subject ILIKE $1 OR description ILIKE $1 LIMIT 6`,
+        [term]
+      );
+      results.groups = r.rows;
+    }
+    res.json({ success: true, results });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── MY EXAM SCHEDULE ──────────────────────────────────────────────────────────
+app.get('/api/my-exam-schedule', authMiddleware, async (req, res) => {
+  try {
+    const userResult = await pool.query('SELECT institution, department, year_of_study FROM users WHERE id=$1', [req.user.userId]);
+    const user = userResult.rows[0];
+    if (!user) return res.json({ success: true, schedules: [] });
+
+    const { rows } = await pool.query(
+      `SELECT * FROM admin_exam_schedules
+       WHERE is_published = TRUE
+         AND institution ILIKE $1
+         ${user.department ? 'AND (department ILIKE $2 OR department IS NULL OR department = \'\')' : ''}
+       ORDER BY created_at DESC LIMIT 5`,
+      user.department ? [`%${user.institution}%`, `%${user.department}%`] : [`%${user.institution}%`]
+    );
+    res.json({ success: true, schedules: rows });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── HOMEWORK RESPONSE UPVOTE ──────────────────────────────────────────────────
+app.post('/api/homework-responses/:id/upvote', authMiddleware, async (req, res) => {
+  try {
+    await pool.query('UPDATE homework_responses SET upvotes=upvotes+1 WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/homework-help/:id/mark-answered', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("UPDATE homework_help SET status='answered' WHERE id=$1 AND student_id=$2", [req.params.id, req.user.userId]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
@@ -8562,7 +9371,9 @@ app.post('/api/share/resource-dm', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+
 // ============================================================================
 // CLOSING
 // ============================================================================
+});
 });
