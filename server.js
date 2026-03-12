@@ -11,6 +11,16 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const { Pool } = require('pg');
+
+// Direct connection pool — used only for DDL (CREATE TABLE, ALTER TABLE).
+// Set DATABASE_DIRECT_URL on Render to the port-5432 direct connection string.
+// Falls back to DATABASE_URL if not set (works if you're already on direct).
+const directPool = new Pool({
+  connectionString: process.env.DATABASE_DIRECT_URL || process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 2,
+  connectionTimeoutMillis: 15000,
+});
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
@@ -719,122 +729,119 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ── AUTO-MIGRATE on startup (non-blocking) ────────────────────────────────────
+// ── AUTO-MIGRATE on startup (uses direct connection, not pooler) ──────────────
 setImmediate(async () => {
-  try {
-    await pool.query(createTablesSQL);
-    console.log('✅ Core tables ensured');
-    // Ensure V4 columns exist
-    const v4Cols = [
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS programme VARCHAR(255)`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS year_of_study VARCHAR(20)`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS subjects TEXT[] DEFAULT '{}'`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style VARCHAR(50)`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS study_times TEXT[] DEFAULT '{}'`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS goals TEXT[] DEFAULT '{}'`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMP`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255)`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_emoji VARCHAR(10)`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_text VARCHAR(100)`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMP`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS social_pref VARCHAR(50)`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS nois_pref VARCHAR(50)`,
-      // Campus Pulse tables
-      `CREATE TABLE IF NOT EXISTS campus_pulse_posts (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        category VARCHAR(40) NOT NULL DEFAULT 'general', text TEXT NOT NULL,
-        is_anonymous BOOLEAN DEFAULT TRUE, author_name VARCHAR(100) DEFAULT 'Anonymous',
-        is_pinned BOOLEAN DEFAULT FALSE, likes INTEGER DEFAULT 0,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS campus_pulse_reactions (
-        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL,
-        UNIQUE(post_id, user_id, emoji)
-      )`,
-      `CREATE TABLE IF NOT EXISTS campus_pulse_comments (
-        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL,
-        author_name VARCHAR(100) DEFAULT 'Anonymous', created_at TIMESTAMPTZ DEFAULT NOW()
-      )`,
-      // User follows
-      `CREATE TABLE IF NOT EXISTS user_follows (
-        id SERIAL PRIMARY KEY, follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        created_at TIMESTAMP DEFAULT NOW(), UNIQUE(follower_id, following_id)
-      )`,
-      // Friendships
-      `CREATE TABLE IF NOT EXISTS friendships (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        friend_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        status VARCHAR(20) DEFAULT 'accepted', created_at TIMESTAMP DEFAULT NOW(),
-        UNIQUE(user_id, friend_id)
-      )`,
-      // Activity logs
-      `CREATE TABLE IF NOT EXISTS activity_logs (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        action VARCHAR(80), label TEXT, meta JSONB DEFAULT '{}',
-        created_at TIMESTAMP DEFAULT NOW()
-      )`,
-      // Daily quests
-      `CREATE TABLE IF NOT EXISTS daily_quests (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        quest_type VARCHAR(60) NOT NULL, label TEXT NOT NULL,
-        target INTEGER DEFAULT 1, progress INTEGER DEFAULT 0,
-        xp_reward INTEGER DEFAULT 20, date DATE NOT NULL DEFAULT CURRENT_DATE,
-        UNIQUE(user_id, quest_type, date)
-      )`,
-      // Habits
-      `CREATE TABLE IF NOT EXISTS habits (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        label VARCHAR(120) NOT NULL, icon VARCHAR(10) DEFAULT '✅',
-        frequency VARCHAR(20) DEFAULT 'daily', created_at TIMESTAMP DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS habit_logs (
-        id SERIAL PRIMARY KEY, habit_id INTEGER REFERENCES habits(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        date DATE NOT NULL DEFAULT CURRENT_DATE, UNIQUE(habit_id, date)
-      )`,
-      // Focus sessions
-      `CREATE TABLE IF NOT EXISTS focus_sessions (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        started_at TIMESTAMP DEFAULT NOW(), ended_at TIMESTAMP,
-        duration_minutes INTEGER, label TEXT, is_active BOOLEAN DEFAULT TRUE
-      )`,
-      // Admin exam schedules
-      `CREATE TABLE IF NOT EXISTS admin_exam_schedules (
-        id SERIAL PRIMARY KEY, admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        title VARCHAR(255), institution VARCHAR(255), department VARCHAR(255),
-        program VARCHAR(255), year_level VARCHAR(20), semester VARCHAR(50),
-        academic_year VARCHAR(20), exams JSONB DEFAULT '[]',
-        is_published BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT NOW()
-      )`,
-      // User preferences
-      `CREATE TABLE IF NOT EXISTS user_preferences (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE UNIQUE,
-        study_style VARCHAR(50), noise_pref VARCHAR(50), collab_pref VARCHAR(50),
-        interests TEXT[] DEFAULT '{}', study_times TEXT[] DEFAULT '{}',
-        goals TEXT[] DEFAULT '{}', notification_prefs JSONB DEFAULT '{}',
-        updated_at TIMESTAMP DEFAULT NOW()
-      )`,
-      // Homework responses upvotes column
-      `ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0`,
-      // Direct messages is_read column
-      `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`,
-    ];
-    for (const sql of v4Cols) {
-      await pool.query(sql).catch(e => console.warn('Migration warning:', e.message.slice(0,80)));
-    }
-    console.log('✅ V4 schema ensured');
-  } catch (e) {
-    console.error('Startup migration error:', e.message);
+  const ddl = directPool;
+  const v4 = [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS programme VARCHAR(255)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS year_of_study VARCHAR(20)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS subjects TEXT[] DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style VARCHAR(50)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS study_times TEXT[] DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS goals TEXT[] DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMP`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_emoji VARCHAR(10)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_text VARCHAR(100)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMP`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS social_pref VARCHAR(50)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS nois_pref VARCHAR(50)`,
+    `CREATE TABLE IF NOT EXISTS campus_pulse_posts (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      category VARCHAR(40) NOT NULL DEFAULT 'general', text TEXT NOT NULL,
+      is_anonymous BOOLEAN DEFAULT TRUE, author_name VARCHAR(100) DEFAULT 'Anonymous',
+      is_pinned BOOLEAN DEFAULT FALSE, likes INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS campus_pulse_reactions (
+      id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL,
+      UNIQUE(post_id, user_id, emoji)
+    )`,
+    `CREATE TABLE IF NOT EXISTS campus_pulse_comments (
+      id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL,
+      author_name VARCHAR(100) DEFAULT 'Anonymous', created_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS user_follows (
+      id SERIAL PRIMARY KEY, follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT NOW(), UNIQUE(follower_id, following_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS friendships (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      friend_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      status VARCHAR(20) DEFAULT 'accepted', created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, friend_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS activity_logs (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      action VARCHAR(80), label TEXT, meta JSONB DEFAULT '{}',
+      created_at TIMESTAMP DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS daily_quests (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      quest_type VARCHAR(60) NOT NULL, label TEXT NOT NULL,
+      target INTEGER DEFAULT 1, progress INTEGER DEFAULT 0,
+      xp_reward INTEGER DEFAULT 20, date DATE NOT NULL DEFAULT CURRENT_DATE,
+      UNIQUE(user_id, quest_type, date)
+    )`,
+    `CREATE TABLE IF NOT EXISTS habits (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      label VARCHAR(120) NOT NULL, icon VARCHAR(10) DEFAULT '✅',
+      frequency VARCHAR(20) DEFAULT 'daily', created_at TIMESTAMP DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS habit_logs (
+      id SERIAL PRIMARY KEY, habit_id INTEGER REFERENCES habits(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      date DATE NOT NULL DEFAULT CURRENT_DATE, UNIQUE(habit_id, date)
+    )`,
+    `CREATE TABLE IF NOT EXISTS focus_sessions (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      started_at TIMESTAMP DEFAULT NOW(), ended_at TIMESTAMP,
+      duration_minutes INTEGER, label TEXT, is_active BOOLEAN DEFAULT TRUE
+    )`,
+    `CREATE TABLE IF NOT EXISTS admin_exam_schedules (
+      id SERIAL PRIMARY KEY, admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(255), institution VARCHAR(255), department VARCHAR(255),
+      program VARCHAR(255), year_level VARCHAR(20), semester VARCHAR(50),
+      academic_year VARCHAR(20), exams JSONB DEFAULT '[]',
+      is_published BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS user_preferences (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE UNIQUE,
+      study_style VARCHAR(50), noise_pref VARCHAR(50), collab_pref VARCHAR(50),
+      interests TEXT[] DEFAULT '{}', study_times TEXT[] DEFAULT '{}',
+      goals TEXT[] DEFAULT '{}', notification_prefs JSONB DEFAULT '{}',
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS user_tour_progress (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      completed BOOLEAN DEFAULT FALSE,
+      steps_seen JSONB DEFAULT '[]',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS phone_contacts (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      contact_phone VARCHAR(50) NOT NULL, contact_name VARCHAR(200),
+      found_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(user_id, contact_phone)
+    )`,
+    `ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0`,
+    `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`,
+  ];
+  let ok = 0, fail = 0;
+  for (const sql of v4) {
+    try { await ddl.query(sql); ok++; }
+    catch (e) { fail++; console.warn('[migrate]', e.message.slice(0, 100)); }
   }
+  console.log(`✅ Startup migration: ${ok} ok, ${fail} skipped/failed`);
 });
 
 app.post('/api/init-db', async (req, res) => {
@@ -3871,28 +3878,28 @@ CREATE INDEX IF NOT EXISTS idx_grade_entries ON grade_entries(subject_id)
 // ============================================================================
 
 const XP_ACTIONS = {
-  resource_upload:      20,
-  upvote_received:       5,
-  homework_answered:    15,
-  study_task_completed: 10,
-  assignment_submitted:  5,
-  daily_login:          10,
-  class_joined:          3,
-  study_group_created:  15,
-  study_group_joined:    5,
-  item_listed:          10,
-  review_given:          5,
-  library_upvote_given:  2,
-  bounty_fulfilled:     30,
-  login_streak_7:       50,
-  login_streak_30:     200,
+  resource_upload:      100,  // Must be genuinely useful — significant effort
+  upvote_received:        0,  // No rep for being upvoted — too passive
+  homework_answered:     50,  // Directly helping a peer — meaningful
+  study_task_completed:   0,  // Personal habit — no external reward
+  assignment_submitted:   0,  // Expected behaviour — not rewarded
+  daily_login:            1,  // Just enough to acknowledge you showed up
+  class_joined:           0,  // Too passive
+  study_group_created:   40,  // Creating value for others
+  study_group_joined:     0,  // Passive participation
+  item_listed:           15,  // Marketplace contribution
+  review_given:          20,  // Must write a real review to earn this
+  library_upvote_given:   0,  // Costs nothing — earns nothing
+  bounty_fulfilled:     200,  // Hardest task, rarest reward
+  login_streak_7:        50,  // A full week — respectable
+  login_streak_30:      300,  // A full month — genuinely rare
 };
 
 function calcLevel(xp) {
-  if (xp >= 2000) return 'Diamond';
-  if (xp >= 800)  return 'Platinum';
-  if (xp >= 400)  return 'Gold';
-  if (xp >= 150)  return 'Silver';
+  if (xp >= 1000000) return 'Diamond';
+  if (xp >= 100000)  return 'Platinum';
+  if (xp >= 10000)   return 'Gold';
+  if (xp >= 1000)    return 'Silver';
   return 'Bronze';
 }
 
@@ -4294,10 +4301,10 @@ app.post('/api/migrate-v2', async (req, res) => {
 // ============================================================================
 
 function calcLevel(xp) {
-  if (xp >= 2000) return 'Diamond';
-  if (xp >= 800)  return 'Platinum';
-  if (xp >= 400)  return 'Gold';
-  if (xp >= 150)  return 'Silver';
+  if (xp >= 1000000) return 'Diamond';
+  if (xp >= 100000)  return 'Platinum';
+  if (xp >= 10000)   return 'Gold';
+  if (xp >= 1000)    return 'Silver';
   return 'Bronze';
 }
 
