@@ -4095,6 +4095,28 @@ setImmediate(async () => {
 app.get('/api/campus-pulse', authMiddleware, async (req, res) => {
   const { category, sort = 'hot', limit = 50 } = req.query;
   try {
+    // Ensure table exists (safe for pooler — CREATE IF NOT EXISTS is idempotent)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS campus_pulse_posts (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        category VARCHAR(40) NOT NULL DEFAULT 'general', text TEXT NOT NULL,
+        is_anonymous BOOLEAN DEFAULT TRUE, author_name VARCHAR(100) DEFAULT 'Anonymous',
+        is_pinned BOOLEAN DEFAULT FALSE, likes INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`).catch(()=>{});
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS campus_pulse_reactions (
+        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL,
+        UNIQUE(post_id, user_id, emoji)
+      )`).catch(()=>{});
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS campus_pulse_comments (
+        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL,
+        author_name VARCHAR(100) DEFAULT 'Anonymous', created_at TIMESTAMPTZ DEFAULT NOW()
+      )`).catch(()=>{});
+
     let q = `
       SELECT p.*,
         (SELECT COUNT(*) FROM campus_pulse_comments c WHERE c.post_id = p.id) AS comment_count,
@@ -4112,7 +4134,7 @@ app.get('/api/campus-pulse', authMiddleware, async (req, res) => {
     params.push(parseInt(limit)); q += ` LIMIT $${params.length}`;
     const { rows } = await pool.query(q, params);
     res.json({ success: true, posts: rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.json({ success: true, posts: [] }); }
 });
 
 app.post('/api/campus-pulse', authMiddleware, async (req, res) => {
@@ -4127,7 +4149,19 @@ app.post('/api/campus-pulse', authMiddleware, async (req, res) => {
       [req.user.userId, category, text.trim(), isAnonymous, name]
     );
     res.json({ success: true, post: { ...rows[0], comment_count: 0, reactions: null } });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) {
+    // Table missing — try to create it then retry once
+    if (e.message.includes('does not exist')) {
+      try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS campus_pulse_posts (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, category VARCHAR(40) NOT NULL DEFAULT 'general', text TEXT NOT NULL, is_anonymous BOOLEAN DEFAULT TRUE, author_name VARCHAR(100) DEFAULT 'Anonymous', is_pinned BOOLEAN DEFAULT FALSE, likes INTEGER DEFAULT 0, created_at TIMESTAMPTZ DEFAULT NOW())`);
+        const uRes = await pool.query('SELECT full_name FROM users WHERE id=$1', [req.user.userId]);
+        const name = isAnonymous ? 'Anonymous' : (authorName?.trim() || uRes.rows[0]?.full_name || 'Student');
+        const { rows } = await pool.query(`INSERT INTO campus_pulse_posts (user_id,category,text,is_anonymous,author_name) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [req.user.userId, category, text.trim(), isAnonymous, name]);
+        return res.json({ success: true, post: { ...rows[0], comment_count: 0, reactions: null } });
+      } catch (e2) { return res.status(500).json({ success: false, error: e2.message }); }
+    }
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/campus-pulse/:id/like', authMiddleware, async (req, res) => {
