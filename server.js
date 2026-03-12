@@ -719,6 +719,124 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// ── AUTO-MIGRATE on startup (non-blocking) ────────────────────────────────────
+setImmediate(async () => {
+  try {
+    await pool.query(createTablesSQL);
+    console.log('✅ Core tables ensured');
+    // Ensure V4 columns exist
+    const v4Cols = [
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS programme VARCHAR(255)`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS year_of_study VARCHAR(20)`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS subjects TEXT[] DEFAULT '{}'`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style VARCHAR(50)`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS study_times TEXT[] DEFAULT '{}'`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS goals TEXT[] DEFAULT '{}'`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMP`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255)`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_emoji VARCHAR(10)`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_text VARCHAR(100)`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMP`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS social_pref VARCHAR(50)`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS nois_pref VARCHAR(50)`,
+      // Campus Pulse tables
+      `CREATE TABLE IF NOT EXISTS campus_pulse_posts (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        category VARCHAR(40) NOT NULL DEFAULT 'general', text TEXT NOT NULL,
+        is_anonymous BOOLEAN DEFAULT TRUE, author_name VARCHAR(100) DEFAULT 'Anonymous',
+        is_pinned BOOLEAN DEFAULT FALSE, likes INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      `CREATE TABLE IF NOT EXISTS campus_pulse_reactions (
+        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL,
+        UNIQUE(post_id, user_id, emoji)
+      )`,
+      `CREATE TABLE IF NOT EXISTS campus_pulse_comments (
+        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL,
+        author_name VARCHAR(100) DEFAULT 'Anonymous', created_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      // User follows
+      `CREATE TABLE IF NOT EXISTS user_follows (
+        id SERIAL PRIMARY KEY, follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT NOW(), UNIQUE(follower_id, following_id)
+      )`,
+      // Friendships
+      `CREATE TABLE IF NOT EXISTS friendships (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        friend_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        status VARCHAR(20) DEFAULT 'accepted', created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, friend_id)
+      )`,
+      // Activity logs
+      `CREATE TABLE IF NOT EXISTS activity_logs (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        action VARCHAR(80), label TEXT, meta JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT NOW()
+      )`,
+      // Daily quests
+      `CREATE TABLE IF NOT EXISTS daily_quests (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        quest_type VARCHAR(60) NOT NULL, label TEXT NOT NULL,
+        target INTEGER DEFAULT 1, progress INTEGER DEFAULT 0,
+        xp_reward INTEGER DEFAULT 20, date DATE NOT NULL DEFAULT CURRENT_DATE,
+        UNIQUE(user_id, quest_type, date)
+      )`,
+      // Habits
+      `CREATE TABLE IF NOT EXISTS habits (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        label VARCHAR(120) NOT NULL, icon VARCHAR(10) DEFAULT '✅',
+        frequency VARCHAR(20) DEFAULT 'daily', created_at TIMESTAMP DEFAULT NOW()
+      )`,
+      `CREATE TABLE IF NOT EXISTS habit_logs (
+        id SERIAL PRIMARY KEY, habit_id INTEGER REFERENCES habits(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        date DATE NOT NULL DEFAULT CURRENT_DATE, UNIQUE(habit_id, date)
+      )`,
+      // Focus sessions
+      `CREATE TABLE IF NOT EXISTS focus_sessions (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        started_at TIMESTAMP DEFAULT NOW(), ended_at TIMESTAMP,
+        duration_minutes INTEGER, label TEXT, is_active BOOLEAN DEFAULT TRUE
+      )`,
+      // Admin exam schedules
+      `CREATE TABLE IF NOT EXISTS admin_exam_schedules (
+        id SERIAL PRIMARY KEY, admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255), institution VARCHAR(255), department VARCHAR(255),
+        program VARCHAR(255), year_level VARCHAR(20), semester VARCHAR(50),
+        academic_year VARCHAR(20), exams JSONB DEFAULT '[]',
+        is_published BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT NOW()
+      )`,
+      // User preferences
+      `CREATE TABLE IF NOT EXISTS user_preferences (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE UNIQUE,
+        study_style VARCHAR(50), noise_pref VARCHAR(50), collab_pref VARCHAR(50),
+        interests TEXT[] DEFAULT '{}', study_times TEXT[] DEFAULT '{}',
+        goals TEXT[] DEFAULT '{}', notification_prefs JSONB DEFAULT '{}',
+        updated_at TIMESTAMP DEFAULT NOW()
+      )`,
+      // Homework responses upvotes column
+      `ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0`,
+      // Direct messages is_read column
+      `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`,
+    ];
+    for (const sql of v4Cols) {
+      await pool.query(sql).catch(e => console.warn('Migration warning:', e.message.slice(0,80)));
+    }
+    console.log('✅ V4 schema ensured');
+  } catch (e) {
+    console.error('Startup migration error:', e.message);
+  }
+});
+
 app.post('/api/init-db', async (req, res) => {
   try {
     await pool.query(createTablesSQL);
@@ -5033,31 +5151,33 @@ app.post('/api/auth/login', async (req, res) => {
 // OVERRIDE: GET /api/auth/profile — includes XP fields
 app.get('/api/auth/profile', authMiddleware, async (req, res) => {
   try {
+    // Use only columns guaranteed to exist; extras caught gracefully
     const result = await pool.query(
       `SELECT id, email, full_name, student_id, institution, phone, bio,
-              profile_image_url, is_course_rep, is_admin, xp_points, level,
-              login_streak, reputation_score, rank_percentile, onboarded_at,
-              onboarding_complete, department, avatar_url,
-              programme, year_of_study, subjects, study_style, study_times, goals
+              xp_points, level, login_streak, onboarded_at, onboarding_complete,
+              programme, year_of_study, subjects, study_style, study_times, goals,
+              is_course_rep, is_admin,
+              COALESCE(profile_image_url, avatar_url, '') AS profile_image_url,
+              COALESCE(department, programme, '') AS department
        FROM users WHERE id=$1`,
       [req.user.userId]
     );
     if (!result.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
     const u = result.rows[0];
+    const isOnboarded = !!(u.onboarded_at || u.onboarding_complete);
     res.json({
       success: true,
       user: {
         ...u,
         fullName:             u.full_name,
-        profileImageUrl:      u.profile_image_url || u.avatar_url,
+        profileImageUrl:      u.profile_image_url,
         isAdmin:              u.is_admin,
         isCourseRep:          u.is_course_rep,
         xpPoints:             u.xp_points || 0,
         loginStreak:          u.login_streak || 0,
-        // Both fields so App.js works regardless of which it checks
-        onboarding_completed: !!(u.onboarded_at || u.onboarding_complete),
-        onboarded:            !!(u.onboarded_at || u.onboarding_complete),
-        department:           u.department || u.programme,
+        onboarding_completed: isOnboarded,
+        onboarded:            isOnboarded,
+        onboarding_complete:  isOnboarded,
       }
     });
   } catch (err) {
@@ -6440,68 +6560,6 @@ app.post('/api/programs/upload', authMiddleware, async (req, res) => {
 // The createNotification calls are embedded in the routes that matter.
 
 // ============================================================================
-app.use((req, res) => {
-  res.status(404).json({ 
-    success: false, 
-    message: 'Route not found',
-    path: req.path 
-  });
-});
-
-app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  
-  if (err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'File too large. Maximum size: 5MB for images, 50MB for documents' 
-    });
-  }
-  
-  if (err.message && err.message.includes('Only image files')) {
-    return res.status(400).json({ 
-      success: false, 
-      message: err.message 
-    });
-  }
-  
-  if (err.message && err.message.includes('Only document files')) {
-    return res.status(400).json({ 
-      success: false, 
-      message: err.message 
-    });
-  }
-  
-  res.status(500).json({ 
-    success: false, 
-    message: err.message || 'Internal server error'
-  });
-});
-
-// ============================================
-// START SERVER
-// ============================================
-
-// ============================================================================
-// V4: PEER RECOMMENDATIONS ENGINE
-// ============================================================================
-
-// ============================================================================
-// V4: PHONE CONTACTS MATCHING
-// ============================================================================
-
-// ============================================================================
-// V4: USER PREFERENCES
-// ============================================================================
-
-// ============================================================================
-// V4: ADMIN EXAM SCHEDULES
-// ============================================================================
-
-// ============================================================================
-// V4: ONBOARDING ENDPOINT
-// ============================================================================
-
 app.post('/api/onboarding', authMiddleware, async (req, res) => {
   const {
     department, yearOfStudy, program, courses, studyTimes, studyStyle,
@@ -6723,6 +6781,68 @@ app.post('/api/homework-help/:id/mark-answered', authMiddleware, async (req, res
 });
 
 
+
+app.use((req, res) => {
+  res.status(404).json({ 
+    success: false, 
+    message: 'Route not found',
+    path: req.path 
+  });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'File too large. Maximum size: 5MB for images, 50MB for documents' 
+    });
+  }
+  
+  if (err.message && err.message.includes('Only image files')) {
+    return res.status(400).json({ 
+      success: false, 
+      message: err.message 
+    });
+  }
+  
+  if (err.message && err.message.includes('Only document files')) {
+    return res.status(400).json({ 
+      success: false, 
+      message: err.message 
+    });
+  }
+  
+  res.status(500).json({ 
+    success: false, 
+    message: err.message || 'Internal server error'
+  });
+});
+
+// ============================================
+// START SERVER
+// ============================================
+
+// ============================================================================
+// V4: PEER RECOMMENDATIONS ENGINE
+// ============================================================================
+
+// ============================================================================
+// V4: PHONE CONTACTS MATCHING
+// ============================================================================
+
+// ============================================================================
+// V4: USER PREFERENCES
+// ============================================================================
+
+// ============================================================================
+// V4: ADMIN EXAM SCHEDULES
+// ============================================================================
+
+// ============================================================================
+// V4: ONBOARDING ENDPOINT
+// ============================================================================
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
