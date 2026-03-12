@@ -835,6 +835,20 @@ setImmediate(async () => {
     )`,
     `ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0`,
     `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`,
+    `CREATE TABLE IF NOT EXISTS homework_help (
+      id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(255) NOT NULL, question TEXT NOT NULL, description TEXT,
+      subject VARCHAR(100), class_space_id INTEGER, attachment_url TEXT,
+      status VARCHAR(50) DEFAULT 'open', urgency VARCHAR(20) DEFAULT 'normal',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS homework_responses (
+      id SERIAL PRIMARY KEY, help_request_id INTEGER REFERENCES homework_help(id) ON DELETE CASCADE,
+      responder_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      response TEXT NOT NULL, attachment_url TEXT,
+      is_expert_response BOOLEAN DEFAULT FALSE, helpful_count INTEGER DEFAULT 0,
+      upvotes INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
   ];
   let ok = 0, fail = 0;
   for (const sql of v4) {
