@@ -697,7 +697,7 @@ const authMiddleware = (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'sh_jwt_secret_2025');
     req.user = decoded;
     next();
   } catch (error) {
@@ -844,6 +844,8 @@ setImmediate(async () => {
     )`,
     `ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0`,
     `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS content TEXT`,
+    `UPDATE direct_messages SET content=message WHERE content IS NULL AND message IS NOT NULL`,
     `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20) DEFAULT 'file'`,
     `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS drive_link TEXT`,
     `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS drive_folder_id TEXT`,
@@ -920,7 +922,7 @@ app.post('/api/auth/register', async (req, res) => {
     const user = result.rows[0];
     const token = jwt.sign(
       { userId: user.id, email: user.email },
-      process.env.JWT_SECRET || 'your-secret-key',
+      process.env.JWT_SECRET || 'sh_jwt_secret_2025',
       { expiresIn: '7d' }
     );
     
@@ -4710,34 +4712,35 @@ app.get('/api/users/me/following', authMiddleware, async (req, res) => {
 app.get('/api/messages/inbox', authMiddleware, async (req, res) => {
   try {
     const uid = req.user.userId;
-    const result = await pool.query(
-      `SELECT DISTINCT ON (other_id)
-         other_id,
-         other_name,
-         other_image,
-         content AS last_message,
-         created_at AS last_at,
-         unread_count
-       FROM (
-         SELECT
-           CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END AS other_id,
-           CASE WHEN dm.sender_id=$1 THEN ru.full_name    ELSE su.full_name   END AS other_name,
-           CASE WHEN dm.sender_id=$1 THEN ru.profile_image_url ELSE su.profile_image_url END AS other_image,
-           dm.content,
-           dm.created_at,
-           (SELECT COUNT(*) FROM direct_messages
-            WHERE sender_id=(CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END)
-              AND receiver_id=$1 AND is_read=false) AS unread_count
-         FROM direct_messages dm
-         JOIN users su ON su.id = dm.sender_id
-         JOIN users ru ON ru.id = dm.receiver_id
-         WHERE dm.sender_id=$1 OR dm.receiver_id=$1
-         ORDER BY dm.created_at DESC
-       ) t
-       ORDER BY other_id, last_at DESC`,
+    const { rows } = await pool.query(`
+      SELECT DISTINCT ON (other_id)
+        other_id,
+        other_name,
+        other_image,
+        last_message,
+        last_at,
+        unread_count
+      FROM (
+        SELECT
+          CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END AS other_id,
+          CASE WHEN dm.sender_id=$1 THEN ru.full_name    ELSE su.full_name   END AS other_name,
+          CASE WHEN dm.sender_id=$1 THEN COALESCE(ru.profile_image_url,ru.avatar_url)
+               ELSE COALESCE(su.profile_image_url,su.avatar_url) END AS other_image,
+          dm.content AS last_message,
+          dm.created_at AS last_at,
+          (SELECT COUNT(*)::int FROM direct_messages d2
+           WHERE d2.sender_id = CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END
+             AND d2.receiver_id=$1 AND d2.is_read=false) AS unread_count
+        FROM direct_messages dm
+        JOIN users su ON su.id = dm.sender_id
+        JOIN users ru ON ru.id = dm.receiver_id
+        WHERE dm.sender_id=$1 OR dm.receiver_id=$1
+        ORDER BY dm.created_at DESC
+      ) t
+      ORDER BY other_id, last_at DESC`,
       [uid]
     );
-    res.json({ success: true, conversations: result.rows });
+    res.json({ success: true, conversations: rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -4749,25 +4752,27 @@ app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
   if (isNaN(other)) return res.status(400).json({ success: false, message: 'Invalid user ID' });
   try {
-    // Mark received messages as read
     await pool.query(
       `UPDATE direct_messages SET is_read=true, read_at=NOW()
        WHERE sender_id=$1 AND receiver_id=$2 AND is_read=false`,
       [other, uid]
     );
     const messages = await pool.query(
-      `SELECT dm.*, u.full_name AS sender_name, u.profile_image_url AS sender_image
+      `SELECT dm.id, dm.sender_id, dm.receiver_id,
+              dm.content AS message, dm.content,
+              dm.is_read, dm.created_at,
+              u.full_name AS sender_name,
+              COALESCE(u.profile_image_url, u.avatar_url) AS sender_image
        FROM direct_messages dm
        JOIN users u ON u.id = dm.sender_id
        WHERE (dm.sender_id=$1 AND dm.receiver_id=$2)
           OR (dm.sender_id=$2 AND dm.receiver_id=$1)
-       ORDER BY dm.created_at ASC
-       LIMIT 200`,
+       ORDER BY dm.created_at ASC LIMIT 200`,
       [uid, other]
     );
-    // Get other user's info
     const otherUser = await pool.query(
-      'SELECT id, full_name, profile_image_url, institution FROM users WHERE id=$1',
+      `SELECT id, full_name, COALESCE(profile_image_url,avatar_url) AS profile_image_url, institution
+       FROM users WHERE id=$1`,
       [other]
     );
     res.json({ success: true, messages: messages.rows, user: otherUser.rows[0] || null });
@@ -4778,9 +4783,10 @@ app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
 
 // POST /api/messages — send a DM
 app.post('/api/messages', authMiddleware, async (req, res) => {
-  const { receiverId, content } = req.body;
+  const { receiverId, content, message } = req.body;
+  const text = (content || message || '').trim();
   const uid = req.user.userId;
-  if (!receiverId || !content?.trim()) {
+  if (!receiverId || !text) {
     return res.status(400).json({ success: false, message: 'Receiver and content required' });
   }
   if (parseInt(receiverId) === uid) {
@@ -4788,20 +4794,16 @@ app.post('/api/messages', authMiddleware, async (req, res) => {
   }
   try {
     const receiver = await pool.query('SELECT id FROM users WHERE id=$1', [receiverId]);
-    if (!receiver.rows.length) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
+    if (!receiver.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
     const result = await pool.query(
-      `INSERT INTO direct_messages (sender_id, receiver_id, content)
-       VALUES ($1,$2,$3) RETURNING *`,
-      [uid, receiverId, content.trim()]
+      `INSERT INTO direct_messages (sender_id, receiver_id, content) VALUES ($1,$2,$3) RETURNING *`,
+      [uid, receiverId, text]
     );
-    // Deliver a notification to receiver
-    await pool.query(
-      `INSERT INTO notifications (user_id, notification_type, reference_id, title, message, scheduled_time)
-       VALUES ($1,'message',$2,$3,$4,NOW())`,
-      [receiverId, uid, 'New Message',
-       (await pool.query('SELECT full_name FROM users WHERE id=$1',[uid])).rows[0]?.full_name + ' sent you a message']
+    const sender = await pool.query('SELECT full_name FROM users WHERE id=$1', [uid]);
+    createNotification(
+      receiverId, 'message',
+      `New message from ${sender.rows[0]?.full_name || 'Someone'}`,
+      text.slice(0, 80), uid
     );
     res.json({ success: true, message: result.rows[0] });
   } catch (err) {
@@ -5135,7 +5137,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     const token = jwt.sign(
       { userId: user.id, email: user.email },
-      process.env.JWT_SECRET || 'fallback-change-this',
+      process.env.JWT_SECRET || 'sh_jwt_secret_2025',
       { expiresIn: '7d' }
     );
 
@@ -6266,9 +6268,8 @@ app.post('/api/share/resource-dm', authMiddleware, async (req, res) => {
     if (!resource.length) return res.status(404).json({ success: false });
     const shareText = `📚 Shared a resource: *${resource[0].title}* ${message ? `\n${message}` : ''}\n[View in Library: /library/${resourceId}]`;
     const { rows } = await pool.query(
-      `INSERT INTO direct_messages(sender_id, receiver_id, message, message_type, meta)
-       VALUES($1,$2,$3,'resource',$4) RETURNING *`,
-      [req.user.userId, recipientId, shareText, JSON.stringify({ resourceId, title: resource[0].title, fileUrl: resource[0].file_url })]
+      `INSERT INTO direct_messages(sender_id, receiver_id, content) VALUES($1,$2,$3) RETURNING *`,
+      [req.user.userId, recipientId, shareText]
     );
     res.json({ success: true, message: rows[0] });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
@@ -6557,16 +6558,15 @@ app.get('/api/chat/conversations', authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT DISTINCT ON (other_id)
-        dm.id, dm.message, dm.created_at, dm.is_read,
+        dm.id, dm.content AS message, dm.content, dm.created_at, dm.is_read,
         dm.sender_id, dm.receiver_id,
         CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END AS other_id,
         u.full_name AS other_name,
         COALESCE(u.profile_image_url, u.avatar_url) AS other_avatar,
         (SELECT COUNT(*)::int FROM direct_messages
-         WHERE receiver_id=$1 AND sender_id=other_user.id AND is_read=false) AS unread_count
+         WHERE receiver_id=$1 AND sender_id=u.id AND is_read=false) AS unread_count
       FROM direct_messages dm
       JOIN users u ON u.id = CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END
-      JOIN users other_user ON other_user.id = CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END
       WHERE dm.sender_id=$1 OR dm.receiver_id=$1
       ORDER BY other_id, dm.created_at DESC`, [uid]);
     res.json({ success: true, conversations: rows });
@@ -6574,15 +6574,39 @@ app.get('/api/chat/conversations', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/chat/messages', authMiddleware, async (req, res) => {
-  const { with: otherId } = req.query;
+  const otherId = req.query.with || req.query.userId;
+  const uid = req.user.userId;
+  if (!otherId) return res.status(400).json({ success: false, message: 'Missing ?with=userId' });
+  try {
+    const { rows } = await pool.query(`
+      SELECT dm.id, dm.sender_id, dm.receiver_id, dm.content AS message,
+             dm.content, dm.is_read, dm.created_at,
+             u.full_name AS sender_name,
+             COALESCE(u.profile_image_url, u.avatar_url) AS sender_avatar
+      FROM direct_messages dm JOIN users u ON u.id=dm.sender_id
+      WHERE (dm.sender_id=$1 AND dm.receiver_id=$2) OR (dm.sender_id=$2 AND dm.receiver_id=$1)
+      ORDER BY dm.created_at ASC LIMIT 200`, [uid, otherId]);
+    await pool.query(
+      `UPDATE direct_messages SET is_read=true WHERE receiver_id=$1 AND sender_id=$2 AND is_read=false`,
+      [uid, otherId]
+    ).catch(()=>{});
+    res.json({ success: true, messages: rows });
+  } catch { res.json({ success: true, messages: [] }); }
+});
+
+// Path-param alias — Chat.js calls /api/chat/messages/:userId
+app.get('/api/chat/messages/:userId', authMiddleware, async (req, res) => {
+  const otherId = req.params.userId;
   const uid = req.user.userId;
   try {
     const { rows } = await pool.query(`
-      SELECT dm.*,u.full_name AS sender_name,u.avatar_url AS sender_avatar
+      SELECT dm.id, dm.sender_id, dm.receiver_id, dm.content AS message,
+             dm.content, dm.is_read, dm.created_at,
+             u.full_name AS sender_name,
+             COALESCE(u.profile_image_url, u.avatar_url) AS sender_avatar
       FROM direct_messages dm JOIN users u ON u.id=dm.sender_id
       WHERE (dm.sender_id=$1 AND dm.receiver_id=$2) OR (dm.sender_id=$2 AND dm.receiver_id=$1)
-      ORDER BY dm.created_at ASC LIMIT 100`, [uid, otherId]);
-    // Mark incoming messages as read
+      ORDER BY dm.created_at ASC LIMIT 200`, [uid, otherId]);
     await pool.query(
       `UPDATE direct_messages SET is_read=true WHERE receiver_id=$1 AND sender_id=$2 AND is_read=false`,
       [uid, otherId]
@@ -6592,15 +6616,17 @@ app.get('/api/chat/messages', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/chat/messages', authMiddleware, async (req, res) => {
-  const { receiverId, message } = req.body;
+  const { receiverId, message, content } = req.body;
+  const text = content || message || '';
   const uid = req.user.userId;
+  if (!text.trim()) return res.status(400).json({ success: false, message: 'Message required' });
   try {
     const { rows } = await pool.query(
-      `INSERT INTO direct_messages (sender_id,receiver_id,message) VALUES ($1,$2,$3) RETURNING *`,
-      [uid, receiverId, message]);
+      `INSERT INTO direct_messages (sender_id,receiver_id,content) VALUES ($1,$2,$3) RETURNING *`,
+      [uid, receiverId, text.trim()]);
     // Auto-notify recipient
     const sender = await pool.query(`SELECT full_name FROM users WHERE id=$1`, [uid]);
-    createNotification(receiverId, 'message', `New message from ${sender.rows[0]?.full_name || 'Someone'}`, message.slice(0,80), uid);
+    createNotification(receiverId, 'message', `New message from ${sender.rows[0]?.full_name || 'Someone'}`, text.slice(0,80), uid);
     res.json({ success: true, message: rows[0] });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
