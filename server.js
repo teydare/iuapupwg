@@ -827,6 +827,15 @@ setImmediate(async () => {
       steps_seen JSONB DEFAULT '[]',
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`,
+    `CREATE TABLE IF NOT EXISTS timetable_attendance (
+      id           SERIAL PRIMARY KEY,
+      user_id      INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      timetable_id INTEGER,
+      class_date   DATE NOT NULL,
+      status       VARCHAR(20) DEFAULT 'present',
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, timetable_id, class_date)
+    )`,
     `CREATE TABLE IF NOT EXISTS phone_contacts (
       id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
       contact_phone VARCHAR(50) NOT NULL, contact_name VARCHAR(200),
@@ -835,6 +844,11 @@ setImmediate(async () => {
     )`,
     `ALTER TABLE homework_responses ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0`,
     `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20) DEFAULT 'file'`,
+    `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS drive_link TEXT`,
+    `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS drive_folder_id TEXT`,
+    `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS drive_files JSONB DEFAULT '[]'`,
+    `ALTER TABLE library_resources ALTER COLUMN file_url DROP NOT NULL`,
     `CREATE TABLE IF NOT EXISTS homework_help (
       id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
       title VARCHAR(255) NOT NULL, question TEXT NOT NULL, description TEXT,
@@ -937,100 +951,48 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.get('/api/auth/stats', authMiddleware, async (req, res) => {
   try {
-   const userId = req.user.userId;
+    const userId = req.user.userId;
 
-    // 1. Calculate Reputation for EVERY user to determine ranking
-    // This query creates a virtual table of all user reputations
-    const rankResult = await pool.query(`
-      WITH UserReputations AS (
-        SELECT 
-          u.id,
-          (
-            (SELECT COUNT(*) FROM library_resources WHERE uploader_id = u.id) * 10 +
-            (SELECT COUNT(*) FROM library_interactions li 
-             JOIN library_resources lr ON li.resource_id = lr.id 
-             WHERE lr.uploader_id = u.id AND li.interaction_type = 'upvote') * 5
-          ) as total_rep
-        FROM users u
-      )
-      SELECT 
-        total_rep,
-        (SELECT COUNT(*) FROM UserReputations) as total_users,
-        (SELECT COUNT(*) FROM UserReputations WHERE total_rep > (SELECT total_rep FROM UserReputations WHERE id = $1)) as users_above
-      FROM UserReputations 
-      WHERE id = $1
-    `, [userId]);
+    const [rankRes, classesRes, resourcesRes, groupsRes, itemsRes, reviewsRes, ratingRes, loginRes] = await Promise.all([
+      pool.query(`
+        SELECT
+          u.xp_points AS total_rep,
+          (SELECT COUNT(*) FROM users) AS total_users,
+          (SELECT COUNT(*) FROM users WHERE xp_points > u.xp_points) AS users_above
+        FROM users u WHERE u.id=$1`, [userId]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM class_space_members WHERE user_id=$1`, [userId]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM library_resources WHERE uploader_id=$1`, [userId]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM study_group_members WHERE user_id=$1`, [userId]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM marketplace_goods WHERE seller_id=$1`, [userId]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM reviews WHERE reviewed_user_id=$1`, [userId]),
+      pool.query(`SELECT COALESCE(AVG(rating),0)::numeric(10,1) AS avg FROM reviews WHERE reviewed_user_id=$1`, [userId]),
+      pool.query(`SELECT login_streak FROM users WHERE id=$1`, [userId]),
+    ]);
 
-    if (rankResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "User not found" });
-    }
-
-    const { total_rep, total_users, users_above } = rankResult.rows[0];
-
-    // 2. Calculate Real Percentile
-    // Formula: (Number of people below you / Total people) * 100
-    // We want "Top X%", so: (Users Above / Total Users) * 100
-    let percentile = Math.round((parseInt(users_above) / parseInt(total_users)) * 100);
-    
-    // Ensure it doesn't say "Top 0%"
-    if (percentile === 0) percentile = 1;
-
-    // 3. Get individual counts for the UI display
-    const uploadCount = await pool.query('SELECT COUNT(*) FROM library_resources WHERE uploader_id = $1', [userId]);
-    const upvoteCount = await pool.query(`
-      SELECT COUNT(*) FROM library_interactions li
-      JOIN library_resources lr ON li.resource_id = lr.id
-      WHERE lr.uploader_id = $1 AND li.interaction_type = 'upvote'
-    `, [userId]);
-
-    const classesCount = await pool.query(
-      'SELECT COUNT(*) FROM class_space_members WHERE user_id = $1',
-      [userId]
-    );
-
-    const resourcesCount = await pool.query(
-      'SELECT COUNT(*) FROM class_resources WHERE uploader_id = $1',
-      [userId]
-    );
-
-    const groupsCount = await pool.query(
-      'SELECT COUNT(*) FROM study_group_members WHERE user_id = $1',
-      [userId]
-    );
-
-    const itemsSold = await pool.query(
-      'SELECT COUNT(*) FROM marketplace_goods WHERE seller_id = $1',
-      [userId]
-    );
-
-    const reviewsReceived = await pool.query(
-      'SELECT COUNT(*) FROM reviews WHERE reviewed_user_id = $1',
-      [userId]
-    );
-
-    const avgRating = await pool.query(
-      'SELECT COALESCE(AVG(rating),0)::numeric(10,1) as avg FROM reviews WHERE reviewed_user_id = $1',
-      [userId]
-    );
+    const rank = rankRes.rows[0] || {};
+    const total_rep = parseInt(rank.total_rep) || 0;
+    const total_users = parseInt(rank.total_users) || 1;
+    const users_above = parseInt(rank.users_above) || 0;
+    let percentile = Math.round((users_above / total_users) * 100);
+    if (percentile === 0 && total_rep > 0) percentile = 1;
 
     res.json({
       success: true,
       stats: {
-        classesJoined: parseInt(classesCount.rows[0].count),
-        resourcesUploaded: parseInt(resourcesCount.rows[0].count),
-        studyGroups: parseInt(groupsCount.rows[0].count),
-        itemsSold: parseInt(itemsSold.rows[0].count),
-        reviewsReceived: parseInt(reviewsReceived.rows[0].count),
-        avgRating: parseFloat(avgRating.rows[0].avg),
-        reputation: parseInt(total_rep),
-        uploads: parseInt(uploadCount.rows[0].count),
-        upvotes: parseInt(upvoteCount.rows[0].count),
-        percentile: percentile
+        classesJoined:    classesRes.rows[0].c,
+        resourcesUploaded: resourcesRes.rows[0].c,
+        studyGroups:      groupsRes.rows[0].c,
+        itemsSold:        itemsRes.rows[0].c,
+        reviewsReceived:  reviewsRes.rows[0].c,
+        avgRating:        parseFloat(ratingRes.rows[0].avg),
+        reputation:       total_rep,
+        uploads:          resourcesRes.rows[0].c,
+        loginStreak:      loginRes.rows[0]?.login_streak || 0,
+        percentile,
       }
     });
-
   } catch (error) {
-    console.error(error);
+    console.error('auth/stats error:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -2000,12 +1962,13 @@ app.get('/api/library', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT lr.*, u.full_name as uploader_name,
+        COALESCE(lr.resource_type,'file') as resource_type,
         (SELECT COUNT(*) FROM library_interactions WHERE resource_id = lr.id AND interaction_type = 'upvote') as upvotes,
         EXISTS(SELECT 1 FROM library_interactions WHERE resource_id = lr.id AND user_id = $1 AND interaction_type = 'upvote') as has_upvoted,
         EXISTS(SELECT 1 FROM library_bookmarks WHERE resource_id = lr.id AND user_id = $1) as is_bookmarked
-      FROM library_resources lr 
-      JOIN users u ON lr.uploader_id = u.id 
-      WHERE lr.is_public = true 
+      FROM library_resources lr
+      JOIN users u ON lr.uploader_id = u.id
+      WHERE lr.is_public = true
       ORDER BY lr.created_at DESC`,
       [req.user.userId]
     );
@@ -5282,7 +5245,85 @@ app.post('/api/library', authMiddleware, libraryUpload.fields([
   }
 });
 
-// OVERRIDE: POST /api/homework-help/:id/respond — award XP for answering
+// ── GOOGLE DRIVE LIBRARY RESOURCE ────────────────────────────────────────────
+// POST /api/library/drive — add a Google Drive folder or file link to the library
+app.post('/api/library/drive', authMiddleware, async (req, res) => {
+  const { title, description, subject, category, driveLink } = req.body;
+  if (!title?.trim()) return res.status(400).json({ success: false, message: 'Title required' });
+  if (!driveLink?.trim()) return res.status(400).json({ success: false, message: 'Google Drive link required' });
+
+  // Extract file/folder ID from various Drive URL formats
+  const extractDriveId = (url) => {
+    const patterns = [
+      /\/folders\/([a-zA-Z0-9_-]+)/,
+      /\/file\/d\/([a-zA-Z0-9_-]+)/,
+      /id=([a-zA-Z0-9_-]+)/,
+      /\/d\/([a-zA-Z0-9_-]+)/,
+    ];
+    for (const p of patterns) {
+      const m = url.match(p);
+      if (m) return m[1];
+    }
+    return null;
+  };
+
+  const driveId = extractDriveId(driveLink);
+  const isFolder = driveLink.includes('/folders/');
+
+  // Build a clean embeddable/previewable URL
+  const buildEmbedUrl = (id, folder) =>
+    folder
+      ? `https://drive.google.com/embeddedfolderview?id=${id}#list`
+      : `https://drive.google.com/file/d/${id}/preview`;
+
+  const embedUrl = driveId ? buildEmbedUrl(driveId, isFolder) : driveLink;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO library_resources
+       (uploader_id, title, description, subject, category, file_url,
+        resource_type, drive_link, drive_folder_id, file_type)
+       VALUES ($1,$2,$3,$4,$5,$6,'drive',$7,$8,$9) RETURNING *`,
+      [
+        req.user.userId,
+        title.trim(),
+        description?.trim() || '',
+        subject?.trim() || '',
+        category || 'Lecture Notes',
+        embedUrl,                    // file_url = the embed URL for iframe preview
+        driveLink.trim(),            // drive_link = original share link
+        isFolder ? driveId : null,
+        isFolder ? 'folder' : 'drive-file',
+      ]
+    );
+    setImmediate(() => {
+      awardXP(req.user.userId, 'resource_upload', `resource:${result.rows[0].id}`);
+      updateStudentRank(req.user.userId);
+    });
+    res.json({ success: true, resource: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/library/:id/drive-embed — returns embed info for a drive resource
+app.get('/api/library/:id/drive-embed', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, title, file_url, drive_link, resource_type, drive_folder_id FROM library_resources WHERE id=$1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Not found' });
+    const r = rows[0];
+    res.json({
+      success: true,
+      embedUrl: r.file_url,
+      driveLink: r.drive_link,
+      isFolder: r.drive_folder_id != null,
+      resourceType: r.resource_type,
+    });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
 app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { response } = req.body;
@@ -5577,6 +5618,58 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 // ============================================================================
 // TIMETABLE — PATCH (missing in original, added here properly)
 // ============================================================================
+
+// ── TIMETABLE ATTENDANCE ─────────────────────────────────────────────────────
+pool.query(`
+  CREATE TABLE IF NOT EXISTS timetable_attendance (
+    id            SERIAL PRIMARY KEY,
+    user_id       INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    timetable_id  INTEGER REFERENCES timetables(id) ON DELETE CASCADE,
+    class_date    DATE NOT NULL,
+    status        VARCHAR(20) DEFAULT 'present',
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, timetable_id, class_date)
+  )`).catch(()=>{});
+
+app.get('/api/timetable/attendance', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    const { rows } = await pool.query(
+      `SELECT ta.*, t.title, t.course_code
+       FROM timetable_attendance ta
+       JOIN timetables t ON t.id = ta.timetable_id
+       WHERE ta.user_id = $1
+       ORDER BY ta.class_date DESC`,
+      [uid]
+    );
+    res.json({ success: true, records: rows });
+  } catch (e) { res.json({ success: true, records: [] }); }
+});
+
+app.post('/api/timetable/:id/attendance', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { classDate, status } = req.body;
+  const uid = req.user.userId;
+  if (!classDate || !['present','absent','late'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'classDate and valid status required' });
+  }
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO timetable_attendance (user_id, timetable_id, class_date, status)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (user_id, timetable_id, class_date)
+       DO UPDATE SET status=$4
+       RETURNING *`,
+      [uid, id, classDate, status]
+    );
+    // Log activity
+    await pool.query(
+      `INSERT INTO activity_logs(user_id,action,label) VALUES($1,'attendance',$2)`,
+      [uid, `Marked ${status} for class ${id} on ${classDate}`]
+    ).catch(()=>{});
+    res.json({ success: true, record: rows[0] });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
 
 app.patch('/api/timetable/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
@@ -6220,23 +6313,34 @@ app.post('/api/user/status', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/user/heatmap', authMiddleware, async (req, res) => {
+  const days = Math.min(parseInt(req.query.days) || 90, 365);
+  const uid = req.user.userId;
   try {
-    const { rows } = await pool.query(
-      `SELECT DATE(created_at) as date, COUNT(*)::int as count
-       FROM activity_logs WHERE user_id=$1
-       AND created_at >= NOW() - INTERVAL '365 days'
-       GROUP BY DATE(created_at) ORDER BY date`,
-      [req.user.userId]
-    );
-    res.json({ success: true, heatmap: rows });
-  } catch { res.json({ success: true, heatmap: [] }); }
+    const [actRes, focusRes] = await Promise.all([
+      pool.query(
+        `SELECT DATE(created_at) AS day, COUNT(*)::int AS actions
+         FROM activity_logs WHERE user_id=$1
+         AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+         GROUP BY DATE(created_at) ORDER BY day`,
+        [uid, days]
+      ),
+      pool.query(
+        `SELECT DATE(started_at) AS day, COALESCE(SUM(duration_minutes)*60,0)::int AS secs
+         FROM focus_sessions WHERE user_id=$1 AND is_active=false
+         AND started_at >= NOW() - ($2 || ' days')::INTERVAL
+         GROUP BY DATE(started_at) ORDER BY day`,
+        [uid, days]
+      ),
+    ]);
+    res.json({ success: true, activity: actRes.rows, focus: focusRes.rows });
+  } catch { res.json({ success: true, activity: [], focus: [] }); }
 });
 
 // ── DAILY LOGIN ───────────────────────────────────────────────────────────────
 app.post('/api/daily-login', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
   try {
-    await pool.query(`
+    const { rows } = await pool.query(`
       UPDATE users SET
         last_login = NOW(),
         login_streak = CASE
@@ -6244,9 +6348,12 @@ app.post('/api/daily-login', authMiddleware, async (req, res) => {
           WHEN DATE(last_login) = CURRENT_DATE THEN login_streak
           ELSE 1
         END
-      WHERE id=$1`, [uid]);
-    await pool.query(`UPDATE users SET xp_points = xp_points + 10 WHERE id=$1`, [uid]).catch(()=>{});
-    res.json({ success: true });
+      WHERE id=$1 RETURNING login_streak`, [uid]);
+    const newStreak = rows[0]?.login_streak || 1;
+    await awardXP(uid, 'daily_login');
+    if (newStreak === 7)  await awardXP(uid, 'login_streak_7',  'streak:7');
+    if (newStreak === 30) await awardXP(uid, 'login_streak_30', 'streak:30');
+    res.json({ success: true, streak: newStreak });
   } catch { res.json({ success: true }); }
 });
 
@@ -6450,10 +6557,16 @@ app.get('/api/chat/conversations', authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT DISTINCT ON (other_id)
-        dm.*, u.full_name AS other_name, u.avatar_url AS other_avatar,
-        CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END AS other_id
+        dm.id, dm.message, dm.created_at, dm.is_read,
+        dm.sender_id, dm.receiver_id,
+        CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END AS other_id,
+        u.full_name AS other_name,
+        COALESCE(u.profile_image_url, u.avatar_url) AS other_avatar,
+        (SELECT COUNT(*)::int FROM direct_messages
+         WHERE receiver_id=$1 AND sender_id=other_user.id AND is_read=false) AS unread_count
       FROM direct_messages dm
       JOIN users u ON u.id = CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END
+      JOIN users other_user ON other_user.id = CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END
       WHERE dm.sender_id=$1 OR dm.receiver_id=$1
       ORDER BY other_id, dm.created_at DESC`, [uid]);
     res.json({ success: true, conversations: rows });
@@ -6469,6 +6582,11 @@ app.get('/api/chat/messages', authMiddleware, async (req, res) => {
       FROM direct_messages dm JOIN users u ON u.id=dm.sender_id
       WHERE (dm.sender_id=$1 AND dm.receiver_id=$2) OR (dm.sender_id=$2 AND dm.receiver_id=$1)
       ORDER BY dm.created_at ASC LIMIT 100`, [uid, otherId]);
+    // Mark incoming messages as read
+    await pool.query(
+      `UPDATE direct_messages SET is_read=true WHERE receiver_id=$1 AND sender_id=$2 AND is_read=false`,
+      [uid, otherId]
+    ).catch(()=>{});
     res.json({ success: true, messages: rows });
   } catch { res.json({ success: true, messages: [] }); }
 });
@@ -6515,21 +6633,57 @@ app.get('/api/chat/group/:groupId/messages', authMiddleware, async (req, res) =>
 
 // ── LEADERBOARDS ──────────────────────────────────────────────────────────────
 app.get('/api/leaderboard', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const period = req.query.period || 'week'; // week | month | all
   try {
+    // Get friend IDs (follows + friendships)
+    const friendRes = await pool.query(`
+      SELECT following_id AS fid FROM user_follows WHERE follower_id=$1
+      UNION
+      SELECT friend_id FROM friendships WHERE user_id=$1
+      UNION
+      SELECT user_id FROM friendships WHERE friend_id=$1`, [uid]);
+    const friendIds = friendRes.rows.map(r => r.fid);
+    friendIds.push(uid); // include self
+
+    // For period-based: sum activity_logs XP proxied by xp_points change
+    // Simple approach: rank by total xp_points but show only friends
     const { rows } = await pool.query(`
-      SELECT id,full_name,avatar_url,xp_points,level,login_streak
-      FROM users ORDER BY xp_points DESC LIMIT 50`);
-    res.json({ success: true, leaderboard: rows });
+      SELECT u.id, u.full_name, u.profile_image_url, u.avatar_url,
+             u.xp_points AS total_xp, u.level, u.login_streak,
+             u.xp_points AS period_xp
+      FROM users u
+      WHERE u.id = ANY($1)
+      ORDER BY u.xp_points DESC
+      LIMIT 50`, [friendIds]);
+
+    // Find current user's global rank
+    const rankRes = await pool.query(
+      `SELECT COUNT(*)::int AS rank FROM users WHERE xp_points > (SELECT xp_points FROM users WHERE id=$1)`,
+      [uid]
+    );
+    const myGlobalRank = (rankRes.rows[0]?.rank || 0) + 1;
+
+    res.json({ success: true, leaderboard: rows, myGlobalRank });
   } catch { res.json({ success: true, leaderboard: [] }); }
 });
 
 app.get('/api/global-leaderboard', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
   const limit = Math.min(parseInt(req.query.limit)||50, 100);
   try {
     const { rows } = await pool.query(`
-      SELECT id,full_name,avatar_url,xp_points,level,login_streak,institution
-      FROM users ORDER BY xp_points DESC LIMIT $1`, [limit]);
-    res.json({ success: true, leaderboard: rows });
+      SELECT u.id, u.full_name, u.profile_image_url, u.avatar_url,
+             u.xp_points, u.level, u.login_streak, u.institution,
+             RANK() OVER (ORDER BY u.xp_points DESC)::int AS global_rank
+      FROM users u
+      ORDER BY u.xp_points DESC LIMIT $1`, [limit]);
+    const rankRes = await pool.query(
+      `SELECT COUNT(*)::int AS rank FROM users WHERE xp_points > (SELECT xp_points FROM users WHERE id=$1)`,
+      [uid]
+    );
+    const myGlobalRank = (rankRes.rows[0]?.rank || 0) + 1;
+    res.json({ success: true, leaderboard: rows, myGlobalRank });
   } catch { res.json({ success: true, leaderboard: [] }); }
 });
 
@@ -6559,7 +6713,18 @@ app.post('/api/focus/end', authMiddleware, async (req, res) => {
       UPDATE focus_sessions SET ended_at=NOW(), is_active=false,
         duration_minutes=ROUND(EXTRACT(EPOCH FROM (NOW()-started_at))/60)
       WHERE user_id=$1 AND is_active=true RETURNING *`, [uid]);
-    if (rows[0]) await pool.query(`UPDATE users SET xp_points=xp_points+5 WHERE id=$1`, [uid]);
+    if (rows[0]) {
+      const mins = rows[0].duration_minutes || 0;
+      // Award XP scaled to session length: 1 Rep per 10 minutes, max 20
+      const xpEarned = Math.min(20, Math.floor(mins / 10));
+      if (xpEarned > 0) {
+        await pool.query(`UPDATE users SET xp_points=xp_points+$1 WHERE id=$2`, [xpEarned, uid]);
+        await pool.query(
+          `INSERT INTO activity_logs(user_id,action,label,meta) VALUES($1,'focus_session','Completed focus session',$2)`,
+          [uid, JSON.stringify({ minutes: mins, xp: xpEarned })]
+        ).catch(()=>{});
+      }
+    }
     res.json({ success: true, session: rows[0]||null });
   } catch { res.json({ success: true }); }
 });
@@ -6584,6 +6749,39 @@ app.get('/api/focus/stats', authMiddleware, async (req, res) => {
 });
 
 // ── MARKETPLACE OFFERS ────────────────────────────────────────────────────────
+
+// PATCH /api/marketplace/offers/:offerId — accept or reject an offer
+app.patch('/api/marketplace/offers/:offerId', authMiddleware, async (req, res) => {
+  const { offerId } = req.params;
+  const { status } = req.body; // 'accepted' | 'rejected'
+  if (!['accepted','rejected'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'status must be accepted or rejected' });
+  }
+  try {
+    const offerRes = await pool.query(
+      `SELECT o.*, mg.seller_id, mg.title AS item_title, mg.id AS item_id
+       FROM offers o JOIN marketplace_goods mg ON mg.id = o.item_id
+       WHERE o.id = $1`, [offerId]
+    );
+    if (!offerRes.rows.length) return res.status(404).json({ success: false, message: 'Offer not found' });
+    const offer = offerRes.rows[0];
+    if (offer.seller_id !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'Only the seller can respond to offers' });
+    }
+    await pool.query(`UPDATE offers SET status=$1 WHERE id=$2`, [status, offerId]);
+    if (status === 'accepted') {
+      await pool.query(`UPDATE marketplace_goods SET status='sold' WHERE id=$1`, [offer.item_id]);
+      await pool.query(`UPDATE offers SET status='rejected' WHERE item_id=$1 AND id!=$2`, [offer.item_id, offerId]);
+      createNotification(offer.buyer_id, 'offer', 'Offer Accepted!',
+        `Your offer of ${offer.offer_amount} for "${offer.item_title}" was accepted.`, offer.item_id);
+    } else {
+      createNotification(offer.buyer_id, 'offer', 'Offer Declined',
+        `Your offer for "${offer.item_title}" was declined.`, offer.item_id);
+    }
+    res.json({ success: true, status });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 app.get('/api/marketplace/offers/:id', authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -6595,7 +6793,22 @@ app.get('/api/marketplace/offers/:id', authMiddleware, async (req, res) => {
 
 // ── PROGRAMS UPLOAD ────────────────────────────────────────────────────────────
 app.post('/api/programs/upload', authMiddleware, async (req, res) => {
-  res.json({ success: true, message: 'Use /api/program-courses/bulk for bulk upload' });
+  // Alias to bulk import
+  const { courses } = req.body;
+  if (!courses || !Array.isArray(courses)) return res.status(400).json({ success: false, message: 'courses array required' });
+  try {
+    let imported = 0;
+    for (const c of courses) {
+      if (!c.courseCode && !c.course_code) continue;
+      await pool.query(
+        `INSERT INTO program_courses (user_id, course_code, course_name, credits, semester, year_level)
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+        [req.user.userId, c.courseCode||c.course_code, c.courseName||c.course_name||'', c.credits||3, c.semester||'', c.yearLevel||c.year_level||'']
+      ).catch(()=>{});
+      imported++;
+    }
+    res.json({ success: true, imported });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ============================================================================
@@ -6762,41 +6975,85 @@ app.get('/api/recommendations/peers', authMiddleware, async (req, res) => {
 // ── ADMIN EXAM SCHEDULES ──────────────────────────────────────────────────────
 app.post('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
-  const { title, institution, department, program, yearLevel, semester, academicYear, exams } = req.body;
+  // Accept both camelCase (from AdminPanel) and snake_case field names
+  const {
+    title, institution, department, program,
+    yearLevel, yearOfStudy, year_level,
+    semester, academicYear, academic_year,
+    exams
+  } = req.body;
+  const resolvedYearLevel = yearLevel || yearOfStudy || year_level || '';
+  const resolvedAcademicYear = academicYear || academic_year || '';
+
+  // Normalize each exam entry — AdminPanel sends courseName/examDate/venue,
+  // but the push logic needs subject/date/location
+  const normalizeExam = (e) => ({
+    subject:   e.subject   || e.courseName  || e.course_name  || '',
+    title:     e.title     || e.courseName  || e.course_name  || '',
+    date:      e.date      || e.examDate    || e.exam_date    || '',
+    time:      e.time      || e.startTime   || e.start_time   || '',
+    end_time:  e.end_time  || e.endTime     || '',
+    location:  e.location  || e.venue       || '',
+    duration:  e.duration  || e.durationMins|| 120,
+    courseCode:e.courseCode|| e.course_code || '',
+    notes:     e.notes     || '',
+  });
+
+  const normalizedExams = (exams || []).map(normalizeExam);
+
   try {
     const { rows } = await pool.query(
-      `INSERT INTO admin_exam_schedules(admin_id,title,institution,department,program,year_level,semester,academic_year,exams,is_published)
+      `INSERT INTO admin_exam_schedules
+        (admin_id, title, institution, department, program,
+         year_level, semester, academic_year, exams, is_published)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE) RETURNING *`,
-      [req.user.userId, title, institution, department, program, yearLevel, semester, academicYear, JSON.stringify(exams||[])]
+      [req.user.userId, title || `${program || department} Exam Schedule`,
+       institution, department, program,
+       resolvedYearLevel, semester, resolvedAcademicYear,
+       JSON.stringify(normalizedExams)]
     );
-    // Push exams to matching users
-    let updated = 0;
-    if (exams && exams.length > 0) {
+
+    // Push exams into matching users' personal exam lists
+    let pushed = 0;
+    if (normalizedExams.length > 0 && institution) {
       const matchUsers = await pool.query(
-        `SELECT id FROM users WHERE institution ILIKE $1 ${department?'AND department ILIKE $2':''}`,
+        `SELECT id FROM users
+         WHERE institution ILIKE $1
+         ${department ? "AND (department ILIKE $2 OR programme ILIKE $2)" : ''}`,
         department ? [`%${institution}%`, `%${department}%`] : [`%${institution}%`]
       );
       for (const user of matchUsers.rows) {
-        for (const exam of exams) {
+        for (const exam of normalizedExams) {
           if (!exam.subject || !exam.date) continue;
           await pool.query(
-            `INSERT INTO exams(user_id,title,subject,exam_date,location,duration_mins,notes)
-             VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,
-            [user.id, exam.subject, exam.subject, exam.date+(exam.time?' '+exam.time:''),
-             exam.location||'', parseInt(exam.duration)||120, `From admin schedule: ${title}`]
+            `INSERT INTO exams
+               (user_id, title, subject, exam_date, location, duration_mins, notes)
+             VALUES($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT DO NOTHING`,
+            [user.id, exam.subject, exam.subject,
+             exam.date + (exam.time ? ' ' + exam.time : ''),
+             exam.location, parseInt(exam.duration) || 120,
+             `From admin schedule: ${title || institution}`]
           ).catch(()=>{});
-          updated++;
+          pushed++;
         }
       }
     }
-    res.json({ success: true, schedule: rows[0], studentsUpdated: updated });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    res.json({ success: true, schedule: rows[0], studentsUpdated: matchUsers?.rowCount || 0, examsPushed: pushed });
+  } catch (e) {
+    console.error('admin exam schedule:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.get('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
   try {
-    const { rows } = await pool.query('SELECT * FROM admin_exam_schedules ORDER BY created_at DESC');
+    const { rows } = await pool.query(`
+      SELECT *,
+        jsonb_array_length(COALESCE(exams, '[]'::jsonb)) AS exam_count
+      FROM admin_exam_schedules
+      ORDER BY created_at DESC`);
     res.json({ success: true, schedules: rows, uploads: rows.map(r => ({...r, type:'exam_schedule'})) });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
