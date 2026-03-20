@@ -180,31 +180,30 @@ const documentUpload = multer({
 
 const libraryUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB for documents
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB per file
   fileFilter: (req, file, cb) => {
-    // Allow both PDFs (main file) and images (thumbnail)
     if (file.fieldname === 'file') {
-      // Main document must be PDF
       const allowedTypes = /pdf|doc|docx|epub|mobi|txt/;
       const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
       const mimetype = allowedTypes.test(file.mimetype);
-      if (extname && mimetype) {
-        return cb(null, true);
-      }
-      cb(new Error('Only document files are allowed for main file (PDF, DOC, DOCX, EPUB, MOBI, TXT)'));
+      if (extname && mimetype) return cb(null, true);
+      cb(new Error('Only document files allowed (PDF, DOC, DOCX, EPUB, MOBI, TXT)'));
     } else if (file.fieldname === 'thumbnail') {
-      // Thumbnail must be an image
       const allowedTypes = /jpeg|jpg|png|gif|webp/;
       const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
       const mimetype = allowedTypes.test(file.mimetype);
-      if (extname && mimetype) {
-        return cb(null, true);
-      }
-      cb(new Error('Only image files are allowed for thumbnail (JPEG, PNG, GIF, WebP)'));
+      if (extname && mimetype) return cb(null, true);
+      cb(new Error('Only image files allowed for thumbnail'));
     } else {
-      cb(new Error('Unexpected field'));
+      cb(null, true); // folder upload uses different field names
     }
   }
+});
+
+// Multer for folder uploads — accepts any field name, up to 200 files, 50MB each
+const folderUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024, files: 200 },
 });
 
 // ============================================
@@ -5247,54 +5246,186 @@ app.post('/api/library', authMiddleware, libraryUpload.fields([
   }
 });
 
-// ── GOOGLE DRIVE LIBRARY RESOURCE ────────────────────────────────────────────
+// ── FOLDER UPLOAD ─────────────────────────────────────────────────────────────
+// POST /api/library/folder — upload an entire local folder, preserve structure
+app.post('/api/library/folder', authMiddleware, folderUpload.any(), async (req, res) => {
+  const { title, description, subject, category } = req.body;
+  if (!title?.trim()) return res.status(400).json({ success: false, message: 'Title required' });
+  if (!req.files || req.files.length === 0) return res.status(400).json({ success: false, message: 'No files received' });
+
+  try {
+    // Each file's fieldname is its relative path (sent by frontend as name="path/to/file.pdf")
+    // Build folder tree while uploading
+    const folderSlug = `folder-${req.user.userId}-${Date.now()}`;
+    const tree = {}; // path -> node
+
+    const uploadedFiles = [];
+    for (const file of req.files) {
+      // relativePath looks like "FolderName/SubFolder/file.pdf"
+      const relativePath = file.fieldname || file.originalname;
+      const parts = relativePath.replace(/^\//, '').split('/');
+      const fileName = parts[parts.length - 1];
+      if (!fileName || fileName.startsWith('.')) continue; // skip hidden files
+
+      // Upload to Supabase under a folder-specific prefix
+      const storageKey = `${folderSlug}/${relativePath}`;
+      const ext = path.extname(fileName);
+      let publicUrl = null;
+      try {
+        const { data, error } = await supabase.storage
+          .from('library-resources')
+          .upload(storageKey, file.buffer, {
+            contentType: file.mimetype || 'application/octet-stream',
+            cacheControl: '3600',
+            upsert: false,
+          });
+        if (!error) {
+          const { data: { publicUrl: url } } = supabase.storage
+            .from('library-resources')
+            .getPublicUrl(storageKey);
+          publicUrl = url;
+        }
+      } catch {}
+
+      uploadedFiles.push({
+        id:           storageKey,
+        name:         fileName,
+        relativePath: relativePath,
+        mimeType:     file.mimetype || 'application/octet-stream',
+        size:         String(file.size),
+        webViewLink:  publicUrl,
+        webContentLink: publicUrl,
+        thumbnailLink: null,
+        modifiedTime: new Date().toISOString(),
+      });
+    }
+
+    // Build nested tree from flat uploaded files list
+    function buildTree(files) {
+      const root = [];
+      const folders = {};
+
+      for (const f of files) {
+        const parts = f.relativePath.replace(/^\//, '').split('/');
+        if (parts.length === 1) {
+          // Top-level file
+          root.push({ ...f, isFolder: false });
+        } else {
+          // Nested — create folder nodes
+          let current = root;
+          for (let i = 0; i < parts.length - 1; i++) {
+            const folderName = parts[i];
+            const folderId = parts.slice(0, i + 1).join('/');
+            let existing = current.find(n => n.isFolder && n.name === folderName);
+            if (!existing) {
+              existing = { id: folderId, name: folderName, isFolder: true, mimeType: 'application/vnd.google-apps.folder', children: [] };
+              current.push(existing);
+            }
+            current = existing.children;
+          }
+          current.push({ ...f, isFolder: false });
+        }
+      }
+      return root;
+    }
+
+    const fileTree = buildTree(uploadedFiles);
+    // Use first uploaded file URL as the "file_url" for the resource card
+    const firstFile = uploadedFiles[0];
+
+    const result = await pool.query(
+      `INSERT INTO library_resources
+       (uploader_id, title, description, subject, category,
+        file_url, resource_type, drive_files, file_type, file_size)
+       VALUES ($1,$2,$3,$4,$5,$6,'folder',$7,'folder',$8) RETURNING *`,
+      [
+        req.user.userId, title.trim(), description?.trim() || '',
+        subject?.trim() || '', category || 'Lecture Notes',
+        firstFile?.webViewLink || '',
+        JSON.stringify(fileTree),
+        uploadedFiles.reduce((s, f) => s + parseInt(f.size || 0), 0),
+      ]
+    );
+
+    setImmediate(() => {
+      awardXP(req.user.userId, 'resource_upload', `resource:${result.rows[0].id}`);
+      updateStudentRank(req.user.userId);
+    });
+
+    res.json({
+      success: true,
+      resource: result.rows[0],
+      fileCount: uploadedFiles.length,
+    });
+  } catch (err) {
+    console.error('Folder upload error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+const DRIVE_API_KEY = process.env.GOOGLE_DRIVE_API_KEY;
+
+// Recursively fetch all files in a Drive folder using the public API
+async function fetchDriveFolder(folderId, depth = 0) {
+  if (!DRIVE_API_KEY || depth > 4) return [];
+  const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&key=${DRIVE_API_KEY}&fields=files(id,name,mimeType,size,thumbnailLink,webViewLink,webContentLink,createdTime,modifiedTime)&orderBy=name&pageSize=200`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const files = data.files || [];
+    // For subfolders, recurse
+    const result = [];
+    for (const f of files) {
+      const item = { id: f.id, name: f.name, mimeType: f.mimeType, size: f.size || null, thumbnailLink: f.thumbnailLink || null, webViewLink: f.webViewLink || null, webContentLink: f.webContentLink || null, modifiedTime: f.modifiedTime || null };
+      if (f.mimeType === 'application/vnd.google-apps.folder' && depth < 3) {
+        item.children = await fetchDriveFolder(f.id, depth + 1);
+        item.isFolder = true;
+      }
+      result.push(item);
+    }
+    return result;
+  } catch { return []; }
+}
+
 // POST /api/library/drive — add a Google Drive folder or file link to the library
 app.post('/api/library/drive', authMiddleware, async (req, res) => {
   const { title, description, subject, category, driveLink } = req.body;
   if (!title?.trim()) return res.status(400).json({ success: false, message: 'Title required' });
   if (!driveLink?.trim()) return res.status(400).json({ success: false, message: 'Google Drive link required' });
 
-  // Extract file/folder ID from various Drive URL formats
   const extractDriveId = (url) => {
-    const patterns = [
-      /\/folders\/([a-zA-Z0-9_-]+)/,
-      /\/file\/d\/([a-zA-Z0-9_-]+)/,
-      /id=([a-zA-Z0-9_-]+)/,
-      /\/d\/([a-zA-Z0-9_-]+)/,
-    ];
-    for (const p of patterns) {
-      const m = url.match(p);
-      if (m) return m[1];
-    }
+    const patterns = [/\/folders\/([a-zA-Z0-9_-]+)/, /\/file\/d\/([a-zA-Z0-9_-]+)/, /id=([a-zA-Z0-9_-]+)/, /\/d\/([a-zA-Z0-9_-]+)/];
+    for (const p of patterns) { const m = url.match(p); if (m) return m[1]; }
     return null;
   };
 
   const driveId = extractDriveId(driveLink);
   const isFolder = driveLink.includes('/folders/');
 
-  // Build a clean embeddable/previewable URL
-  const buildEmbedUrl = (id, folder) =>
-    folder
-      ? `https://drive.google.com/embeddedfolderview?id=${id}#list`
-      : `https://drive.google.com/file/d/${id}/preview`;
+  // Fetch actual file tree if we have an API key
+  let driveFiles = [];
+  if (DRIVE_API_KEY && isFolder && driveId) {
+    driveFiles = await fetchDriveFolder(driveId);
+  }
 
-  const embedUrl = driveId ? buildEmbedUrl(driveId, isFolder) : driveLink;
+  const embedUrl = driveId
+    ? (isFolder
+        ? `https://drive.google.com/embeddedfolderview?id=${driveId}#list`
+        : `https://drive.google.com/file/d/${driveId}/preview`)
+    : driveLink;
 
   try {
     const result = await pool.query(
       `INSERT INTO library_resources
        (uploader_id, title, description, subject, category, file_url,
-        resource_type, drive_link, drive_folder_id, file_type)
-       VALUES ($1,$2,$3,$4,$5,$6,'drive',$7,$8,$9) RETURNING *`,
+        resource_type, drive_link, drive_folder_id, drive_files, file_type)
+       VALUES ($1,$2,$3,$4,$5,$6,'drive',$7,$8,$9,$10) RETURNING *`,
       [
-        req.user.userId,
-        title.trim(),
-        description?.trim() || '',
-        subject?.trim() || '',
-        category || 'Lecture Notes',
-        embedUrl,                    // file_url = the embed URL for iframe preview
-        driveLink.trim(),            // drive_link = original share link
+        req.user.userId, title.trim(), description?.trim() || '',
+        subject?.trim() || '', category || 'Lecture Notes',
+        embedUrl, driveLink.trim(),
         isFolder ? driveId : null,
+        JSON.stringify(driveFiles),
         isFolder ? 'folder' : 'drive-file',
       ]
     );
@@ -5302,28 +5433,32 @@ app.post('/api/library/drive', authMiddleware, async (req, res) => {
       awardXP(req.user.userId, 'resource_upload', `resource:${result.rows[0].id}`);
       updateStudentRank(req.user.userId);
     });
-    res.json({ success: true, resource: result.rows[0] });
+    res.json({ success: true, resource: { ...result.rows[0], drive_files: driveFiles }, fileCount: driveFiles.length });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// GET /api/library/:id/drive-embed — returns embed info for a drive resource
-app.get('/api/library/:id/drive-embed', authMiddleware, async (req, res) => {
+// GET /api/library/:id/drive-files — return (and optionally refresh) the file tree
+app.get('/api/library/:id/drive-files', authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, title, file_url, drive_link, resource_type, drive_folder_id FROM library_resources WHERE id=$1`,
+      `SELECT id, title, drive_link, drive_folder_id, drive_files, resource_type FROM library_resources WHERE id=$1`,
       [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ success: false, message: 'Not found' });
     const r = rows[0];
-    res.json({
-      success: true,
-      embedUrl: r.file_url,
-      driveLink: r.drive_link,
-      isFolder: r.drive_folder_id != null,
-      resourceType: r.resource_type,
-    });
+
+    // If refresh requested or no files stored yet, re-fetch from Drive API
+    if ((req.query.refresh === '1' || !r.drive_files || r.drive_files === '[]') && DRIVE_API_KEY && r.drive_folder_id) {
+      const fresh = await fetchDriveFolder(r.drive_folder_id);
+      await pool.query(`UPDATE library_resources SET drive_files=$1 WHERE id=$2`, [JSON.stringify(fresh), r.id]);
+      return res.json({ success: true, files: fresh, fromCache: false });
+    }
+
+    let files = [];
+    try { files = typeof r.drive_files === 'string' ? JSON.parse(r.drive_files) : (r.drive_files || []); } catch {}
+    res.json({ success: true, files, fromCache: true });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
