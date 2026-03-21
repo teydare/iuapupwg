@@ -166,16 +166,9 @@ const imageUpload = multer({
 
 const documentUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB for documents
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /pdf|doc|docx|epub|mobi|txt/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-    if (extname && mimetype) {
-      return cb(null, true);
-    }
-    cb(new Error('Only document files are allowed (PDF, DOC, DOCX, EPUB, MOBI, TXT)'));
-  }
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  // Accept any file — class spaces need images, videos, PDFs, slides etc.
+  fileFilter: (req, file, cb) => cb(null, true),
 });
 
 const libraryUpload = multer({
@@ -845,6 +838,7 @@ setImmediate(async () => {
     `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS content TEXT`,
     `UPDATE direct_messages SET content=message WHERE content IS NULL AND message IS NOT NULL`,
+    `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE`,
     `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20) DEFAULT 'file'`,
     `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS drive_link TEXT`,
     `ALTER TABLE library_resources ADD COLUMN IF NOT EXISTS drive_folder_id TEXT`,
@@ -6550,17 +6544,41 @@ app.get('/api/habits', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
   const today = new Date().toISOString().split('T')[0];
   try {
-    await pool.query(`
-      INSERT INTO habits (user_id,label,icon) VALUES
-        ($1,'Review notes','📖'),($1,'Drink water','💧'),
-        ($1,'Exercise','🏃'),($1,'Read ahead','📚')
-      ON CONFLICT DO NOTHING`, [uid]);
     const { rows } = await pool.query(`
       SELECT h.*, EXISTS(
         SELECT 1 FROM habit_logs hl WHERE hl.habit_id=h.id AND hl.date=$2
       ) AS completed_today FROM habits h WHERE h.user_id=$1 ORDER BY h.id`, [uid, today]);
+    // Only seed defaults if user has no habits at all
+    if (rows.length === 0) {
+      await pool.query(`
+        INSERT INTO habits (user_id,label,icon) VALUES
+          ($1,'Review notes','📖'),($1,'Drink water','💧'),($1,'Exercise','🏃')
+        ON CONFLICT DO NOTHING`, [uid]);
+      const { rows: seeded } = await pool.query(`
+        SELECT h.*, false AS completed_today FROM habits h WHERE h.user_id=$1 ORDER BY h.id`, [uid]);
+      return res.json({ success: true, habits: seeded });
+    }
     res.json({ success: true, habits: rows });
   } catch { res.json({ success: true, habits: [] }); }
+});
+
+app.post('/api/habits', authMiddleware, async (req, res) => {
+  const { label, icon } = req.body;
+  if (!label?.trim()) return res.status(400).json({ success: false, message: 'Label required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO habits (user_id, label, icon) VALUES ($1,$2,$3) RETURNING *`,
+      [req.user.userId, label.trim(), icon || '✅']
+    );
+    res.json({ success: true, habit: { ...rows[0], completed_today: false } });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.delete('/api/habits/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM habits WHERE id=$1 AND user_id=$2`, [req.params.id, req.user.userId]);
+    res.json({ success: true });
+  } catch { res.json({ success: true }); }
 });
 
 app.post('/api/habits/toggle', authMiddleware, async (req, res) => {
@@ -6570,12 +6588,12 @@ app.post('/api/habits/toggle', authMiddleware, async (req, res) => {
     const ex = await pool.query(`SELECT id FROM habit_logs WHERE habit_id=$1 AND date=$2`, [habitId, today]);
     if (ex.rows.length) {
       await pool.query(`DELETE FROM habit_logs WHERE habit_id=$1 AND date=$2`, [habitId, today]);
-      res.json({ success: true, completed: false });
+      res.json({ success: true, checked: false, completed: false });
     } else {
       await pool.query(`INSERT INTO habit_logs (habit_id,user_id,date) VALUES ($1,$2,$3)`, [habitId, req.user.userId, today]);
-      res.json({ success: true, completed: true });
+      res.json({ success: true, checked: true, completed: true });
     }
-  } catch { res.json({ success: true, completed: false }); }
+  } catch { res.json({ success: true, checked: false, completed: false }); }
 });
 
 // ── ACTIVITY FEED ─────────────────────────────────────────────────────────────
@@ -6624,18 +6642,67 @@ app.post('/api/activity', authMiddleware, async (req, res) => {
 // ── DASHBOARD ─────────────────────────────────────────────────────────────────
 app.get('/api/dashboard', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
+  const today = new Date();
+  const dayOfWeek = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][today.getDay()];
+  const todayStr = today.toISOString().split('T')[0];
+
   try {
-    const [uRes, tRes] = await Promise.all([
-      pool.query(`SELECT id,full_name,avatar_url,xp_points,level,login_streak,department,year_of_study,onboarded_at,onboarding_complete FROM users WHERE id=$1`, [uid]),
-      pool.query(`SELECT id,title,due_date,status FROM assignments WHERE user_id=$1 AND status!='completed' ORDER BY due_date ASC LIMIT 5`, [uid]).catch(()=>({rows:[]})),
+    const [uRes, assignRes, classRes, questRes, focusRes, examRes, actRes] = await Promise.all([
+      pool.query(`SELECT id,full_name,avatar_url,xp_points,level,login_streak,department,
+                         year_of_study,onboarded_at,onboarding_complete,institution
+                  FROM users WHERE id=$1`, [uid]),
+      pool.query(`SELECT id,title,due_date,status,subject FROM assignments
+                  WHERE user_id=$1 AND status!='completed' ORDER BY due_date ASC LIMIT 6`, [uid]).catch(()=>({rows:[]})),
+      pool.query(`SELECT id,title,course_code,start_time,end_time,location_name,color
+                  FROM timetables
+                  WHERE user_id=$1 AND day_of_week=EXTRACT(DOW FROM NOW())::int
+                  ORDER BY start_time ASC LIMIT 6`, [uid]).catch(()=>({rows:[]})),
+      pool.query(`SELECT * FROM daily_quests WHERE user_id=$1 AND date=$2 ORDER BY id`, [uid, todayStr]).catch(()=>({rows:[]})),
+      pool.query(`SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(ended_at,NOW())-started_at))),0)::int AS secs
+                  FROM focus_sessions WHERE user_id=$1 AND DATE(started_at)=CURRENT_DATE`, [uid]).catch(()=>({rows:[{secs:0}]})),
+      pool.query(`SELECT id,title,course_code,exam_date,duration_mins,location
+                  FROM exams WHERE user_id=$1 AND exam_date >= CURRENT_DATE
+                  ORDER BY exam_date ASC LIMIT 3`, [uid]).catch(()=>({rows:[]})),
+      pool.query(`SELECT COUNT(*)::int AS c FROM activity_logs WHERE user_id=$1 AND DATE(created_at)=CURRENT_DATE`, [uid]).catch(()=>({rows:[{c:0}]})),
     ]);
+
     const u = uRes.rows[0] || {};
+
+    // Smart suggestions engine
+    const now = Date.now();
+    const suggestions = [];
+    const overdue = assignRes.rows.filter(a => a.due_date && new Date(a.due_date) < now);
+    const dueSoon = assignRes.rows.filter(a => a.due_date && new Date(a.due_date) - now < 86400000 && new Date(a.due_date) >= now);
+    if (overdue.length)  suggestions.push({ type:'urgent',  emoji:'🚨', text:`${overdue.length} overdue assignment${overdue.length>1?'s':''}`, action:'assignments' });
+    if (dueSoon.length)  suggestions.push({ type:'warning', emoji:'⏰', text:`${dueSoon[0].title} due in under 24h`, action:'assignments' });
+    if (classRes.rows.length) {
+      const nextClass = classRes.rows.find(c => {
+        const [h,m] = (c.start_time||'00:00').split(':').map(Number);
+        return (h*60+m) > (today.getHours()*60+today.getMinutes());
+      });
+      if (nextClass) suggestions.push({ type:'info', emoji:'📚', text:`${nextClass.course_code||nextClass.title} starts at ${nextClass.start_time}`, action:'class-spaces' });
+    }
+    if (examRes.rows.length) {
+      const days = Math.ceil((new Date(examRes.rows[0].exam_date) - now) / 86400000);
+      if (days <= 7) suggestions.push({ type: days<=2?'urgent':'warning', emoji:'📝', text:`${examRes.rows[0].title||examRes.rows[0].course_code} exam in ${days} day${days!==1?'s':''}`, action:'timetable' });
+    }
+    if (focusRes.rows[0]?.secs < 1500) suggestions.push({ type:'info', emoji:'⏱️', text:"Start a focus session to build your streak", action:'home' });
+
     res.json({
       success: true,
       user: { ...u, onboarding_completed: !!(u.onboarded_at || u.onboarding_complete) },
-      upcomingTasks: tRes.rows,
+      assignments:       assignRes.rows,
+      todayClasses:      classRes.rows,
+      quests:            questRes.rows.map(q => ({ ...q, completed: q.progress >= q.target, title: q.label })),
+      focusSecsToday:    focusRes.rows[0]?.secs || 0,
+      upcomingExams:     examRes.rows,
+      actionsToday:      actRes.rows[0]?.c || 0,
+      suggestions:       suggestions.slice(0, 3),
     });
-  } catch (err) { res.json({ success: true, user: {}, upcomingTasks: [] }); }
+  } catch (err) {
+    console.error('dashboard:', err.message);
+    res.json({ success: true, user: {}, assignments: [], todayClasses: [], quests: [], suggestions: [] });
+  }
 });
 
 // ── SUGGESTIONS ───────────────────────────────────────────────────────────────
@@ -6661,11 +6728,13 @@ app.get('/api/chat/class/:classId/messages', authMiddleware, async (req, res) =>
   const { classId } = req.params;
   try {
     const { rows } = await pool.query(`
-      SELECT cm.*,u.full_name AS sender_name,u.avatar_url AS sender_avatar
+      SELECT cm.*,u.full_name AS sender_name,
+             COALESCE(u.profile_image_url, u.avatar_url) AS sender_avatar
       FROM chat_messages cm JOIN users u ON cm.sender_id=u.id
-      WHERE cm.group_id=$1 ORDER BY cm.created_at ASC LIMIT 100`, [classId]);
+      WHERE cm.class_space_id=$1
+      ORDER BY cm.created_at ASC LIMIT 200`, [classId]);
     res.json({ success: true, messages: rows });
-  } catch { res.json({ success: true, messages: [] }); }
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.post('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
@@ -6675,9 +6744,8 @@ app.post('/api/chat/class/:classId/messages', authMiddleware, async (req, res) =
   if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
   try {
     const { rows } = await pool.query(
-      `INSERT INTO chat_messages (sender_id,group_id,message) VALUES ($1,$2,$3) RETURNING *`,
+      `INSERT INTO chat_messages (sender_id, class_space_id, message) VALUES ($1,$2,$3) RETURNING *`,
       [uid, classId, message.trim()]);
-    // Notify class members (excluding sender)
     const members = await pool.query(
       `SELECT user_id FROM class_space_members WHERE class_space_id=$1 AND user_id!=$2`, [classId, uid]);
     const sender = await pool.query(`SELECT full_name FROM users WHERE id=$1`, [uid]);
@@ -6876,15 +6944,20 @@ app.post('/api/focus/end', authMiddleware, async (req, res) => {
       WHERE user_id=$1 AND is_active=true RETURNING *`, [uid]);
     if (rows[0]) {
       const mins = rows[0].duration_minutes || 0;
-      // Award XP scaled to session length: 1 Rep per 10 minutes, max 20
-      const xpEarned = Math.min(20, Math.floor(mins / 10));
-      if (xpEarned > 0) {
-        await pool.query(`UPDATE users SET xp_points=xp_points+$1 WHERE id=$2`, [xpEarned, uid]);
-        await pool.query(
-          `INSERT INTO activity_logs(user_id,action,label,meta) VALUES($1,'focus_session','Completed focus session',$2)`,
-          [uid, JSON.stringify({ minutes: mins, xp: xpEarned })]
-        ).catch(()=>{});
+      // Only reward genuine 25+ min pomodoro sessions — 1 Rep per completed session, max 3/day
+      if (mins >= 25) {
+        const todaySessions = await pool.query(
+          `SELECT COUNT(*)::int AS c FROM focus_sessions
+           WHERE user_id=$1 AND is_active=false AND duration_minutes>=25
+           AND DATE(ended_at)=CURRENT_DATE`, [uid]);
+        if ((todaySessions.rows[0]?.c || 0) <= 3) {
+          await pool.query(`UPDATE users SET xp_points=xp_points+1 WHERE id=$1`, [uid]);
+        }
       }
+      await pool.query(
+        `INSERT INTO activity_logs(user_id,action,label,meta) VALUES($1,'focus_session','Completed focus session',$2)`,
+        [uid, JSON.stringify({ minutes: mins })]
+      ).catch(()=>{});
     }
     res.json({ success: true, session: rows[0]||null });
   } catch { res.json({ success: true }); }
@@ -7222,20 +7295,19 @@ app.get('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
 // ── MY EXAM SCHEDULE ──────────────────────────────────────────────────────────
 app.get('/api/my-exam-schedule', authMiddleware, async (req, res) => {
   try {
-    const userResult = await pool.query('SELECT institution, department, year_of_study FROM users WHERE id=$1', [req.user.userId]);
-    const user = userResult.rows[0];
-    if (!user) return res.json({ success: true, schedules: [] });
-
+    const userResult = await pool.query('SELECT institution, department FROM users WHERE id=$1', [req.user.userId]);
+    const u = userResult.rows[0];
+    if (!u || !u.institution) return res.json({ success: true, schedules: [] });
     const { rows } = await pool.query(
-      `SELECT * FROM admin_exam_schedules
-       WHERE is_published = TRUE
-         AND institution ILIKE $1
-         ${user.department ? 'AND (department ILIKE $2 OR department IS NULL OR department = \'\')' : ''}
+      `SELECT *, jsonb_array_length(COALESCE(exams,'[]'::jsonb)) AS exam_count
+       FROM admin_exam_schedules
+       WHERE is_published = TRUE AND institution ILIKE $1
+         AND (department IS NULL OR department = '' OR department ILIKE $2)
        ORDER BY created_at DESC LIMIT 5`,
-      user.department ? [`%${user.institution}%`, `%${user.department}%`] : [`%${user.institution}%`]
+      [`%${u.institution}%`, `%${u.department || ''}%`]
     );
     res.json({ success: true, schedules: rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.json({ success: true, schedules: [] }); }
 });
 
 // ── HOMEWORK RESPONSE UPVOTE ──────────────────────────────────────────────────
@@ -7254,6 +7326,28 @@ app.post('/api/homework-help/:id/mark-answered', authMiddleware, async (req, res
 });
 
 
+
+// ── COMBINED STATUS POLL — replaces 3 separate polling calls in Navigation ────
+// One request every 3 min instead of 3 requests every 60-120s
+app.get('/api/me/status', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    const [userRes, notifRes, dmRes] = await Promise.all([
+      pool.query(`SELECT xp_points, level, login_streak FROM users WHERE id=$1`, [uid]),
+      pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE user_id=$1 AND (read IS NULL OR read=false) AND scheduled_time <= NOW()`, [uid]),
+      pool.query(`SELECT COUNT(*)::int AS count FROM direct_messages WHERE receiver_id=$1 AND is_read=false`, [uid]),
+    ]);
+    const u = userRes.rows[0] || {};
+    res.json({
+      success: true,
+      xp:          u.xp_points   || 0,
+      level:       u.level       || 'Bronze',
+      streak:      u.login_streak|| 0,
+      notifCount:  notifRes.rows[0]?.count || 0,
+      dmCount:     dmRes.rows[0]?.count   || 0,
+    });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
 
 app.use((req, res) => {
   res.status(404).json({ 
