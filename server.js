@@ -873,7 +873,7 @@ app.post('/api/init-db', async (req, res) => {
     res.json({ success: true, message: 'Database initialized successfully' });
   } catch (error) {
     console.error('Database init error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -940,7 +940,7 @@ app.post('/api/auth/register', async (req, res) => {
       if (error.constraint === 'users_student_id_key') return res.status(400).json({ success: false, message: 'Student ID already exists' });
       if (error.constraint === 'users_phone_key') return res.status(400).json({ success: false, message: 'Phone number already exists' });
     }
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -988,7 +988,7 @@ app.get('/api/auth/stats', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('auth/stats error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1014,7 +1014,7 @@ app.post('/api/auth/avatar', authMiddleware, imageUpload.single('avatar'), async
 
   } catch (error) {
     console.error('Avatar upload error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1033,7 +1033,7 @@ app.get('/api/marketplace/goods', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, items: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1079,7 +1079,7 @@ app.get('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
       isFavorited: favoriteResult.rows.length > 0
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1108,7 +1108,7 @@ app.put('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
     
     res.json({ success: true, item: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1122,7 +1122,7 @@ app.delete('/api/marketplace/goods/:id', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, message: 'Item deleted' });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1150,7 +1150,7 @@ app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res)
       res.json({ success: true, favorited: true });
     }
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1200,7 +1200,7 @@ app.get('/api/marketplace/favorites', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, favorites: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1216,7 +1216,7 @@ app.post('/api/marketplace/goods/:id/offer', authMiddleware, async (req, res) =>
     );
     res.json({ success: true, offer: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1245,7 +1245,7 @@ app.get('/api/marketplace/goods/:id/offers', authMiddleware, async (req, res) =>
     
     res.json({ success: true, offers: offersResult.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 // ============================================
@@ -1301,7 +1301,7 @@ app.get('/api/reviews/:itemId', authMiddleware, async (req, res) => {
 
   } catch (error) {
     console.error('Fetch reviews error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1319,7 +1319,7 @@ app.get('/api/stores', authMiddleware, async (req, res) => {
 
     res.json({ success: true, stores: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1350,7 +1350,7 @@ app.post('/api/stores', authMiddleware, async (req, res) => {
 
     res.json({ success: true, store: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1385,7 +1385,7 @@ app.put('/api/stores/:id', authMiddleware, async (req, res) => {
 
     res.json({ success: true, store: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1416,7 +1416,7 @@ app.post('/api/stores/:id/follow', authMiddleware, async (req, res) => {
       res.json({ success: true, following: true });
     }
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1438,7 +1438,7 @@ app.get('/api/stores/my-store', authMiddleware, async (req, res) => {
 
     res.json({ success: true, store: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1478,7 +1478,7 @@ app.get('/api/reviews/user/:userId', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('Get reviews error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1498,7 +1498,7 @@ app.get('/api/reviews/store/:storeId', authMiddleware, async (req, res) => {
 
     res.json({ success: true, reviews: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1548,7 +1548,7 @@ app.delete('/api/reviews/:id', authMiddleware, async (req, res) => {
 
     res.json({ success: true, message: 'Review deleted' });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1594,7 +1594,7 @@ app.get('/api/store/:sellerId', async (req,res) => {
     });
 
   } catch(err){
-    res.status(500).json({success:false,error:err.message});
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1685,7 +1685,7 @@ app.post('/api/marketplace/services', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, service: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1699,7 +1699,7 @@ app.get('/api/marketplace/services', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, services: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1713,7 +1713,7 @@ app.delete('/api/marketplace/services/:id', authMiddleware, async (req, res) => 
     );
     res.json({ success: true, message: 'Service deleted' });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1747,7 +1747,7 @@ app.post('/api/class-spaces', authMiddleware, async (req, res) => {
     
     res.json({ success: true, classSpace: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1762,7 +1762,7 @@ app.get('/api/class-spaces', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, classSpaces: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1782,7 +1782,7 @@ app.post('/api/class-spaces/:id/resources', authMiddleware, documentUpload.singl
     res.json({ success: true, resource: result.rows[0] });
   } catch (error) {
     console.error('Error uploading class resource:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1800,7 +1800,7 @@ app.get('/api/class-spaces/:id/resources', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, resources: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1821,7 +1821,7 @@ app.post('/api/class-spaces/:id/timetable', authMiddleware, async (req, res) => 
     );
     res.json({ success: true, entry: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1834,7 +1834,7 @@ app.get('/api/class-spaces/:id/timetable', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, entries: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1849,7 +1849,7 @@ app.delete('/api/class-spaces/:classId/timetable/:entryId', authMiddleware, asyn
     await pool.query('DELETE FROM class_timetables WHERE id = $1 AND class_space_id = $2', [entryId, classId]);
     res.json({ success: true, message: 'Timetable entry deleted' });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1906,7 +1906,7 @@ app.post('/api/library/:id/vote', authMiddleware, async (req, res) => {
       return res.json({ success: true, action: 'added' });
     }
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1926,7 +1926,7 @@ app.get('/api/library/:id/comments', authMiddleware, async (req, res) => {
     // Helper to nest comments (handled on frontend usually, but flat list is fine for now)
     res.json({ success: true, comments: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1946,7 +1946,7 @@ app.post('/api/library/:id/comments', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, comment: newComment.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1970,7 +1970,7 @@ app.get('/api/library', authMiddleware, async (req, res) => {
     res.json({ success: true, resources: result.rows });
   } catch (error) {
     console.error('Library Fetch Error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1984,7 +1984,7 @@ app.get('/api/library/bookmarks', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, bookmarks: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2008,7 +2008,7 @@ app.post('/api/library/:id/bookmark', authMiddleware, async (req, res) => {
       res.json({ success: true, action: 'added', is_bookmarked: true });
     }
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2022,7 +2022,7 @@ app.delete('/api/library/:id', authMiddleware, async (req, res) => {
     if (result.rowCount === 0) return res.status(403).json({ success: false, message: "Unauthorized" });
     res.json({ success: true, message: "Resource deleted" });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2064,7 +2064,7 @@ app.post('/api/library/:id/downvote', authMiddleware, async (req, res) => {
     }
   } catch (error) {
     console.error('Downvote error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2367,7 +2367,7 @@ app.post('/api/timetable', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, entry: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2379,7 +2379,7 @@ app.get('/api/timetable', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, entries: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2447,7 +2447,7 @@ app.delete('/api/timetable/:id', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, message: 'Timetable entry deleted' });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2476,7 +2476,7 @@ app.post('/api/programs', authMiddleware, async (req, res) => {
     res.json({ success: true, program: result.rows[0] });
   } catch (error) {
     console.error('Create program error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2493,7 +2493,7 @@ app.get('/api/programs', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, programs: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2505,7 +2505,7 @@ app.get('/api/programs/:id/courses', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, courses: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2527,7 +2527,7 @@ app.post('/api/program-courses/bulk', authMiddleware, async (req, res) => {
     res.json({ success: true, imported: courses.length });
   } catch (error) {
     console.error('Bulk upload error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2627,7 +2627,7 @@ app.post('/api/timetable/import-from-program', authMiddleware, async (req, res) 
       clashes: clashes.rows
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2650,7 +2650,7 @@ app.get('/api/timetable/clashes', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, clashes: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2662,7 +2662,7 @@ app.post('/api/timetable/clashes/:clashId/resolve', authMiddleware, async (req, 
     );
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2685,7 +2685,7 @@ app.post('/api/classroom-locations', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, location: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2701,7 +2701,7 @@ app.get('/api/classroom-locations', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, locations: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2723,7 +2723,7 @@ app.get('/api/classroom-locations/:building/:room', authMiddleware, async (req, 
       res.json({ success: false, message: 'Location not found' });
     }
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2764,7 +2764,7 @@ app.post('/api/assignments', authMiddleware, async (req, res) => {
     
     res.json({ success: true, assignment: assignment });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2784,7 +2784,7 @@ app.get('/api/assignments', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, assignments: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2817,7 +2817,7 @@ app.patch('/api/assignments/:id', authMiddleware, async (req, res) => {
     
     res.json({ success: true, assignment: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2829,7 +2829,7 @@ app.delete('/api/assignments/:id', authMiddleware, async (req, res) => {
     );
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2843,7 +2843,7 @@ app.post('/api/assignments/cleanup', async (req, res) => {
     );
     res.json({ success: true, deleted: result.rows.length });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2872,7 +2872,7 @@ app.get('/api/school-events', authMiddleware, async (req, res) => {
     
     res.json({ success: true, events: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2897,7 +2897,7 @@ app.post('/api/school-events', authMiddleware, async (req, res) => {
     
     res.json({ success: true, event: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2906,7 +2906,7 @@ app.delete('/api/school-events/:id', authMiddleware, async (req, res) => {
     await pool.query('DELETE FROM school_events WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2968,7 +2968,7 @@ app.post('/api/exams', authMiddleware, async (req, res) => {
     
     res.json({ success: true, exam: exam });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -2984,7 +2984,7 @@ app.get('/api/exams', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, exams: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3002,7 +3002,7 @@ app.get('/api/exams/countdown', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, exams: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3014,7 +3014,7 @@ app.delete('/api/exams/:id', authMiddleware, async (req, res) => {
     );
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3083,7 +3083,7 @@ app.post('/api/exams/:examId/generate-study-plan', authMiddleware, async (req, r
     
     res.json({ success: true, studyPlan: plan });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3116,7 +3116,7 @@ app.get('/api/exams/:examId/study-plan', authMiddleware, async (req, res) => {
       tasks: tasksResult.rows 
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3136,7 +3136,7 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, notifications: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3148,7 +3148,7 @@ app.get('/api/notifications/unread-count', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, count: parseInt(result.rows[0].count) });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3160,7 +3160,7 @@ app.post('/api/notifications/:id/read', authMiddleware, async (req, res) => {
     );
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3176,7 +3176,7 @@ app.post('/api/notifications/process', async (req, res) => {
     
     res.json({ success: true, processed: result.rows.length, notifications: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3224,7 +3224,7 @@ app.post('/api/timetable/setup-notifications', authMiddleware, async (req, res) 
     
     res.json({ success: true, scheduled: scheduled });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3246,7 +3246,7 @@ app.post('/api/rideshare', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, request: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3262,7 +3262,7 @@ app.get('/api/rideshare', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, requests: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3276,7 +3276,7 @@ app.patch('/api/rideshare/:id/status', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, request: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3297,7 +3297,7 @@ app.post('/api/homework-help', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, helpRequest: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3312,7 +3312,7 @@ app.get('/api/homework-help', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, requests: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3331,7 +3331,7 @@ app.get('/api/homework-help/:id/responses', authMiddleware, async (req, res) => 
     );
     res.json({ success: true, responses: result.rows });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -3542,7 +3542,7 @@ app.post('/api/parse-timetable-pdf', authMiddleware, upload.single('pdf'), async
     console.error('[PDF] Error:', error.message);
     res.status(500).json({
       success: false,
-      error: error.message === 'TIMEOUT' ? 'Groq timed out. Try again.' : 'Failed: ' + error.message
+      message: error.message === 'TIMEOUT' ? 'Request timed out. Try again.' : 'Processing failed. Please try again.'
     });
   }
 });
@@ -4132,7 +4132,7 @@ app.post('/api/campus-pulse', authMiddleware, async (req, res) => {
         return res.json({ success: true, post: { ...rows[0], comment_count: 0, reactions: null } });
       } catch (e2) { return res.status(500).json({ success: false, error: e2.message }); }
     }
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4150,7 +4150,7 @@ app.post('/api/campus-pulse/:id/like', authMiddleware, async (req, res) => {
     await pool.query(`INSERT INTO campus_pulse_reactions(post_id,user_id,emoji) VALUES($1,$2,'👍')`, [req.params.id, req.user.userId]);
     await pool.query(`UPDATE campus_pulse_posts SET likes=likes+1 WHERE id=$1`, [req.params.id]);
     res.json({ success: true, action: 'liked' });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/campus-pulse/:id/react', authMiddleware, async (req, res) => {
@@ -4162,7 +4162,7 @@ app.post('/api/campus-pulse/:id/react', authMiddleware, async (req, res) => {
       [req.params.id, req.user.userId, emoji]
     );
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/campus-pulse/:id/comment', authMiddleware, async (req, res) => {
@@ -4176,7 +4176,7 @@ app.post('/api/campus-pulse/:id/comment', authMiddleware, async (req, res) => {
       [req.params.id, req.user.userId, text.trim(), name]
     );
     res.json({ success: true, comment: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.get('/api/campus-pulse/:id/comments', authMiddleware, async (req, res) => {
@@ -4186,14 +4186,14 @@ app.get('/api/campus-pulse/:id/comments', authMiddleware, async (req, res) => {
       [req.params.id]
     );
     res.json({ success: true, comments: rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.delete('/api/campus-pulse/:id', authMiddleware, async (req, res) => {
   try {
     await pool.query('DELETE FROM campus_pulse_posts WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -4209,7 +4209,7 @@ app.get('/api/grades/subjects', authMiddleware, async (req, res) => {
       [req.user.userId]
     );
     res.json({ success: true, subjects: subjects.map(s => ({ ...s, grades: s.grades || [] })) });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/grades/subjects', authMiddleware, async (req, res) => {
@@ -4221,7 +4221,7 @@ app.post('/api/grades/subjects', authMiddleware, async (req, res) => {
       [req.user.userId, name.trim(), code?.trim() || null, parseFloat(credits)||3, parseFloat(totalWeight)||100]
     );
     res.json({ success: true, subject: { ...rows[0], grades: [] } });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.put('/api/grades/subjects/:id', authMiddleware, async (req, res) => {
@@ -4234,14 +4234,14 @@ app.put('/api/grades/subjects/:id', authMiddleware, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ success: false, message: 'Not found' });
     res.json({ success: true, subject: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.delete('/api/grades/subjects/:id', authMiddleware, async (req, res) => {
   try {
     await pool.query('DELETE FROM grade_subjects WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/grades/subjects/:id/entries', authMiddleware, async (req, res) => {
@@ -4255,7 +4255,7 @@ app.post('/api/grades/subjects/:id/entries', authMiddleware, async (req, res) =>
       [req.params.id, name.trim(), parseFloat(pct), parseFloat(weight)||1]
     );
     res.json({ success: true, entry: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.delete('/api/grades/subjects/:subjectId/entries/:entryId', authMiddleware, async (req, res) => {
@@ -4264,7 +4264,7 @@ app.delete('/api/grades/subjects/:subjectId/entries/:entryId', authMiddleware, a
     if (!owned.length) return res.status(403).json({ success: false });
     await pool.query('DELETE FROM grade_entries WHERE id=$1 AND subject_id=$2', [req.params.entryId, req.params.subjectId]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -4298,7 +4298,7 @@ app.post('/api/migrate-v2', async (req, res) => {
     await seedBadges();
     res.json({ success: true, results });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4424,7 +4424,7 @@ app.get('/api/rewards/me', authMiddleware, async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4460,7 +4460,7 @@ app.get('/api/rewards/leaderboard', authMiddleware, async (req, res) => {
       myRank: parseInt(myRank.rows[0].rank),
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4478,7 +4478,7 @@ app.get('/api/rewards/badges', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, badges: result.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4496,7 +4496,7 @@ app.get('/api/rewards/history', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, history: result.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4556,7 +4556,7 @@ app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4592,7 +4592,7 @@ app.get('/api/users/search', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, users: result.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4634,7 +4634,7 @@ app.get('/api/users/:id/profile', authMiddleware, async (req, res) => {
       recentUploads: recentUploads.rows,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4659,7 +4659,7 @@ app.post('/api/users/:id/follow', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, following: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4676,7 +4676,7 @@ app.get('/api/users/me/followers', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, followers: result.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4693,7 +4693,7 @@ app.get('/api/users/me/following', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, following: result.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4735,7 +4735,7 @@ app.get('/api/messages/inbox', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, conversations: rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4770,7 +4770,7 @@ app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, messages: messages.rows, user: otherUser.rows[0] || null });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4800,7 +4800,7 @@ app.post('/api/messages', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, message: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4814,7 +4814,7 @@ app.delete('/api/messages/:id', authMiddleware, async (req, res) => {
     if (!result.rowCount) return res.status(403).json({ success: false, message: 'Not found or unauthorized' });
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4835,7 +4835,7 @@ app.get('/api/library/bounties', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, bounties: result.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4851,7 +4851,7 @@ app.post('/api/library/bounties', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, bounty: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4897,7 +4897,7 @@ app.post('/api/library/bounties/:id/fulfill', authMiddleware, async (req, res) =
     );
     res.json({ success: true, fulfillment: fulfillment.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4911,7 +4911,7 @@ app.delete('/api/library/bounties/:id', authMiddleware, async (req, res) => {
     if (!result.rowCount) return res.status(403).json({ success: false, message: 'Not found or unauthorized' });
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4941,7 +4941,7 @@ app.post('/api/school-events/:id/rsvp', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, rsvp: result.rows[0], counts: counts.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4962,7 +4962,7 @@ app.get('/api/school-events/:id/rsvps', authMiddleware, async (req, res) => {
       myStatus: myRsvp.rows[0]?.status || null,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4979,7 +4979,7 @@ app.post('/api/notifications/read-all', authMiddleware, async (req, res) => {
     );
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -4992,7 +4992,7 @@ app.delete('/api/notifications/:id', authMiddleware, async (req, res) => {
     );
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5017,7 +5017,7 @@ app.get('/api/marketplace/services/:id', authMiddleware, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ success: false, message: 'Service not found' });
     res.json({ success: true, service: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5039,7 +5039,7 @@ app.put('/api/marketplace/services/:id', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, service: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5059,7 +5059,7 @@ app.post('/api/marketplace/services/:id/images', authMiddleware, imageUpload.arr
     );
     res.json({ success: true, urls });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5078,7 +5078,7 @@ app.get('/api/marketplace/my-listings', authMiddleware, async (req, res) => {
     ]);
     res.json({ success: true, goods: goods.rows, services: services.rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5157,7 +5157,7 @@ app.post('/api/auth/login', async (req, res) => {
     });
   } catch (err) {
     console.error('Login error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5194,7 +5194,7 @@ app.get('/api/auth/profile', authMiddleware, async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5236,7 +5236,7 @@ app.post('/api/library', authMiddleware, libraryUpload.fields([
     res.json({ success: true, resource: result.rows[0] });
   } catch (err) {
     console.error('Library upload error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5353,7 +5353,7 @@ app.post('/api/library/folder', authMiddleware, folderUpload.any(), async (req, 
     });
   } catch (err) {
     console.error('Folder upload error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 const DRIVE_API_KEY = process.env.GOOGLE_DRIVE_API_KEY;
@@ -5429,7 +5429,7 @@ app.post('/api/library/drive', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, resource: { ...result.rows[0], drive_files: driveFiles }, fileCount: driveFiles.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5453,7 +5453,7 @@ app.get('/api/library/:id/drive-files', authMiddleware, async (req, res) => {
     let files = [];
     try { files = typeof r.drive_files === 'string' ? JSON.parse(r.drive_files) : (r.drive_files || []); } catch {}
     res.json({ success: true, files, fromCache: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
   const { id } = req.params;
@@ -5481,7 +5481,7 @@ app.post('/api/homework-help/:id/respond', authMiddleware, async (req, res) => {
     setImmediate(() => awardXP(req.user.userId, 'homework_answered', `help:${id}`));
     res.json({ success: true, response: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5506,7 +5506,7 @@ app.post('/api/study-groups', authMiddleware, async (req, res) => {
     setImmediate(() => awardXP(uid, 'study_group_created', `group:${group.id}`));
     res.json({ success: true, group });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5532,7 +5532,7 @@ app.post('/api/class-spaces/:id/join', authMiddleware, async (req, res) => {
     }
     res.json({ success: true, message: 'Joined class space' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5551,7 +5551,7 @@ app.post('/api/marketplace/goods', authMiddleware, imageUpload.array('images', 5
     setImmediate(() => awardXP(req.user.userId, 'item_listed', `good:${result.rows[0].id}`));
     res.json({ success: true, item: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5578,7 +5578,7 @@ app.post('/api/reviews', authMiddleware, async (req, res) => {
     setImmediate(() => awardXP(req.user.userId, 'review_given', `review:${review.id}`));
     res.json({ success: true, review: withUser.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5594,7 +5594,7 @@ app.post('/api/assignments/:id/submit', authMiddleware, async (req, res) => {
     setImmediate(() => awardXP(req.user.userId, 'assignment_submitted', `assignment:${req.params.id}`));
     res.json({ success: true, assignment: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5623,7 +5623,7 @@ app.post('/api/study-tasks/:taskId/complete', authMiddleware, async (req, res) =
     setImmediate(() => awardXP(req.user.userId, 'study_task_completed', `task:${req.params.taskId}`));
     res.json({ success: true, task: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5656,7 +5656,7 @@ app.post('/api/library/:id/upvote', authMiddleware, async (req, res) => {
     }
     res.json({ success: true, action: 'added' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5693,7 +5693,7 @@ app.post('/api/study-groups/:id/join', authMiddleware, async (req, res) => {
     setImmediate(() => awardXP(uid, 'study_group_joined', `group:${id}`));
     res.json({ success: true, message: 'Joined group' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5718,7 +5718,7 @@ app.post('/api/library/comments/:id/like', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, liked: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5742,7 +5742,7 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
     res.json({ success: true, user: result.rows[0], message: 'Profile updated' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5799,7 +5799,7 @@ app.post('/api/timetable/:id/attendance', authMiddleware, async (req, res) => {
       [uid, `Marked ${status} for class ${id} on ${classDate}`]
     ).catch(()=>{});
     res.json({ success: true, record: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.patch('/api/timetable/:id', authMiddleware, async (req, res) => {
@@ -5828,7 +5828,7 @@ app.patch('/api/timetable/:id', authMiddleware, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ success: false, message: 'Entry not found' });
     res.json({ success: true, entry: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5855,7 +5855,7 @@ app.get('/api/stats/platform', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5878,7 +5878,7 @@ app.get('/api/library/:id', authMiddleware, async (req, res) => {
     await pool.query('UPDATE library_resources SET downloads=downloads+1 WHERE id=$1', [req.params.id]);
     res.json({ success: true, resource: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -5947,7 +5947,7 @@ app.post('/api/migrate-v4', async (req, res) => {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS status_text    VARCHAR(100);
     `);
     res.json({ success: true, message: 'V4 migration complete' });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -5957,7 +5957,7 @@ app.get('/api/preferences', authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM user_preferences WHERE user_id=$1', [req.user.userId]);
     res.json({ success: true, preferences: rows[0] || null });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 app.put('/api/preferences', authMiddleware, async (req, res) => {
   const { studyStyle, noisePref, collabPref, interests, studyTimes, goals } = req.body;
@@ -5974,7 +5974,7 @@ app.put('/api/preferences', authMiddleware, async (req, res) => {
       await pool.query('UPDATE users SET interests=$1 WHERE id=$2', [JSON.stringify(interests), req.user.userId]);
     }
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 app.patch('/api/onboarding/complete', authMiddleware, async (req, res) => {
   const { university, programName, studyStyle, noisePref, collabPref, interests, studyTimes, goals } = req.body;
@@ -5996,7 +5996,7 @@ app.patch('/api/onboarding/complete', authMiddleware, async (req, res) => {
       );
     }
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -6006,7 +6006,7 @@ app.get('/api/tour', authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM user_tour_progress WHERE user_id=$1', [req.user.userId]);
     res.json({ success: true, tour: rows[0] || null });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 app.post('/api/tour/complete', authMiddleware, async (req, res) => {
   try {
@@ -6016,7 +6016,7 @@ app.post('/api/tour/complete', authMiddleware, async (req, res) => {
       [req.user.userId]
     );
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -6057,7 +6057,7 @@ app.post('/api/contacts/sync', authMiddleware, async (req, res) => {
     }
 
     res.json({ success: true, matches });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // GET /api/contacts/matches — get previously synced matches
@@ -6075,7 +6075,7 @@ app.get('/api/contacts/matches', authMiddleware, async (req, res) => {
       [req.user.userId]
     );
     res.json({ success: true, contacts: rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -6168,7 +6168,7 @@ app.get('/api/search', authMiddleware, async (req, res) => {
     }
 
     res.json({ success: true, results, query: q.trim() });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -6199,7 +6199,7 @@ app.get('/api/recommendations/people', authMiddleware, async (req, res) => {
       [uid, university, program_name]
     );
     res.json({ success: true, people: rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -6214,7 +6214,7 @@ const adminMiddleware = (req, res, next) => {
       if (!rows[0]?.is_admin) return res.status(403).json({ success: false, message: 'Admin access required' });
       next();
     })
-    .catch(e => res.status(500).json({ success: false, error: e.message }));
+    .catch(e => res.status(500).json({ success: false, message: 'Server error' }));
 };
 
 // POST /api/admin/make-admin  { userId } — dev only, no auth check
@@ -6226,7 +6226,7 @@ app.post('/api/admin/make-admin', async (req, res) => {
   try {
     await pool.query('UPDATE users SET is_admin=TRUE WHERE id=$1', [userId]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // GET /api/admin/stats
@@ -6256,7 +6256,7 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) =>
         totalGroups:     results[7].rows[0].total,
       }
     });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // GET /api/admin/users?limit=50&page=1
@@ -6276,7 +6276,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
     );
     const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS total FROM users`);
     res.json({ success: true, users: rows, total: cnt[0].total });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // POST /api/admin/upload-timetable — upload program timetable
@@ -6301,7 +6301,7 @@ app.post('/api/admin/upload-timetable', authMiddleware, adminMiddleware, async (
         for (const entry of timetableData.entries) {
           try {
             await pool.query(
-              `INSERT INTO timetables(user_id, day_of_week, start_time, end_time, title, location_name, color)
+              `INSERT INTO timetables(user_id, day_of_week, start_time, end_time, title, location, color)
                VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,
               [student.id, entry.day, entry.startTime, entry.endTime,
                entry.courseName, entry.location || null, entry.color || '#5b4efa']
@@ -6315,7 +6315,7 @@ app.post('/api/admin/upload-timetable', authMiddleware, adminMiddleware, async (
     }
 
     res.json({ success: true, upload: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // POST /api/admin/upload-material — upload course material for students
@@ -6339,7 +6339,7 @@ app.post('/api/admin/upload-material', authMiddleware, adminMiddleware, async (r
     }
 
     res.json({ success: true, upload: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // GET /api/admin/uploads — list all admin uploads
@@ -6351,7 +6351,7 @@ app.get('/api/admin/uploads', authMiddleware, adminMiddleware, async (req, res) 
        ORDER BY au.created_at DESC LIMIT 100`
     );
     res.json({ success: true, uploads: rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // DELETE /api/admin/uploads/:id
@@ -6359,7 +6359,7 @@ app.delete('/api/admin/uploads/:id', authMiddleware, adminMiddleware, async (req
   try {
     await pool.query('DELETE FROM admin_uploads WHERE id=$1', [req.params.id]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // POST /api/admin/announcement  — send notification to all users or specific program
@@ -6384,7 +6384,7 @@ app.post('/api/admin/announcement', authMiddleware, adminMiddleware, async (req,
       sent++;
     }
     res.json({ success: true, sent });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -6401,7 +6401,7 @@ app.post('/api/share/resource-dm', authMiddleware, async (req, res) => {
       [req.user.userId, recipientId, shareText]
     );
     res.json({ success: true, message: rows[0] });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 
@@ -6502,12 +6502,12 @@ app.get('/api/daily-quests', authMiddleware, async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
   try {
     await pool.query(`
-      INSERT INTO daily_quests (user_id, quest_type, label, target, progress, date) VALUES
-        ($1,'upload_resource','Upload a resource',1,0,$2),
-        ($1,'join_study_group','Join a study session',1,0,$2),
-        ($1,'send_message','Send 5 messages',5,0,$2),
-        ($1,'complete_task','Complete 3 tasks',3,0,$2),
-        ($1,'daily_login','Log in today',1,1,$2)
+      INSERT INTO daily_quests (user_id, quest_type, label, target, progress, xp_reward, date) VALUES
+        ($1,'upload_resource',  'Share a study resource',      1,0,100,$2),
+        ($1,'join_study_group', 'Join a study group session',  1,0, 40,$2),
+        ($1,'send_message',     'Send 5 messages to classmates',5,0, 25,$2),
+        ($1,'complete_task',    'Complete 3 tasks',             3,0, 30,$2),
+        ($1,'daily_login',      'Log in today',                 1,1, 10,$2)
       ON CONFLICT (user_id, quest_type, date) DO NOTHING`, [uid, today]);
     const { rows } = await pool.query(
       `SELECT * FROM daily_quests WHERE user_id=$1 AND date=$2 ORDER BY id`, [uid, today]);
@@ -6571,7 +6571,7 @@ app.post('/api/habits', authMiddleware, async (req, res) => {
       [req.user.userId, label.trim(), icon || '✅']
     );
     res.json({ success: true, habit: { ...rows[0], completed_today: false } });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.delete('/api/habits/:id', authMiddleware, async (req, res) => {
@@ -6653,7 +6653,7 @@ app.get('/api/dashboard', authMiddleware, async (req, res) => {
                   FROM users WHERE id=$1`, [uid]),
       pool.query(`SELECT id,title,due_date,status,subject FROM assignments
                   WHERE user_id=$1 AND status!='completed' ORDER BY due_date ASC LIMIT 6`, [uid]).catch(()=>({rows:[]})),
-      pool.query(`SELECT id,title,course_code,start_time,end_time,location_name,color
+      pool.query(`SELECT id,title,course_code,start_time,end_time,location AS location_name,color
                   FROM timetables
                   WHERE user_id=$1 AND day_of_week=EXTRACT(DOW FROM NOW())::int
                   ORDER BY start_time ASC LIMIT 6`, [uid]).catch(()=>({rows:[]})),
@@ -6727,6 +6727,8 @@ app.get('/api/suggestions', authMiddleware, async (req, res) => {
 app.get('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
   const { classId } = req.params;
   try {
+    // Self-heal: ensure column exists (runs fast when already present)
+    await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE`).catch(()=>{});
     const { rows } = await pool.query(`
       SELECT cm.*,u.full_name AS sender_name,
              COALESCE(u.profile_image_url, u.avatar_url) AS sender_avatar
@@ -6734,7 +6736,7 @@ app.get('/api/chat/class/:classId/messages', authMiddleware, async (req, res) =>
       WHERE cm.class_space_id=$1
       ORDER BY cm.created_at ASC LIMIT 200`, [classId]);
     res.json({ success: true, messages: rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.json({ success: true, messages: [] }); }
 });
 
 app.post('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
@@ -6743,12 +6745,14 @@ app.post('/api/chat/class/:classId/messages', authMiddleware, async (req, res) =
   const uid = req.user.userId;
   if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
   try {
+    await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE`).catch(()=>{});
     const { rows } = await pool.query(
       `INSERT INTO chat_messages (sender_id, class_space_id, message) VALUES ($1,$2,$3) RETURNING *`,
       [uid, classId, message.trim()]);
-    const members = await pool.query(
-      `SELECT user_id FROM class_space_members WHERE class_space_id=$1 AND user_id!=$2`, [classId, uid]);
-    const sender = await pool.query(`SELECT full_name FROM users WHERE id=$1`, [uid]);
+    const [members, sender] = await Promise.all([
+      pool.query(`SELECT user_id FROM class_space_members WHERE class_space_id=$1 AND user_id!=$2`, [classId, uid]),
+      pool.query(`SELECT full_name FROM users WHERE id=$1`, [uid]),
+    ]);
     const name = sender.rows[0]?.full_name || 'Someone';
     members.rows.forEach(m => createNotification(m.user_id, 'message', `New message in class`, `${name}: ${message.trim().slice(0,60)}`, classId));
     res.json({ success: true, message: rows[0] });
@@ -6831,7 +6835,7 @@ app.post('/api/chat/messages', authMiddleware, async (req, res) => {
     const sender = await pool.query(`SELECT full_name FROM users WHERE id=$1`, [uid]);
     createNotification(receiverId, 'message', `New message from ${sender.rows[0]?.full_name || 'Someone'}`, text.slice(0,80), uid);
     res.json({ success: true, message: rows[0] });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.get('/api/chat/unread-count', authMiddleware, async (req, res) => {
@@ -6932,7 +6936,7 @@ app.post('/api/focus/start', authMiddleware, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO focus_sessions (user_id,label) VALUES ($1,$2) RETURNING *`, [uid, label||'Focus session']);
     res.json({ success: true, session: rows[0] });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/focus/end', authMiddleware, async (req, res) => {
@@ -7013,7 +7017,7 @@ app.patch('/api/marketplace/offers/:offerId', authMiddleware, async (req, res) =
         `Your offer for "${offer.item_title}" was declined.`, offer.item_id);
     }
     res.json({ success: true, status });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.get('/api/marketplace/offers/:id', authMiddleware, async (req, res) => {
@@ -7042,7 +7046,7 @@ app.post('/api/programs/upload', authMiddleware, async (req, res) => {
       imported++;
     }
     res.json({ success: true, imported });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -7112,7 +7116,7 @@ app.post('/api/onboarding', authMiddleware, async (req, res) => {
       [uid]
     );
     res.json({ success: true, user });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ============================================================================
@@ -7143,7 +7147,7 @@ app.post('/api/tour/step', authMiddleware, async (req, res) => {
       [req.user.userId, JSON.stringify([stepId])]
     );
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ── PHONE CONTACTS LOOKUP ────────────────────────────────────────────────────
@@ -7171,7 +7175,7 @@ app.post('/api/contacts/find', authMiddleware, async (req, res) => {
       ).catch(()=>{});
     }
     res.json({ success: true, found: result.rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ── PEER RECOMMENDATIONS ─────────────────────────────────────────────────────
@@ -7203,12 +7207,20 @@ app.get('/api/recommendations/peers', authMiddleware, async (req, res) => {
       [req.user.userId, me.institution, me.department, me.year_of_study, me.study_style]
     );
     res.json({ success: true, peers: result.rows });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ── ADMIN EXAM SCHEDULES ──────────────────────────────────────────────────────
 app.post('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
+  // Self-heal: ensure admin_exam_schedules table exists
+  await pool.query(`CREATE TABLE IF NOT EXISTS admin_exam_schedules (
+    id SERIAL PRIMARY KEY, admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255), institution VARCHAR(255), department VARCHAR(255),
+    program VARCHAR(255), year_level VARCHAR(20), semester VARCHAR(50),
+    academic_year VARCHAR(20), exams JSONB DEFAULT '[]', is_published BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW())`).catch(()=>{});
+
   // Accept both camelCase (from AdminPanel) and snake_case field names
   const {
     title, institution, department, program,
@@ -7276,7 +7288,7 @@ app.post('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
     res.json({ success: true, schedule: rows[0], studentsUpdated: matchUsers?.rowCount || 0, examsPushed: pushed });
   } catch (e) {
     console.error('admin exam schedule:', e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -7289,7 +7301,7 @@ app.get('/api/admin/exam-schedules', authMiddleware, async (req, res) => {
       FROM admin_exam_schedules
       ORDER BY created_at DESC`);
     res.json({ success: true, schedules: rows, uploads: rows.map(r => ({...r, type:'exam_schedule'})) });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ── MY EXAM SCHEDULE ──────────────────────────────────────────────────────────
@@ -7315,14 +7327,14 @@ app.post('/api/homework-responses/:id/upvote', authMiddleware, async (req, res) 
   try {
     await pool.query('UPDATE homework_responses SET upvotes=upvotes+1 WHERE id=$1', [req.params.id]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/homework-help/:id/mark-answered', authMiddleware, async (req, res) => {
   try {
     await pool.query("UPDATE homework_help SET status='answered' WHERE id=$1 AND student_id=$2", [req.params.id, req.user.userId]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 
@@ -7334,7 +7346,7 @@ app.get('/api/me/status', authMiddleware, async (req, res) => {
   try {
     const [userRes, notifRes, dmRes] = await Promise.all([
       pool.query(`SELECT xp_points, level, login_streak FROM users WHERE id=$1`, [uid]),
-      pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE user_id=$1 AND (read IS NULL OR read=false) AND scheduled_time <= NOW()`, [uid]),
+      pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE user_id=$1 AND (is_read IS NULL OR is_read=false OR (read IS NOT NULL AND read=false)) AND (scheduled_time IS NULL OR scheduled_time <= NOW())`, [uid]),
       pool.query(`SELECT COUNT(*)::int AS count FROM direct_messages WHERE receiver_id=$1 AND is_read=false`, [uid]),
     ]);
     const u = userRes.rows[0] || {};
@@ -7346,7 +7358,7 @@ app.get('/api/me/status', authMiddleware, async (req, res) => {
       notifCount:  notifRes.rows[0]?.count || 0,
       dmCount:     dmRes.rows[0]?.count   || 0,
     });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.use((req, res) => {
