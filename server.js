@@ -137,13 +137,32 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ✅ FIXED: Rate limiter with proper proxy config
+// Generous limit for general API (300/15min ≈ 20/min — handles active multi-tab usage)
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // 100 requests per window
+  windowMs: 15 * 60 * 1000,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    // Never rate-limit status poll, heartbeat, or health check
+    const exempt = ['/api/me/status', '/api/user/heartbeat', '/api/health', '/api/keep-alive'];
+    return exempt.includes(req.path);
+  },
+  message: { success: false, message: 'Too many requests, please slow down.' },
 });
+
+// Strict limit for auth endpoints (20/15min — prevents brute force)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many auth attempts, please wait.' },
+});
+
 app.use('/api/', limiter);
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
 // ============================================
 // FILE UPLOAD SETUP - MEMORY STORAGE
@@ -858,6 +877,47 @@ setImmediate(async () => {
       is_expert_response BOOLEAN DEFAULT FALSE, helpful_count INTEGER DEFAULT 0,
       upvotes INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
+    // ── Gamification tables (safe to re-run — IF NOT EXISTS) ──────────────
+    `CREATE TABLE IF NOT EXISTS badges (
+      id SERIAL PRIMARY KEY, slug VARCHAR(60) UNIQUE NOT NULL,
+      name VARCHAR(100) NOT NULL, description TEXT, icon VARCHAR(10),
+      tier VARCHAR(20) DEFAULT 'bronze', xp_reward INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
+    `CREATE TABLE IF NOT EXISTS user_badges (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      badge_id INTEGER REFERENCES badges(id) ON DELETE CASCADE,
+      earned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, badge_id))`,
+    `CREATE TABLE IF NOT EXISTS point_transactions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      action VARCHAR(60) NOT NULL, points INTEGER NOT NULL,
+      reference TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
+    `CREATE TABLE IF NOT EXISTS user_follows (
+      id SERIAL PRIMARY KEY,
+      follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(follower_id, following_id))`,
+    `CREATE TABLE IF NOT EXISTS friendships (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      friend_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      status VARCHAR(20) DEFAULT 'accepted',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, friend_id))`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS xp_points INTEGER DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS level VARCHAR(20) DEFAULT 'Bronze'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS login_streak INTEGER DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_date DATE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation_score INTEGER DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS rank_percentile NUMERIC(5,2) DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS social_pref VARCHAR(50)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(30)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS student_id VARCHAR(50)`,
   ];
   let ok = 0, fail = 0;
   for (const sql of v4) {
@@ -899,37 +959,57 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Student ID already registered' });
     }
 
-    // 3. Check if Phone Number exists
-    const phoneCheck = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
-    if (phoneCheck.rows.length > 0) {
-      return res.status(400).json({ success: false, message: 'Phone number already linked to an account' });
+    // 3. Check phone uniqueness only if phone provided
+    if (phone && phone.trim()) {
+      const phoneCheck = await pool.query('SELECT id FROM users WHERE phone = $1', [phone.trim()]);
+      if (phoneCheck.rows.length > 0) {
+        return res.status(400).json({ success: false, message: 'Phone number already linked to an account' });
+      }
     }
-    
+
     // 4. Create User
     const passwordHash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password_hash, full_name, student_id, institution, phone, is_course_rep) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, email, full_name, student_id, institution, phone, is_course_rep',
-      [email, passwordHash, fullName, studentId, institution, phone, isCourseRep || false]
+      `INSERT INTO users (email, password_hash, full_name, student_id, institution, phone, is_course_rep,
+                          xp_points, level, login_streak, last_login_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7, 1,'Bronze',1,CURRENT_DATE)
+       RETURNING id, email, full_name, student_id, institution, phone, is_course_rep, xp_points, level`,
+      [email.toLowerCase().trim(), passwordHash, fullName?.trim(), studentId?.trim()||null,
+       institution?.trim()||null, phone?.trim()||null, isCourseRep || false]
     );
-    
+
     const user = result.rows[0];
+    // Non-blocking: seed daily login quest completion
+    setImmediate(() => {
+      pool.query(
+        `INSERT INTO daily_quests (user_id,quest_type,label,target,progress,xp_reward,date)
+         VALUES ($1,'daily_login','Log in today',1,1,10,CURRENT_DATE) ON CONFLICT DO NOTHING`,
+        [user.id]
+      ).catch(()=>{});
+    });
+
     const token = jwt.sign(
       { userId: user.id, email: user.email },
       process.env.JWT_SECRET || 'sh_jwt_secret_2025',
       { expiresIn: '7d' }
     );
-    
-    res.json({ 
-      success: true, 
-      token, 
+
+    res.json({
+      success: true,
+      token,
       user: {
-        id: user.id,
-        email: user.email,
-        fullName: user.full_name,
-        studentId: user.student_id,
-        institution: user.institution,
-        phone: user.phone,
-        isCourseRep: user.is_course_rep
+        id:                   user.id,
+        email:                user.email,
+        fullName:             user.full_name,
+        studentId:            user.student_id,
+        institution:          user.institution,
+        phone:                user.phone,
+        isCourseRep:          user.is_course_rep,
+        xpPoints:             user.xp_points || 1,
+        level:                user.level || 'Bronze',
+        loginStreak:          1,
+        onboarding_completed: false,
+        onboarded:            false,
       }
     });
   } catch (error) {
@@ -948,7 +1028,7 @@ app.get('/api/auth/stats', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
 
-    const [rankRes, classesRes, resourcesRes, groupsRes, itemsRes, reviewsRes, ratingRes, loginRes] = await Promise.all([
+    const [rankRes, classesRes, resourcesRes, groupsRes, itemsRes, reviewsRes, ratingRes, loginRes, answersRes] = await Promise.all([
       pool.query(`
         SELECT
           u.xp_points AS total_rep,
@@ -962,6 +1042,7 @@ app.get('/api/auth/stats', authMiddleware, async (req, res) => {
       pool.query(`SELECT COUNT(*)::int AS c FROM reviews WHERE reviewed_user_id=$1`, [userId]),
       pool.query(`SELECT COALESCE(AVG(rating),0)::numeric(10,1) AS avg FROM reviews WHERE reviewed_user_id=$1`, [userId]),
       pool.query(`SELECT login_streak FROM users WHERE id=$1`, [userId]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM homework_responses WHERE responder_id=$1`, [userId]).catch(()=>({rows:[{c:0}]})),
     ]);
 
     const rank = rankRes.rows[0] || {};
@@ -974,15 +1055,16 @@ app.get('/api/auth/stats', authMiddleware, async (req, res) => {
     res.json({
       success: true,
       stats: {
-        classesJoined:    classesRes.rows[0].c,
+        classesJoined:     classesRes.rows[0].c,
         resourcesUploaded: resourcesRes.rows[0].c,
-        studyGroups:      groupsRes.rows[0].c,
-        itemsSold:        itemsRes.rows[0].c,
-        reviewsReceived:  reviewsRes.rows[0].c,
-        avgRating:        parseFloat(ratingRes.rows[0].avg),
-        reputation:       total_rep,
-        uploads:          resourcesRes.rows[0].c,
-        loginStreak:      loginRes.rows[0]?.login_streak || 0,
+        studyGroups:       groupsRes.rows[0].c,
+        itemsSold:         itemsRes.rows[0].c,
+        reviewsReceived:   reviewsRes.rows[0].c,
+        answersGiven:      answersRes.rows[0].c,
+        avgRating:         parseFloat(ratingRes.rows[0].avg),
+        reputation:        total_rep,
+        uploads:           resourcesRes.rows[0].c,
+        loginStreak:       loginRes.rows[0]?.login_streak || 0,
         percentile,
       }
     });
@@ -1156,33 +1238,49 @@ app.post('/api/marketplace/goods/:id/favorite', authMiddleware, async (req, res)
 
 app.post('/api/auth/onboarding', authMiddleware, async (req, res) => {
   const userId = req.user.userId;
-  const { programme, year, subjects, study_style, study_times, goals } = req.body;
+  const {
+    programme, year, subjects, study_style, study_times, goals,
+    department, yearOfStudy, phone, bio,
+    noisePref, collabPref, interests, studyStyle, studyTimes,
+    onboardingComplete,
+  } = req.body;
+
+  // Normalise: accept camelCase or snake_case
+  const prog   = programme || req.body.program || null;
+  const yr     = year || yearOfStudy || null;
+  const subs   = Array.isArray(subjects) ? subjects : (subjects ? JSON.parse(subjects) : []);
+  const style  = studyStyle || study_style || null;
+  const times  = Array.isArray(study_times) ? study_times : (studyTimes ? JSON.parse(studyTimes) : study_times || []);
+  const goalsA = Array.isArray(goals) ? goals : (goals ? JSON.parse(goals) : []);
+  const dept   = department || null;
+  const intsA  = Array.isArray(interests) ? interests : (interests ? JSON.parse(interests) : []);
 
   try {
-    await pool.query(
+    const { rows } = await pool.query(
       `UPDATE users SET
-         programme     = $1,
-         year_of_study = $2,
-         subjects      = $3,
-         study_style   = $4,
-         study_times   = $5,
-         goals         = $6,
-         onboarded_at  = NOW(),
-         updated_at    = NOW()
-       WHERE id = $7`,
-      [
-        programme || null,
-        year      || null,
-        subjects  || [],
-        study_style || null,
-        study_times || [],
-        goals     || [],
-        userId,
-      ]
+         programme          = COALESCE($1, programme),
+         year_of_study      = COALESCE($2, year_of_study),
+         subjects           = $3,
+         study_style        = COALESCE($4, study_style),
+         study_times        = $5,
+         goals              = $6,
+         department         = COALESCE($7, department),
+         phone              = COALESCE($8, phone),
+         bio                = COALESCE($9, bio),
+         social_pref        = COALESCE($10, social_pref),
+         interests          = $11,
+         onboarding_complete= TRUE,
+         onboarded_at       = COALESCE(onboarded_at, NOW()),
+         updated_at         = NOW()
+       WHERE id = $12
+       RETURNING id, email, full_name, department, year_of_study, programme,
+                 institution, xp_points, level, login_streak, onboarding_complete, onboarded_at`,
+      [prog, yr, subs, style, times, goalsA, dept, phone||null, bio||null, collabPref||null, intsA, userId]
     );
-    res.json({ success: true, message: 'Profile saved' });
+    if (!rows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({ success: true, user: { ...rows[0], onboarding_completed: true }, message: 'Profile saved' });
   } catch (err) {
-    console.error('Onboarding save error:', err);
+    console.error('Onboarding save error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to save profile' });
   }
 });
@@ -6091,9 +6189,9 @@ app.get('/api/search', authMiddleware, async (req, res) => {
 
     if (type === 'all' || type === 'users') {
       const { rows } = await pool.query(
-        `SELECT id, full_name, profile_image_url, university, program_name, xp_points, status_emoji,
+        `SELECT id, full_name, profile_image_url, institution, programme, xp_points, level,
                 EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$2 AND following_id=u.id) AS is_following
-         FROM users u WHERE full_name ILIKE $1 AND id!=$2 LIMIT 8`,
+         FROM users u WHERE (full_name ILIKE $1 OR institution ILIKE $1) AND id!=$2 LIMIT 8`,
         [term, uid]
       );
       results.users = rows;
@@ -6976,13 +7074,26 @@ app.get('/api/focus/active', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/focus/stats', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
   try {
-    const { rows } = await pool.query(`
-      SELECT COUNT(*)::int AS total_sessions,
+    const [allTime, today, week] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total_sessions,
         COALESCE(SUM(duration_minutes),0)::int AS total_minutes,
-        COALESCE(AVG(duration_minutes),0)::int AS avg_minutes
-      FROM focus_sessions WHERE user_id=$1 AND is_active=false`, [req.user.userId]);
-    res.json({ success: true, stats: rows[0] });
+        COALESCE(AVG(duration_minutes),0)::numeric(10,1) AS avg_minutes
+        FROM focus_sessions WHERE user_id=$1 AND is_active=false`, [uid]),
+      pool.query(`SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(ended_at,NOW()),NOW())-started_at))),0)::int AS today_secs
+        FROM focus_sessions WHERE user_id=$1 AND DATE(started_at)=CURRENT_DATE`, [uid]),
+      pool.query(`SELECT COUNT(*)::int AS week_sessions,
+        COALESCE(SUM(duration_minutes)*60,0)::int AS week_secs
+        FROM focus_sessions WHERE user_id=$1 AND is_active=false
+        AND started_at >= NOW() - INTERVAL '7 days'`, [uid]),
+    ]);
+    res.json({ success: true, stats: {
+      ...allTime.rows[0],
+      today_secs:    today.rows[0]?.today_secs || 0,
+      week_sessions: week.rows[0]?.week_sessions || 0,
+      week_secs:     week.rows[0]?.week_secs || 0,
+    }});
   } catch { res.json({ success: true, stats: {} }); }
 });
 
@@ -7182,32 +7293,49 @@ app.post('/api/contacts/find', authMiddleware, async (req, res) => {
 app.get('/api/recommendations/peers', authMiddleware, async (req, res) => {
   try {
     const meResult = await pool.query(
-      'SELECT institution, department, year_of_study, study_style, social_pref, interests FROM users WHERE id=$1',
+      'SELECT institution, department, year_of_study, study_style, social_pref, interests, programme FROM users WHERE id=$1',
       [req.user.userId]
     );
     const me = meResult.rows[0];
     if (!me) return res.json({ success: true, peers: [] });
 
-    // Algorithm: score by shared institution + dept + year + interests
-    const result = await pool.query(
+    // Build scoring query — works even if institution is null (broadens to all users)
+    const hasInstitution = !!(me.institution && me.institution.trim());
+    const { rows } = await pool.query(
       `SELECT u.id, u.full_name, u.profile_image_url, u.department, u.institution,
-              u.year_of_study, u.study_style, u.xp_points, u.level, u.bio,
+              u.year_of_study, u.study_style, u.xp_points, u.level, u.bio, u.programme,
               EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND following_id=u.id) AS is_following,
-              (CASE WHEN u.institution=$2 THEN 3 ELSE 0 END +
-               CASE WHEN u.department=$3 THEN 3 ELSE 0 END +
-               CASE WHEN u.year_of_study=$4 THEN 2 ELSE 0 END +
-               CASE WHEN u.study_style=$5 THEN 1 ELSE 0 END) AS match_score
+              (
+                CASE WHEN $2::text IS NOT NULL AND u.institution ILIKE $2 THEN 30 ELSE 0 END +
+                CASE WHEN $3::text IS NOT NULL AND u.department   ILIKE $3 THEN 25 ELSE 0 END +
+                CASE WHEN $4::text IS NOT NULL AND u.year_of_study=$4         THEN 20 ELSE 0 END +
+                CASE WHEN $5::text IS NOT NULL AND u.study_style  =$5         THEN 15 ELSE 0 END
+              ) AS match_score
        FROM users u
        WHERE u.id != $1
-         AND u.institution = $2
-         AND u.onboarding_complete = TRUE
+         AND ($2::text IS NULL OR u.institution ILIKE $2)
          AND u.id NOT IN (SELECT following_id FROM user_follows WHERE follower_id=$1)
        ORDER BY match_score DESC, u.xp_points DESC
-       LIMIT 15`,
-      [req.user.userId, me.institution, me.department, me.year_of_study, me.study_style]
+       LIMIT 20`,
+      [req.user.userId, hasInstitution ? `%${me.institution}%` : null,
+       me.department || null, me.year_of_study || null, me.study_style || null]
     );
-    res.json({ success: true, peers: result.rows });
-  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
+
+    // Build human-readable match reasons
+    const peers = rows.map(u => {
+      const reasons = [];
+      if (me.institution && u.institution && u.institution.toLowerCase().includes(me.institution.toLowerCase())) reasons.push('Same university');
+      if (me.department && u.department === me.department) reasons.push(u.department);
+      if (me.year_of_study && u.year_of_study === me.year_of_study) reasons.push(`Year ${u.year_of_study}`);
+      if (me.study_style && u.study_style === me.study_style) reasons.push(`${u.study_style} learner`);
+      return { ...u, match_reasons: reasons, match_score: parseInt(u.match_score) || 0 };
+    }).filter(u => u.match_score > 0 || rows.length < 5); // show anyone if matches are scarce
+
+    res.json({ success: true, peers });
+  } catch (e) {
+    console.error('peer recs:', e.message);
+    res.json({ success: true, peers: [] });
+  }
 });
 
 // ── ADMIN EXAM SCHEDULES ──────────────────────────────────────────────────────
