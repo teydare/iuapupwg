@@ -1884,6 +1884,29 @@ app.post('/api/class-spaces/:id/resources', authMiddleware, documentUpload.singl
   }
 });
 
+app.get('/api/class-spaces/:id/assignments', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Get the course code for this class space
+    const cs = await pool.query(`SELECT course_code FROM class_spaces WHERE id=$1`, [id]);
+    const courseCode = cs.rows[0]?.course_code;
+    if (!courseCode) return res.json({ success: true, assignments: [] });
+    // Return assignments belonging to any member of this class that match the course code
+    const { rows } = await pool.query(
+      `SELECT a.id, a.title, a.due_date, a.status, a.priority, a.subject,
+              u.full_name AS creator_name
+       FROM assignments a
+       JOIN class_space_members csm ON csm.user_id = a.user_id AND csm.class_space_id = $2
+       JOIN users u ON u.id = a.user_id
+       WHERE (a.subject ILIKE $1 OR a.subject ILIKE $3)
+         AND a.status != 'completed'
+       ORDER BY a.due_date ASC NULLS LAST LIMIT 20`,
+      [`%${courseCode}%`, id, `%${courseCode.replace(/\d+/,'').trim()}%`]
+    );
+    res.json({ success: true, assignments: rows });
+  } catch { res.json({ success: true, assignments: [] }); }
+});
+
 app.get('/api/class-spaces/:id/resources', authMiddleware, async (req, res) => {
   const { id } = req.params;
   
