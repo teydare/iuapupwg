@@ -7495,21 +7495,35 @@ app.post('/api/homework-help/:id/mark-answered', authMiddleware, async (req, res
 app.get('/api/me/status', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
   try {
+    // Each sub-query is isolated — one schema mismatch won't crash the whole endpoint
     const [userRes, notifRes, dmRes] = await Promise.all([
-      pool.query(`SELECT xp_points, level, login_streak FROM users WHERE id=$1`, [uid]),
-      pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE user_id=$1 AND (is_read IS NULL OR is_read=false OR (read IS NOT NULL AND read=false)) AND (scheduled_time IS NULL OR scheduled_time <= NOW())`, [uid]),
-      pool.query(`SELECT COUNT(*)::int AS count FROM direct_messages WHERE receiver_id=$1 AND is_read=false`, [uid]),
+      pool.query(`SELECT xp_points, level, login_streak FROM users WHERE id=$1`, [uid])
+        .catch(() => ({ rows: [{}] })),
+      pool.query(
+        `SELECT COUNT(*)::int AS count FROM notifications
+         WHERE user_id=$1
+           AND (is_read IS NULL OR is_read=false OR (read IS NOT NULL AND read=false))
+           AND (scheduled_time IS NULL OR scheduled_time <= NOW())`,
+        [uid]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+      pool.query(
+        `SELECT COUNT(*)::int AS count FROM direct_messages WHERE receiver_id=$1 AND is_read=false`,
+        [uid]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
     ]);
     const u = userRes.rows[0] || {};
     res.json({
-      success: true,
-      xp:          u.xp_points   || 0,
-      level:       u.level       || 'Bronze',
-      streak:      u.login_streak|| 0,
-      notifCount:  notifRes.rows[0]?.count || 0,
-      dmCount:     dmRes.rows[0]?.count   || 0,
+      success:    true,
+      xp:         u.xp_points    || 0,
+      level:      u.level        || 'Bronze',
+      streak:     u.login_streak || 0,
+      notifCount: notifRes.rows[0]?.count || 0,
+      dmCount:    dmRes.rows[0]?.count    || 0,
     });
-  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
+  } catch (e) {
+    console.error('/api/me/status error:', e.message);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
 app.use((req, res) => {
