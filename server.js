@@ -4187,47 +4187,47 @@ setImmediate(async () => {
 
 app.get('/api/campus-pulse', authMiddleware, async (req, res) => {
   const { category, sort = 'hot', limit = 50 } = req.query;
+  const uid = req.user.userId;
   try {
-    // Ensure table exists (safe for pooler — CREATE IF NOT EXISTS is idempotent)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS campus_pulse_posts (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        category VARCHAR(40) NOT NULL DEFAULT 'general', text TEXT NOT NULL,
-        is_anonymous BOOLEAN DEFAULT TRUE, author_name VARCHAR(100) DEFAULT 'Anonymous',
-        is_pinned BOOLEAN DEFAULT FALSE, likes INTEGER DEFAULT 0,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )`).catch(()=>{});
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS campus_pulse_reactions (
-        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL,
-        UNIQUE(post_id, user_id, emoji)
-      )`).catch(()=>{});
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS campus_pulse_comments (
-        id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL,
-        author_name VARCHAR(100) DEFAULT 'Anonymous', created_at TIMESTAMPTZ DEFAULT NOW()
-      )`).catch(()=>{});
+    // Get the current user's institution so we only show their campus posts
+    const instRes = await pool.query('SELECT institution FROM users WHERE id=$1', [uid]);
+    const institution = instRes.rows[0]?.institution || null;
 
     let q = `
       SELECT p.*,
         (SELECT COUNT(*) FROM campus_pulse_comments c WHERE c.post_id = p.id) AS comment_count,
+        EXISTS(SELECT 1 FROM campus_pulse_reactions WHERE post_id=p.id AND user_id=$1 AND emoji='👍') AS liked,
         (SELECT json_agg(json_build_object('emoji',emoji,'count',cnt)) FROM
           (SELECT emoji, COUNT(*) AS cnt FROM campus_pulse_reactions WHERE post_id=p.id GROUP BY emoji) r
         ) AS reactions
       FROM campus_pulse_posts p
-      WHERE 1=1 `;
-    const params = [];
+      JOIN users u ON u.id = p.user_id
+      WHERE 1=1`;
+    const params = [uid];
+
+    // Filter by institution if the user has one set
+    if (institution) {
+      params.push(institution);
+      q += ` AND u.institution = $${params.length}`;
+    }
     if (category && category !== 'all') { params.push(category); q += ` AND p.category = $${params.length}`; }
-    if (sort === 'hot')  q += ` ORDER BY (p.likes * 2 + comment_count) DESC, p.created_at DESC`;
-    else if (sort === 'new') q += ` ORDER BY p.created_at DESC`;
-    else if (sort === 'top') q += ` ORDER BY p.likes DESC`;
-    else q += ` ORDER BY p.created_at DESC`;
+
+    if (sort === 'hot')  q += ` ORDER BY p.is_pinned DESC, (p.likes * 2 + comment_count) DESC, p.created_at DESC`;
+    else if (sort === 'new') q += ` ORDER BY p.is_pinned DESC, p.created_at DESC`;
+    else if (sort === 'top') q += ` ORDER BY p.is_pinned DESC, p.likes DESC`;
+    else q += ` ORDER BY p.is_pinned DESC, p.created_at DESC`;
+
     params.push(parseInt(limit)); q += ` LIMIT $${params.length}`;
     const { rows } = await pool.query(q, params);
+
+    // Add no-cache headers so 304 never serves stale empty data
+    res.set('Cache-Control', 'no-store');
     res.json({ success: true, posts: rows });
-  } catch (e) { res.json({ success: true, posts: [] }); }
+  } catch (e) {
+    console.error('GET /api/campus-pulse error:', e.message);
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, posts: [] });
+  }
 });
 
 app.post('/api/campus-pulse', authMiddleware, async (req, res) => {
@@ -4866,15 +4866,18 @@ app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
   if (isNaN(other)) return res.status(400).json({ success: false, message: 'Invalid user ID' });
   try {
+    // Mark received messages as read — ignore if columns missing
     await pool.query(
       `UPDATE direct_messages SET is_read=true, read_at=NOW()
        WHERE sender_id=$1 AND receiver_id=$2 AND is_read=false`,
       [other, uid]
-    );
+    ).catch(() => {});
+
     const messages = await pool.query(
       `SELECT dm.id, dm.sender_id, dm.receiver_id,
               dm.content AS message, dm.content,
-              dm.is_read, dm.created_at,
+              COALESCE(dm.is_read, false) AS is_read,
+              dm.created_at,
               u.full_name AS sender_name,
               COALESCE(u.profile_image_url, u.avatar_url) AS sender_image
        FROM direct_messages dm
@@ -4891,6 +4894,7 @@ app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
     );
     res.json({ success: true, messages: messages.rows, user: otherUser.rows[0] || null });
   } catch (err) {
+    console.error('GET /api/messages/:userId error:', err.message);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
@@ -7494,36 +7498,33 @@ app.post('/api/homework-help/:id/mark-answered', authMiddleware, async (req, res
 // One request every 3 min instead of 3 requests every 60-120s
 app.get('/api/me/status', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
+  let xp = 0, level = 'Bronze', streak = 0, notifCount = 0, dmCount = 0;
+
   try {
-    // Each sub-query is isolated — one schema mismatch won't crash the whole endpoint
-    const [userRes, notifRes, dmRes] = await Promise.all([
-      pool.query(`SELECT xp_points, level, login_streak FROM users WHERE id=$1`, [uid])
-        .catch(() => ({ rows: [{}] })),
-      pool.query(
-        `SELECT COUNT(*)::int AS count FROM notifications
-         WHERE user_id=$1
-           AND (is_read IS NULL OR is_read=false OR (read IS NOT NULL AND read=false))
-           AND (scheduled_time IS NULL OR scheduled_time <= NOW())`,
-        [uid]
-      ).catch(() => ({ rows: [{ count: 0 }] })),
-      pool.query(
-        `SELECT COUNT(*)::int AS count FROM direct_messages WHERE receiver_id=$1 AND is_read=false`,
-        [uid]
-      ).catch(() => ({ rows: [{ count: 0 }] })),
-    ]);
-    const u = userRes.rows[0] || {};
-    res.json({
-      success:    true,
-      xp:         u.xp_points    || 0,
-      level:      u.level        || 'Bronze',
-      streak:     u.login_streak || 0,
-      notifCount: notifRes.rows[0]?.count || 0,
-      dmCount:    dmRes.rows[0]?.count    || 0,
-    });
-  } catch (e) {
-    console.error('/api/me/status error:', e.message);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+    const ur = await pool.query(
+      `SELECT COALESCE(xp_points,0) AS xp,
+              COALESCE(level,'Bronze') AS level,
+              COALESCE(login_streak,0) AS streak
+       FROM users WHERE id=$1`, [uid]);
+    if (ur.rows[0]) { xp = ur.rows[0].xp; level = ur.rows[0].level; streak = ur.rows[0].streak; }
+  } catch(e) { console.error('me/status users query:', e.message); }
+
+  try {
+    const nr = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM notifications
+       WHERE user_id=$1
+         AND (is_read IS NULL OR is_read=false OR (read IS NOT NULL AND read=false))
+         AND (scheduled_time IS NULL OR scheduled_time <= NOW())`, [uid]);
+    notifCount = nr.rows[0]?.count || 0;
+  } catch(e) { console.error('me/status notif query:', e.message); }
+
+  try {
+    const dr = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM direct_messages WHERE receiver_id=$1 AND is_read=false`, [uid]);
+    dmCount = dr.rows[0]?.count || 0;
+  } catch(e) { console.error('me/status dm query:', e.message); }
+
+  res.json({ success: true, xp, level, streak, notifCount, dmCount });
 });
 
 app.use((req, res) => {
@@ -7631,4 +7632,511 @@ app.listen(PORT, () => {
 // CLOSING
 // ============================================================================
 });
+});
+
+// ============================================================================
+// EXPONENTIAL GROWTH — NEW ROUTES
+// ============================================================================
+
+// ── AI PROXY (Haiku for chat/quizzes, Sonnet for analysis) ──────────────────
+const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
+const AI_HEADERS = {
+  'Content-Type': 'application/json',
+  'x-api-key': process.env.ANTHROPIC_API_KEY || '',
+  'anthropic-version': '2023-06-01',
+};
+
+async function callClaude(model, system, userMsg, maxTokens = 800) {
+  const res = await fetch(ANTHROPIC_API, {
+    method: 'POST',
+    headers: AI_HEADERS,
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: userMsg }],
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || 'AI error');
+  return data.content[0]?.text || '';
+}
+
+// POST /api/ai/tutor — AI Study Tutor (Haiku — fast & cheap)
+app.post('/api/ai/tutor', authMiddleware, async (req, res) => {
+  const { message, mode = 'explain', subject, history = [] } = req.body;
+  if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
+  const systemPrompts = {
+    explain:   `You are a patient, encouraging university tutor. Explain concepts clearly with examples. Keep responses focused and under 300 words. Subject context: ${subject || 'general'}`,
+    quiz:      `You are a quiz master. Given a topic, generate 3 multiple-choice questions with 4 options each. Format: Q: [question]\nA) [opt]\nB) [opt]\nC) [opt]\nD) [opt]\nAnswer: [letter]. Subject: ${subject || 'general'}`,
+    practice:  `You are a practice problem generator. Create a realistic exam-style problem with full worked solution. Subject: ${subject || 'general'}`,
+    socratic:  `You are a Socratic tutor. Guide the student to the answer by asking probing questions. Never give the answer directly — help them discover it. Subject: ${subject || 'general'}`,
+  };
+  try {
+    const msgs = [...history.slice(-6), { role: 'user', content: message }];
+    const resp = await fetch(ANTHROPIC_API, {
+      method: 'POST', headers: AI_HEADERS,
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001', max_tokens: 600,
+        system: systemPrompts[mode] || systemPrompts.explain,
+        messages: msgs,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error?.message || 'AI error');
+    res.json({ success: true, reply: data.content[0]?.text || '' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// POST /api/ai/essay — Essay feedback (Sonnet — needs quality)
+app.post('/api/ai/essay', authMiddleware, async (req, res) => {
+  const { essay, type = 'essay' } = req.body;
+  if (!essay?.trim()) return res.status(400).json({ success: false, message: 'Essay text required' });
+  if (essay.length > 8000) return res.status(400).json({ success: false, message: 'Essay too long (max ~1500 words)' });
+  try {
+    const reply = await callClaude(
+      'claude-haiku-4-5-20251001',
+      `You are an experienced university writing tutor. Analyse the student's ${type} and return structured JSON feedback with keys: overall_score (0-100), grade (A+/A/B+/B/C+/C/D/F), strengths (array of 3 strings), improvements (array of 3 strings), argument_score (0-10), structure_score (0-10), evidence_score (0-10), language_score (0-10), summary (2 sentence overall comment). Return ONLY valid JSON, no markdown.`,
+      essay,
+      700
+    );
+    let feedback;
+    try { feedback = JSON.parse(reply.replace(/```json|```/g, '').trim()); }
+    catch { feedback = { overall_score: 70, grade: 'B', strengths: ['Good effort'], improvements: ['Expand your argument'], summary: reply }; }
+    res.json({ success: true, feedback });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/ai/past-paper — Past paper analysis
+app.post('/api/ai/past-paper', authMiddleware, async (req, res) => {
+  const { text, course } = req.body;
+  if (!text?.trim()) return res.status(400).json({ success: false, message: 'Paper text required' });
+  try {
+    const reply = await callClaude(
+      'claude-haiku-4-5-20251001',
+      `You are an exam analyst. Analyse this past exam paper and return JSON with: topics (array of {name, frequency: high/medium/low}), likely_topics (array of 3 predicted topics for next exam), practice_questions (array of 3 new questions based on patterns), tips (array of 3 study tips). Return ONLY valid JSON.`,
+      `Course: ${course || 'unknown'}\n\n${text.slice(0, 3000)}`,
+      800
+    );
+    let analysis;
+    try { analysis = JSON.parse(reply.replace(/```json|```/g, '').trim()); }
+    catch { analysis = { topics: [], likely_topics: [], practice_questions: [], tips: ['Review the material carefully'] }; }
+    res.json({ success: true, analysis });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/ai/weekly-review — Weekly AI digest (Haiku)
+app.post('/api/ai/weekly-review', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    const [focusRes, actRes, gradeRes] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(duration_secs),0)::int AS secs FROM focus_sessions WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days'`, [uid]).catch(()=>({ rows:[{secs:0}] })),
+      pool.query(`SELECT COUNT(*)::int AS cnt FROM activity_log WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days'`, [uid]).catch(()=>({ rows:[{cnt:0}] })),
+      pool.query(`SELECT COUNT(*)::int AS cnt FROM assignments WHERE user_id=$1 AND status='submitted' AND updated_at > NOW()-INTERVAL '7 days'`, [uid]).catch(()=>({ rows:[{cnt:0}] })),
+    ]);
+    const focusMins = Math.round((focusRes.rows[0]?.secs || 0) / 60);
+    const actions = actRes.rows[0]?.cnt || 0;
+    const submitted = gradeRes.rows[0]?.cnt || 0;
+    const reply = await callClaude(
+      'claude-haiku-4-5-20251001',
+      'You are a supportive academic coach writing a brief weekly review. Be encouraging, specific, and actionable. Max 120 words.',
+      `Student stats this week: ${focusMins} minutes of focused study, ${actions} platform actions, ${submitted} assignments submitted. Write a personalised 3-sentence weekly review with one specific encouragement and one actionable tip for next week.`,
+      200
+    );
+    res.json({ success: true, review: reply, stats: { focusMins, actions, submitted } });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/ai/flashcards — Generate flashcards from text (Haiku)
+app.post('/api/ai/flashcards', authMiddleware, async (req, res) => {
+  const { text, count = 8 } = req.body;
+  if (!text?.trim()) return res.status(400).json({ success: false, message: 'Text required' });
+  try {
+    const reply = await callClaude(
+      'claude-haiku-4-5-20251001',
+      `Generate exactly ${Math.min(count, 12)} flashcards from the provided text. Return ONLY a JSON array of objects with keys "front" (question/term, max 20 words) and "back" (answer/definition, max 40 words). No markdown, no extra text.`,
+      text.slice(0, 3000),
+      600
+    );
+    let cards;
+    try { cards = JSON.parse(reply.replace(/```json|```/g, '').trim()); }
+    catch { cards = []; }
+    res.json({ success: true, cards: Array.isArray(cards) ? cards : [] });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── FLASHCARD DECKS ─────────────────────────────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS flashcard_decks (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(200) NOT NULL, subject VARCHAR(100), color VARCHAR(20) DEFAULT '#5b4efa',
+  is_public BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS flashcards (
+  id SERIAL PRIMARY KEY, deck_id INTEGER REFERENCES flashcard_decks(id) ON DELETE CASCADE,
+  front TEXT NOT NULL, back TEXT NOT NULL,
+  ease FLOAT DEFAULT 2.5, interval INTEGER DEFAULT 1, repetitions INTEGER DEFAULT 0,
+  next_review TIMESTAMPTZ DEFAULT NOW(), created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+app.get('/api/flashcards/decks', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    `SELECT d.*, COUNT(f.id)::int AS card_count,
+     COUNT(CASE WHEN f.next_review <= NOW() THEN 1 END)::int AS due_count
+     FROM flashcard_decks d LEFT JOIN flashcards f ON f.deck_id=d.id
+     WHERE d.user_id=$1 GROUP BY d.id ORDER BY d.created_at DESC`, [uid]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success: true, decks: rows });
+});
+
+app.post('/api/flashcards/decks', authMiddleware, async (req, res) => {
+  const { title, subject, color, cards = [] } = req.body;
+  const uid = req.user.userId;
+  if (!title?.trim()) return res.status(400).json({ success: false, message: 'Title required' });
+  const { rows } = await pool.query(
+    `INSERT INTO flashcard_decks (user_id, title, subject, color) VALUES ($1,$2,$3,$4) RETURNING *`,
+    [uid, title.trim(), subject||null, color||'#5b4efa']
+  );
+  const deck = rows[0];
+  if (cards.length) {
+    for (const c of cards.slice(0,50)) {
+      await pool.query(`INSERT INTO flashcards (deck_id, front, back) VALUES ($1,$2,$3)`,
+        [deck.id, c.front, c.back]).catch(()=>{});
+    }
+  }
+  res.json({ success: true, deck });
+});
+
+app.get('/api/flashcards/decks/:id/cards', authMiddleware, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT f.* FROM flashcards f JOIN flashcard_decks d ON d.id=f.deck_id
+     WHERE f.deck_id=$1 AND d.user_id=$2 ORDER BY f.next_review ASC`,
+    [req.params.id, req.user.userId]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success: true, cards: rows });
+});
+
+app.post('/api/flashcards/decks/:id/cards', authMiddleware, async (req, res) => {
+  const { front, back } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO flashcards (deck_id, front, back) VALUES ($1,$2,$3) RETURNING *`,
+    [req.params.id, front, back]
+  );
+  res.json({ success: true, card: rows[0] });
+});
+
+// SM-2 review endpoint
+app.post('/api/flashcards/:cardId/review', authMiddleware, async (req, res) => {
+  const { quality } = req.body; // 0=Again,1=Hard,2=Good,3=Easy
+  const { rows } = await pool.query('SELECT * FROM flashcards WHERE id=$1', [req.params.cardId]);
+  if (!rows.length) return res.status(404).json({ success: false });
+  let { ease, interval, repetitions } = rows[0];
+  if (quality < 2) { repetitions = 0; interval = 1; }
+  else {
+    repetitions++;
+    interval = repetitions === 1 ? 1 : repetitions === 2 ? 6 : Math.round(interval * ease);
+    ease = Math.max(1.3, ease + 0.1 - (3 - quality) * (0.08 + (3 - quality) * 0.02));
+  }
+  const nextReview = new Date(Date.now() + interval * 86400000);
+  await pool.query(
+    `UPDATE flashcards SET ease=$1, interval=$2, repetitions=$3, next_review=$4 WHERE id=$5`,
+    [ease, interval, repetitions, nextReview, req.params.cardId]
+  );
+  res.json({ success: true, nextReview, interval });
+});
+
+app.delete('/api/flashcards/decks/:id', authMiddleware, async (req, res) => {
+  await pool.query(`DELETE FROM flashcard_decks WHERE id=$1 AND user_id=$2`, [req.params.id, req.user.userId]);
+  res.json({ success: true });
+});
+
+// ── CAMPUS STORIES ──────────────────────────────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS campus_stories (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  content TEXT, image_url TEXT, is_anonymous BOOLEAN DEFAULT FALSE,
+  author_name VARCHAR(100), created_at TIMESTAMPTZ DEFAULT NOW(),
+  expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '24 hours')
+)`).catch(()=>{});
+
+app.get('/api/campus-stories', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const instRes = await pool.query('SELECT institution FROM users WHERE id=$1', [uid]).catch(()=>({ rows:[{}] }));
+  const inst = instRes.rows[0]?.institution;
+  let q = `SELECT s.*, u.institution,
+    EXISTS(SELECT 1 FROM campus_story_views WHERE story_id=s.id AND user_id=$1) AS viewed
+    FROM campus_stories s JOIN users u ON u.id=s.user_id
+    WHERE s.expires_at > NOW()`;
+  const params = [uid];
+  if (inst) { params.push(inst); q += ` AND u.institution=$${params.length}`; }
+  q += ` ORDER BY s.created_at DESC LIMIT 50`;
+  const { rows } = await pool.query(q, params).catch(()=>({ rows:[] }));
+  res.set('Cache-Control','no-store');
+  res.json({ success: true, stories: rows });
+});
+
+pool.query(`CREATE TABLE IF NOT EXISTS campus_story_views (
+  story_id INTEGER, user_id INTEGER, PRIMARY KEY(story_id, user_id)
+)`).catch(()=>{});
+
+app.post('/api/campus-stories', authMiddleware, async (req, res) => {
+  const { content, imageUrl, isAnonymous } = req.body;
+  if (!content?.trim() && !imageUrl) return res.status(400).json({ success: false, message: 'Content required' });
+  const uRes = await pool.query('SELECT full_name FROM users WHERE id=$1', [req.user.userId]);
+  const name = isAnonymous ? 'Anonymous' : uRes.rows[0]?.full_name || 'Student';
+  const { rows } = await pool.query(
+    `INSERT INTO campus_stories (user_id, content, image_url, is_anonymous, author_name) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [req.user.userId, content?.trim()||null, imageUrl||null, !!isAnonymous, name]
+  );
+  res.json({ success: true, story: rows[0] });
+});
+
+app.post('/api/campus-stories/:id/view', authMiddleware, async (req, res) => {
+  await pool.query(`INSERT INTO campus_story_views (story_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+    [req.params.id, req.user.userId]).catch(()=>{});
+  res.json({ success: true });
+});
+
+// ── CAMPUS PULSE POLLS ──────────────────────────────────────────────────────
+pool.query(`ALTER TABLE campus_pulse_posts ADD COLUMN IF NOT EXISTS poll_options JSONB`).catch(()=>{});
+pool.query(`ALTER TABLE campus_pulse_posts ADD COLUMN IF NOT EXISTS poll_expires_at TIMESTAMPTZ`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS campus_pulse_poll_votes (
+  id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES campus_pulse_posts(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  option_index INTEGER NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(post_id, user_id)
+)`).catch(()=>{});
+
+app.post('/api/campus-pulse/:id/poll-vote', authMiddleware, async (req, res) => {
+  const { optionIndex } = req.body;
+  const uid = req.user.userId;
+  const existing = await pool.query('SELECT id FROM campus_pulse_poll_votes WHERE post_id=$1 AND user_id=$2', [req.params.id, uid]);
+  if (existing.rows.length) return res.status(400).json({ success: false, message: 'Already voted' });
+  await pool.query(`INSERT INTO campus_pulse_poll_votes (post_id, user_id, option_index) VALUES ($1,$2,$3)`,
+    [req.params.id, uid, optionIndex]);
+  const votes = await pool.query(
+    `SELECT option_index, COUNT(*)::int AS count FROM campus_pulse_poll_votes WHERE post_id=$1 GROUP BY option_index`,
+    [req.params.id]
+  );
+  res.json({ success: true, votes: votes.rows });
+});
+
+app.get('/api/campus-pulse/:id/poll-results', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const votes = await pool.query(
+    `SELECT option_index, COUNT(*)::int AS count FROM campus_pulse_poll_votes WHERE post_id=$1 GROUP BY option_index`,
+    [req.params.id]
+  ).catch(()=>({ rows:[] }));
+  const myVote = await pool.query(
+    `SELECT option_index FROM campus_pulse_poll_votes WHERE post_id=$1 AND user_id=$2`,
+    [req.params.id, uid]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success: true, votes: votes.rows, myVote: myVote.rows[0]?.option_index ?? null });
+});
+
+// ── WANTED BOARD ─────────────────────────────────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS marketplace_wanted (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(200) NOT NULL, description TEXT, max_price NUMERIC(10,2),
+  category VARCHAR(50), institution VARCHAR(255), status VARCHAR(20) DEFAULT 'open',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+app.get('/api/marketplace/wanted', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const inst = await pool.query('SELECT institution FROM users WHERE id=$1', [uid])
+    .then(r => r.rows[0]?.institution).catch(()=>null);
+  let q = `SELECT w.*, u.full_name AS poster_name FROM marketplace_wanted w JOIN users u ON u.id=w.user_id WHERE w.status='open'`;
+  const params = [];
+  if (inst) { params.push(inst); q += ` AND u.institution=$${params.length}`; }
+  q += ` ORDER BY w.created_at DESC LIMIT 50`;
+  const { rows } = await pool.query(q, params).catch(()=>({ rows:[] }));
+  res.json({ success: true, wanted: rows });
+});
+
+app.post('/api/marketplace/wanted', authMiddleware, async (req, res) => {
+  const { title, description, maxPrice, category } = req.body;
+  if (!title?.trim()) return res.status(400).json({ success: false, message: 'Title required' });
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    `INSERT INTO marketplace_wanted (user_id, title, description, max_price, category) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [uid, title.trim(), description||null, maxPrice||null, category||null]
+  );
+  res.json({ success: true, wanted: rows[0] });
+});
+
+app.delete('/api/marketplace/wanted/:id', authMiddleware, async (req, res) => {
+  await pool.query(`UPDATE marketplace_wanted SET status='closed' WHERE id=$1 AND user_id=$2`, [req.params.id, req.user.userId]);
+  res.json({ success: true });
+});
+
+// ── STUDY STREAK ─────────────────────────────────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS study_streak_log (
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  study_date DATE NOT NULL, focus_mins INTEGER DEFAULT 0,
+  PRIMARY KEY(user_id, study_date)
+)`).catch(()=>{});
+
+app.get('/api/study-streak', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    `SELECT study_date::text, focus_mins FROM study_streak_log WHERE user_id=$1 ORDER BY study_date DESC LIMIT 90`,
+    [uid]
+  ).catch(()=>({ rows:[] }));
+  // Calculate current streak
+  let streak = 0;
+  const today = new Date().toISOString().split('T')[0];
+  const dateSet = new Set(rows.map(r => r.study_date));
+  let d = new Date();
+  while (true) {
+    const ds = d.toISOString().split('T')[0];
+    if (dateSet.has(ds)) { streak++; d.setDate(d.getDate()-1); }
+    else if (ds === today) { d.setDate(d.getDate()-1); }
+    else break;
+  }
+  res.json({ success: true, streak, log: rows });
+});
+
+// Log study day when focus session ends (called from endFocus)
+// ── FOCUS ANALYTICS ──────────────────────────────────────────────────────────
+app.get('/api/focus/analytics', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const [weekly, bySubject, longestStreak] = await Promise.all([
+    pool.query(
+      `SELECT DATE_TRUNC('day', created_at)::date::text AS day, SUM(duration_secs)::int AS secs, COUNT(*)::int AS sessions
+       FROM focus_sessions WHERE user_id=$1 AND created_at > NOW()-INTERVAL '14 days' AND completed=true
+       GROUP BY 1 ORDER BY 1`, [uid]
+    ).catch(()=>({ rows:[] })),
+    pool.query(
+      `SELECT COALESCE(subject, 'General') AS subject, SUM(duration_secs)::int AS secs, COUNT(*)::int AS sessions
+       FROM focus_sessions WHERE user_id=$1 AND created_at > NOW()-INTERVAL '30 days' AND completed=true
+       GROUP BY 1 ORDER BY secs DESC LIMIT 5`, [uid]
+    ).catch(()=>({ rows:[] })),
+    pool.query(
+      `SELECT COUNT(DISTINCT DATE_TRUNC('day', created_at))::int AS days FROM focus_sessions WHERE user_id=$1 AND completed=true`, [uid]
+    ).catch(()=>({ rows:[{days:0}] })),
+  ]);
+  res.json({
+    success: true,
+    weekly: weekly.rows,
+    bySubject: bySubject.rows,
+    totalStudyDays: longestStreak.rows[0]?.days || 0,
+  });
+});
+
+// ── TYPING INDICATORS (lightweight polling) ──────────────────────────────────
+const typingStore = new Map(); // userId_withUserId -> timestamp
+app.post('/api/messages/typing', authMiddleware, (req, res) => {
+  const key = `${req.user.userId}_${req.body.toUserId}`;
+  typingStore.set(key, Date.now());
+  setTimeout(() => typingStore.delete(key), 5000);
+  res.json({ success: true });
+});
+app.get('/api/messages/typing/:userId', authMiddleware, (req, res) => {
+  const key = `${req.params.userId}_${req.user.userId}`;
+  const ts = typingStore.get(key);
+  res.json({ typing: !!(ts && Date.now() - ts < 5000) });
+});
+
+// ── MY MARKETPLACE LISTINGS ──────────────────────────────────────────────────
+app.get('/api/marketplace/my-listings', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    `SELECT mg.*,
+       (SELECT COUNT(*)::int FROM marketplace_offers WHERE item_id=mg.id) AS offer_count
+     FROM marketplace_goods mg
+     WHERE mg.seller_id=$1 ORDER BY mg.created_at DESC`, [uid]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success: true, listings: rows });
+});
+
+app.patch('/api/marketplace/goods/:id/status', authMiddleware, async (req, res) => {
+  const { status } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE marketplace_goods SET status=$1 WHERE id=$2 AND seller_id=$3 RETURNING *`,
+    [status, req.params.id, req.user.userId]
+  ).catch(()=>({ rows:[] }));
+  if (!rows.length) return res.status(403).json({ success: false, message: 'Not found' });
+  res.json({ success: true, item: rows[0] });
+});
+
+// ── EXAM PLANNER ─────────────────────────────────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS exam_plan (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  subject VARCHAR(200) NOT NULL, exam_date DATE NOT NULL,
+  topics JSONB DEFAULT '[]', color VARCHAR(20) DEFAULT '#5b4efa',
+  notes TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS exam_plan_sessions (
+  id SERIAL PRIMARY KEY, exam_id INTEGER REFERENCES exam_plan(id) ON DELETE CASCADE,
+  session_date DATE NOT NULL, topic VARCHAR(200), duration_mins INTEGER DEFAULT 60,
+  completed BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+app.get('/api/exam-plan', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    `SELECT e.*,
+       COUNT(s.id)::int AS session_count,
+       COUNT(CASE WHEN s.completed THEN 1 END)::int AS completed_sessions
+     FROM exam_plan e LEFT JOIN exam_plan_sessions s ON s.exam_id=e.id
+     WHERE e.user_id=$1 GROUP BY e.id ORDER BY e.exam_date ASC`, [uid]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success: true, exams: rows });
+});
+
+app.post('/api/exam-plan', authMiddleware, async (req, res) => {
+  const { subject, examDate, topics, color, notes } = req.body;
+  if (!subject || !examDate) return res.status(400).json({ success: false, message: 'Subject and exam date required' });
+  const { rows } = await pool.query(
+    `INSERT INTO exam_plan (user_id, subject, exam_date, topics, color, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [req.user.userId, subject, examDate, JSON.stringify(topics||[]), color||'#5b4efa', notes||null]
+  );
+  res.json({ success: true, exam: rows[0] });
+});
+
+app.get('/api/exam-plan/:id/sessions', authMiddleware, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT s.* FROM exam_plan_sessions s JOIN exam_plan e ON e.id=s.exam_id
+     WHERE s.exam_id=$1 AND e.user_id=$2 ORDER BY s.session_date ASC`,
+    [req.params.id, req.user.userId]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success: true, sessions: rows });
+});
+
+app.post('/api/exam-plan/:id/sessions', authMiddleware, async (req, res) => {
+  const sessions = req.body.sessions || [req.body];
+  const inserted = [];
+  for (const s of sessions) {
+    const { rows } = await pool.query(
+      `INSERT INTO exam_plan_sessions (exam_id, session_date, topic, duration_mins) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.params.id, s.sessionDate, s.topic, s.durationMins || 60]
+    ).catch(()=>({ rows:[] }));
+    if (rows[0]) inserted.push(rows[0]);
+  }
+  res.json({ success: true, sessions: inserted });
+});
+
+app.patch('/api/exam-plan/sessions/:id/complete', authMiddleware, async (req, res) => {
+  await pool.query(`UPDATE exam_plan_sessions SET completed=NOT completed WHERE id=$1`, [req.params.id]);
+  res.json({ success: true });
+});
+
+app.delete('/api/exam-plan/:id', authMiddleware, async (req, res) => {
+  await pool.query(`DELETE FROM exam_plan WHERE id=$1 AND user_id=$2`, [req.params.id, req.user.userId]);
+  res.json({ success: true });
+});
+
+// ── PRICE COMPARISON ─────────────────────────────────────────────────────────
+app.get('/api/marketplace/similar/:id', authMiddleware, async (req, res) => {
+  const { rows: item } = await pool.query('SELECT title, category, price FROM marketplace_goods WHERE id=$1', [req.params.id]).catch(()=>({ rows:[] }));
+  if (!item[0]) return res.json({ success: true, similar: [] });
+  const { rows } = await pool.query(
+    `SELECT id, title, price, images, condition FROM marketplace_goods
+     WHERE category=$1 AND id!=$2 AND status='available'
+     ORDER BY ABS(price - $3) LIMIT 4`,
+    [item[0].category, req.params.id, item[0].price]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success: true, similar: rows, currentPrice: item[0].price });
 });
