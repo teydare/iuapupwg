@@ -8143,3 +8143,447 @@ app.get('/api/marketplace/similar/:id', authMiddleware, async (req, res) => {
   ).catch(()=>({ rows:[] }));
   res.json({ success: true, similar: rows, currentPrice: item[0].price });
 });
+
+
+// ============================================================================
+// 2X UPGRADE — AUTOMATION ENGINE + ENGAGEMENT SYSTEM
+// ============================================================================
+
+// ── TABLES ──────────────────────────────────────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS daily_rewards (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  day_number INTEGER NOT NULL, reward_type VARCHAR(50), reward_value INTEGER,
+  claimed_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, DATE(claimed_at))
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS challenges (
+  id SERIAL PRIMARY KEY, title VARCHAR(200), description TEXT,
+  challenge_type VARCHAR(50), target_value INTEGER, reward_xp INTEGER,
+  start_date DATE DEFAULT CURRENT_DATE, end_date DATE,
+  is_global BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS user_challenges (
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  challenge_id INTEGER REFERENCES challenges(id) ON DELETE CASCADE,
+  progress INTEGER DEFAULT 0, completed BOOLEAN DEFAULT FALSE,
+  completed_at TIMESTAMPTZ, PRIMARY KEY(user_id, challenge_id)
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS streak_freezes (
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  freeze_date DATE NOT NULL, used BOOLEAN DEFAULT FALSE,
+  PRIMARY KEY(user_id, freeze_date)
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS power_ups (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  type VARCHAR(50) NOT NULL, expires_at TIMESTAMPTZ, used BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS campus_live_activity (
+  id SERIAL PRIMARY KEY, institution VARCHAR(255), action_type VARCHAR(50),
+  actor_name VARCHAR(100), subject VARCHAR(200), created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS user_goals (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(200), category VARCHAR(50), target_date DATE,
+  target_value INTEGER, current_value INTEGER DEFAULT 0,
+  completed BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS smart_reminders (
+  id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  type VARCHAR(50), message TEXT, trigger_at TIMESTAMPTZ,
+  sent BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+// Seed weekly challenges if empty
+(async () => {
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*)::int AS cnt FROM challenges WHERE end_date >= CURRENT_DATE');
+    if (rows[0].cnt === 0) {
+      const challenges = [
+        ['Study Marathon', 'Focus for 5+ hours this week', 'focus_hours', 300, 200],
+        ['Helper of the Week', 'Answer 3 homework questions', 'homework_answers', 3, 150],
+        ['Library Champion', 'Upload 2 resources', 'uploads', 2, 250],
+        ['Social Butterfly', 'Send 10 direct messages', 'messages_sent', 10, 100],
+        ['Bounty Hunter', 'Fulfill 1 bounty', 'bounties_fulfilled', 1, 300],
+        ['Consistent Learner', 'Log in 5 days in a row', 'login_streak', 5, 100],
+      ];
+      for (const [title, desc, type, target, xp] of challenges) {
+        const end = new Date(); end.setDate(end.getDate() + 7);
+        await pool.query(
+          `INSERT INTO challenges (title, description, challenge_type, target_value, reward_xp, end_date) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [title, desc, type, target, xp, end.toISOString().split('T')[0]]
+        ).catch(()=>{});
+      }
+    }
+  } catch {}
+})();
+
+// ── DAILY REWARD CLAIM ───────────────────────────────────────────────────────
+const DAILY_REWARDS_SCHEDULE = [
+  { day:1, type:'xp', value:10 },   { day:2, type:'xp', value:15 },
+  { day:3, type:'xp', value:20 },   { day:4, type:'freeze', value:1 },
+  { day:5, type:'xp', value:30 },   { day:6, type:'xp', value:40 },
+  { day:7, type:'xp', value:75 },   { day:14, type:'freeze', value:2 },
+  { day:21, type:'xp', value:150 }, { day:30, type:'xp', value:300 },
+];
+
+app.get('/api/daily-reward/status', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const today = new Date().toISOString().split('T')[0];
+  const [userRes, todayRes, streakRes] = await Promise.all([
+    pool.query('SELECT login_streak, xp_points FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{}]})),
+    pool.query('SELECT id FROM daily_rewards WHERE user_id=$1 AND DATE(claimed_at)=$2', [uid, today]).catch(()=>({rows:[]})),
+    pool.query('SELECT COUNT(*)::int AS cnt FROM daily_rewards WHERE user_id=$1 AND claimed_at > NOW()-INTERVAL \'30 days\'', [uid]).catch(()=>({rows:[{cnt:0}]})),
+  ]);
+  const streak = userRes.rows[0]?.login_streak || 0;
+  const claimed = todayRes.rows.length > 0;
+  const totalClaimed = streakRes.rows[0]?.cnt || 0;
+  const nextReward = DAILY_REWARDS_SCHEDULE.find(r => r.day > totalClaimed) || DAILY_REWARDS_SCHEDULE[DAILY_REWARDS_SCHEDULE.length-1];
+  res.json({ success:true, claimed, streak, totalClaimed, nextReward, xp: userRes.rows[0]?.xp_points||0 });
+});
+
+app.post('/api/daily-reward/claim', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const today = new Date().toISOString().split('T')[0];
+  const existing = await pool.query('SELECT id FROM daily_rewards WHERE user_id=$1 AND DATE(claimed_at)=$2', [uid, today]).catch(()=>({rows:[{id:1}]}));
+  if (existing.rows.length) return res.status(400).json({ success:false, message:'Already claimed today' });
+  const totalRes = await pool.query('SELECT COUNT(*)::int AS cnt FROM daily_rewards WHERE user_id=$1', [uid]).catch(()=>({rows:[{cnt:0}]}));
+  const total = (totalRes.rows[0]?.cnt || 0) + 1;
+  const reward = DAILY_REWARDS_SCHEDULE.find(r => r.day === total) || { type:'xp', value:10 };
+  await pool.query('INSERT INTO daily_rewards (user_id, day_number, reward_type, reward_value) VALUES ($1,$2,$3,$4)', [uid, total, reward.type, reward.value]).catch(()=>{});
+  if (reward.type === 'xp') {
+    await pool.query('UPDATE users SET xp_points=xp_points+$1 WHERE id=$2', [reward.value, uid]).catch(()=>{});
+  } else if (reward.type === 'freeze') {
+    for (let i=0; i<reward.value; i++) {
+      const d = new Date(); d.setDate(d.getDate()+i+1);
+      await pool.query('INSERT INTO streak_freezes(user_id,freeze_date) VALUES($1,$2) ON CONFLICT DO NOTHING', [uid, d.toISOString().split('T')[0]]).catch(()=>{});
+    }
+  }
+  await pool.query('UPDATE users SET login_streak=login_streak+1 WHERE id=$1', [uid]).catch(()=>{});
+  res.json({ success:true, reward, dayNumber:total });
+});
+
+// ── CHALLENGES ──────────────────────────────────────────────────────────────
+app.get('/api/challenges', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(`
+    SELECT c.*, uc.progress, uc.completed, uc.completed_at
+    FROM challenges c
+    LEFT JOIN user_challenges uc ON uc.challenge_id=c.id AND uc.user_id=$1
+    WHERE c.end_date >= CURRENT_DATE OR uc.completed=true
+    ORDER BY c.reward_xp DESC LIMIT 20`, [uid]
+  ).catch(()=>({rows:[]}));
+  res.json({ success:true, challenges:rows });
+});
+
+app.post('/api/challenges/:id/join', authMiddleware, async (req, res) => {
+  await pool.query('INSERT INTO user_challenges(user_id,challenge_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [req.user.userId, req.params.id]).catch(()=>{});
+  res.json({ success:true });
+});
+
+// Internal: progress a challenge type
+async function progressChallenge(userId, type, amount=1) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.id, c.target_value, c.reward_xp, uc.progress, uc.completed
+       FROM challenges c JOIN user_challenges uc ON uc.challenge_id=c.id
+       WHERE uc.user_id=$1 AND c.challenge_type=$2 AND NOT uc.completed AND c.end_date>=CURRENT_DATE`,
+      [userId, type]
+    );
+    for (const ch of rows) {
+      const newProg = (ch.progress||0) + amount;
+      const completed = newProg >= ch.target_value;
+      await pool.query('UPDATE user_challenges SET progress=$1, completed=$2, completed_at=$3 WHERE user_id=$4 AND challenge_id=$5',
+        [newProg, completed, completed?new Date():null, userId, ch.id]);
+      if (completed) await pool.query('UPDATE users SET xp_points=xp_points+$1 WHERE id=$2', [ch.reward_xp, userId]).catch(()=>{});
+    }
+  } catch {}
+}
+
+// ── LIVE CAMPUS ACTIVITY ────────────────────────────────────────────────────
+async function logLiveActivity(institution, actionType, actorName, subject) {
+  if (!institution) return;
+  await pool.query(
+    'INSERT INTO campus_live_activity(institution,action_type,actor_name,subject) VALUES($1,$2,$3,$4)',
+    [institution, actionType, actorName, subject]
+  ).catch(()=>{});
+  // Keep only last 100 per institution
+  await pool.query(
+    `DELETE FROM campus_live_activity WHERE institution=$1 AND id NOT IN (SELECT id FROM campus_live_activity WHERE institution=$1 ORDER BY created_at DESC LIMIT 100)`,
+    [institution]
+  ).catch(()=>{});
+}
+
+app.get('/api/campus-live', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const instRes = await pool.query('SELECT institution, full_name FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{}]}));
+  const inst = instRes.rows[0]?.institution;
+  if (!inst) return res.json({ success:true, activities:[], onlineCount:0 });
+  const [actRes, onlineRes] = await Promise.all([
+    pool.query(`SELECT * FROM campus_live_activity WHERE institution=$1 AND created_at > NOW()-INTERVAL '2 hours' ORDER BY created_at DESC LIMIT 15`, [inst]).catch(()=>({rows:[]})),
+    pool.query(`SELECT COUNT(DISTINCT user_id)::int AS cnt FROM activity_log WHERE created_at > NOW()-INTERVAL '15 minutes' AND user_id IN (SELECT id FROM users WHERE institution=$1)`, [inst]).catch(()=>({rows:[{cnt:0}]})),
+  ]);
+  res.set('Cache-Control','no-store');
+  res.json({ success:true, activities: actRes.rows, onlineCount: onlineRes.rows[0]?.cnt || 0 });
+});
+
+// ── POWER-UPS ────────────────────────────────────────────────────────────────
+const POWERUP_SHOP = [
+  { id:'xp_boost', name:'XP Boost', desc:'2x XP for 24 hours', cost:50, icon:'⚡', duration:86400 },
+  { id:'streak_freeze', name:'Streak Freeze', desc:'Protect your streak for 1 day', cost:30, icon:'🧊', duration:86400 },
+  { id:'bounty_boost', name:'Bounty Boost', desc:'+50% Rep on next bounty fulfillment', cost:75, icon:'🎯', duration:86400 },
+];
+
+app.get('/api/powerups/shop', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const [xpRes, activeRes] = await Promise.all([
+    pool.query('SELECT xp_points FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{xp_points:0}]})),
+    pool.query('SELECT type FROM power_ups WHERE user_id=$1 AND NOT used AND expires_at > NOW()', [uid]).catch(()=>({rows:[]})),
+  ]);
+  const activePowerups = activeRes.rows.map(r=>r.type);
+  res.json({ success:true, shop:POWERUP_SHOP, xp: xpRes.rows[0]?.xp_points||0, active: activePowerups });
+});
+
+app.post('/api/powerups/buy', authMiddleware, async (req, res) => {
+  const { type } = req.body;
+  const item = POWERUP_SHOP.find(p => p.id === type);
+  if (!item) return res.status(400).json({ success:false, message:'Unknown power-up' });
+  const uid = req.user.userId;
+  const xpRes = await pool.query('SELECT xp_points FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{xp_points:0}]}));
+  if ((xpRes.rows[0]?.xp_points||0) < item.cost) return res.status(400).json({ success:false, message:'Not enough Rep' });
+  await pool.query('UPDATE users SET xp_points=xp_points-$1 WHERE id=$2', [item.cost, uid]).catch(()=>{});
+  const exp = new Date(Date.now() + item.duration*1000);
+  await pool.query('INSERT INTO power_ups(user_id,type,expires_at) VALUES($1,$2,$3)', [uid, type, exp]).catch(()=>{});
+  res.json({ success:true, powerup: item, expiresAt: exp });
+});
+
+// ── GOALS ────────────────────────────────────────────────────────────────────
+app.get('/api/goals', authMiddleware, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM user_goals WHERE user_id=$1 ORDER BY created_at DESC', [req.user.userId]).catch(()=>({rows:[]}));
+  res.json({ success:true, goals:rows });
+});
+app.post('/api/goals', authMiddleware, async (req, res) => {
+  const { title, category, targetDate, targetValue } = req.body;
+  if (!title?.trim()) return res.status(400).json({ success:false, message:'Title required' });
+  const { rows } = await pool.query(
+    'INSERT INTO user_goals(user_id,title,category,target_date,target_value) VALUES($1,$2,$3,$4,$5) RETURNING *',
+    [req.user.userId, title.trim(), category||'general', targetDate||null, targetValue||null]
+  ).catch(()=>({rows:[]}));
+  res.json({ success:true, goal:rows[0] });
+});
+app.patch('/api/goals/:id', authMiddleware, async (req, res) => {
+  const { currentValue, completed } = req.body;
+  const fields = []; const vals = [req.params.id, req.user.userId];
+  if (currentValue !== undefined) { vals.push(currentValue); fields.push(`current_value=$${vals.length}`); }
+  if (completed !== undefined) { vals.push(completed); fields.push(`completed=$${vals.length}`); }
+  if (!fields.length) return res.status(400).json({ success:false });
+  await pool.query(`UPDATE user_goals SET ${fields.join(',')} WHERE id=$1 AND user_id=$2`, vals).catch(()=>{});
+  res.json({ success:true });
+});
+app.delete('/api/goals/:id', authMiddleware, async (req, res) => {
+  await pool.query('DELETE FROM user_goals WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]).catch(()=>{});
+  res.json({ success:true });
+});
+
+// ── SMART REMINDERS ─────────────────────────────────────────────────────────
+// Auto-create reminders for assignment deadlines (runs on login)
+app.post('/api/reminders/generate', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    // Get upcoming assignments without reminders
+    const assgn = await pool.query(
+      `SELECT a.* FROM assignments a
+       WHERE a.user_id=$1 AND a.status!='submitted' AND a.due_date > NOW()
+       AND NOT EXISTS(SELECT 1 FROM smart_reminders sr WHERE sr.user_id=$1 AND sr.type='assignment' AND sr.message LIKE '%'||a.title||'%')
+       ORDER BY a.due_date ASC LIMIT 10`,
+      [uid]
+    ).catch(()=>({rows:[]}));
+    let created = 0;
+    for (const a of assgn.rows) {
+      const due = new Date(a.due_date);
+      const dayBefore = new Date(due.getTime() - 86400000);
+      const threeDays = new Date(due.getTime() - 3*86400000);
+      if (dayBefore > new Date()) {
+        await pool.query('INSERT INTO smart_reminders(user_id,type,message,trigger_at) VALUES($1,$2,$3,$4)',
+          [uid,'assignment',`"${a.title}" is due tomorrow!`, dayBefore]).catch(()=>{});
+        created++;
+      }
+      if (threeDays > new Date()) {
+        await pool.query('INSERT INTO smart_reminders(user_id,type,message,trigger_at) VALUES($1,$2,$3,$4)',
+          [uid,'assignment',`"${a.title}" is due in 3 days. Have you started?`, threeDays]).catch(()=>{});
+        created++;
+      }
+    }
+    // Exam reminders
+    const exams = await pool.query(
+      `SELECT * FROM exam_plan WHERE user_id=$1 AND exam_date > NOW() AND exam_date <= NOW()+INTERVAL '7 days'`, [uid]
+    ).catch(()=>({rows:[]}));
+    for (const e of exams.rows) {
+      await pool.query(
+        `INSERT INTO notifications(user_id,notification_type,title,message,scheduled_time)
+         VALUES($1,'exam_reminder','Exam coming up: '||$2,'Your exam is on '||$3||'. Keep grinding!',NOW())
+         ON CONFLICT DO NOTHING`,
+        [uid, e.subject, e.exam_date]
+      ).catch(()=>{});
+    }
+    res.json({ success:true, created });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+app.get('/api/reminders/pending', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    'SELECT * FROM smart_reminders WHERE user_id=$1 AND NOT sent AND trigger_at <= NOW() ORDER BY trigger_at ASC',
+    [uid]
+  ).catch(()=>({rows:[]}));
+  if (rows.length) {
+    await pool.query('UPDATE smart_reminders SET sent=true WHERE user_id=$1 AND NOT sent AND trigger_at <= NOW()', [uid]).catch(()=>{});
+  }
+  res.json({ success:true, reminders: rows });
+});
+
+// ── AI STUDY PLAN (smart, context-aware) ────────────────────────────────────
+app.post('/api/ai/study-plan', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  try {
+    const [gradeRes, examRes, focusRes] = await Promise.all([
+      pool.query(`SELECT gs.subject_name, AVG(ge.score_percent)::numeric(5,1) AS avg_score FROM grade_subjects gs LEFT JOIN grade_entries ge ON ge.subject_id=gs.id WHERE gs.user_id=$1 GROUP BY gs.subject_name ORDER BY avg_score ASC LIMIT 5`, [uid]).catch(()=>({rows:[]})),
+      pool.query(`SELECT subject, exam_date FROM exam_plan WHERE user_id=$1 AND exam_date >= CURRENT_DATE ORDER BY exam_date ASC LIMIT 3`, [uid]).catch(()=>({rows:[]})),
+      pool.query(`SELECT COALESCE(subject,'General') AS subject, SUM(duration_secs)::int AS secs FROM focus_sessions WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days' GROUP BY 1`, [uid]).catch(()=>({rows:[]})),
+    ]);
+    const context = `
+Weak subjects (by grade avg): ${gradeRes.rows.map(r=>`${r.subject_name} (${r.avg_score}%)`).join(', ') || 'unknown'}
+Upcoming exams: ${examRes.rows.map(r=>`${r.subject} on ${r.exam_date}`).join(', ') || 'none'}
+Focus time this week: ${focusRes.rows.map(r=>`${r.subject} ${Math.round(r.secs/60)}min`).join(', ') || 'no data'}`;
+    const reply = await callClaude(
+      'claude-haiku-4-5-20251001',
+      'You are an expert academic coach. Based on student data, create a realistic 5-day study plan. Return JSON: { week_goal (string), days: [{day: "Mon", tasks: [{subject, duration_mins, activity}]}], focus_tip (string) }. Return ONLY valid JSON.',
+      context, 700
+    );
+    let plan;
+    try { plan = JSON.parse(reply.replace(/```json|```/g,'').trim()); }
+    catch { plan = { week_goal:'Review your weakest subjects first', days:[], focus_tip:'Start with 25-minute focused sessions.' }; }
+    res.json({ success:true, plan });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+// ── CAMPUS STATS (social proof) ──────────────────────────────────────────────
+app.get('/api/campus-stats', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const inst = await pool.query('SELECT institution FROM users WHERE id=$1', [uid])
+    .then(r=>r.rows[0]?.institution).catch(()=>null);
+  const [studyingRes, uploadsRes, postsRes, questsRes] = await Promise.all([
+    pool.query(`SELECT COUNT(DISTINCT user_id)::int AS cnt FROM focus_sessions WHERE completed=false AND created_at > NOW()-INTERVAL '1 hour'${inst?' AND user_id IN(SELECT id FROM users WHERE institution=$1)':''} `, inst?[inst]:[]).catch(()=>({rows:[{cnt:0}]})),
+    pool.query(`SELECT COUNT(*)::int AS cnt FROM library_resources WHERE created_at > NOW()-INTERVAL '24 hours'${inst?' AND user_id IN(SELECT id FROM users WHERE institution=$1)':''} `, inst?[inst]:[]).catch(()=>({rows:[{cnt:0}]})),
+    pool.query(`SELECT COUNT(*)::int AS cnt FROM campus_pulse_posts WHERE created_at > NOW()-INTERVAL '24 hours'${inst?' AND user_id IN(SELECT id FROM users WHERE institution=$1)':''} `, inst?[inst]:[]).catch(()=>({rows:[{cnt:0}]})),
+    pool.query(`SELECT COUNT(DISTINCT user_id)::int AS cnt FROM activity_log WHERE created_at > NOW()-INTERVAL '5 minutes'${inst?' AND user_id IN(SELECT id FROM users WHERE institution=$1)':''} `, inst?[inst]:[]).catch(()=>({rows:[{cnt:0}]})),
+  ]);
+  res.set('Cache-Control','no-store');
+  res.json({
+    success:true,
+    studyingNow: studyingRes.rows[0]?.cnt||0,
+    uploadsToday: uploadsRes.rows[0]?.cnt||0,
+    postsToday: postsRes.rows[0]?.cnt||0,
+    onlineNow: questsRes.rows[0]?.cnt||0,
+  });
+});
+
+// ── ACCOUNTABILITY PARTNERS ──────────────────────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS accountability_pairs (
+  id SERIAL PRIMARY KEY, user1_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  user2_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user1_id, user2_id)
+)`).catch(()=>{});
+
+app.post('/api/accountability/request', authMiddleware, async (req, res) => {
+  const { targetUserId } = req.body;
+  const uid = req.user.userId;
+  if (parseInt(targetUserId)===uid) return res.status(400).json({success:false, message:'Cannot pair with yourself'});
+  await pool.query('INSERT INTO accountability_pairs(user1_id,user2_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [uid, targetUserId]).catch(()=>{});
+  // Notify the target
+  const uRes = await pool.query('SELECT full_name FROM users WHERE id=$1',[uid]).catch(()=>({rows:[{}]}));
+  await pool.query('INSERT INTO notifications(user_id,notification_type,title,message) VALUES($1,$2,$3,$4)',
+    [targetUserId,'accountability',`${uRes.rows[0]?.full_name||'Someone'} wants to be your study partner!`,'Accept to hold each other accountable every day.']).catch(()=>{});
+  res.json({ success:true });
+});
+
+app.get('/api/accountability/partners', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(`
+    SELECT ap.*, 
+      CASE WHEN ap.user1_id=$1 THEN u2.full_name ELSE u1.full_name END AS partner_name,
+      CASE WHEN ap.user1_id=$1 THEN u2.id ELSE u1.id END AS partner_id,
+      CASE WHEN ap.user1_id=$1 THEN u2.login_streak ELSE u1.login_streak END AS partner_streak,
+      CASE WHEN ap.user1_id=$1 THEN COALESCE(u2.profile_image_url,u2.avatar_url) ELSE COALESCE(u1.profile_image_url,u1.avatar_url) END AS partner_image
+    FROM accountability_pairs ap
+    JOIN users u1 ON u1.id=ap.user1_id
+    JOIN users u2 ON u2.id=ap.user2_id
+    WHERE (ap.user1_id=$1 OR ap.user2_id=$1) AND ap.status='accepted'`, [uid]
+  ).catch(()=>({rows:[]}));
+  res.json({ success:true, partners:rows });
+});
+
+app.patch('/api/accountability/:id/accept', authMiddleware, async (req, res) => {
+  await pool.query('UPDATE accountability_pairs SET status=$1 WHERE id=$2 AND user2_id=$3', ['accepted', req.params.id, req.user.userId]).catch(()=>{});
+  res.json({ success:true });
+});
+
+// ── AUTOMATED BACKGROUND JOBS (runs every 5 min) ────────────────────────────
+setInterval(async () => {
+  try {
+    // 1. Auto-notify users about upcoming assignments (24h before)
+    const dueTomorrow = await pool.query(
+      `SELECT a.user_id, a.title, a.due_date FROM assignments a
+       WHERE a.status != 'submitted' AND a.due_date BETWEEN NOW() AND NOW()+INTERVAL '25 hours'
+       AND NOT EXISTS(SELECT 1 FROM notifications n WHERE n.user_id=a.user_id AND n.title LIKE '%'||a.title||'%' AND n.created_at > NOW()-INTERVAL '20 hours')`
+    ).catch(()=>({rows:[]}));
+    for (const r of dueTomorrow.rows) {
+      await pool.query(
+        `INSERT INTO notifications(user_id,notification_type,title,message,scheduled_time) VALUES($1,'reminder',$2,$3,NOW())`,
+        [r.user_id, `⏰ Due tomorrow: ${r.title}`, `Your assignment "${r.title}" is due tomorrow. Make sure you're on track!`]
+      ).catch(()=>{});
+    }
+
+    // 2. Auto-notify about exam plan sessions due today
+    const sessionsToday = await pool.query(
+      `SELECT eps.*, ep.user_id, ep.subject FROM exam_plan_sessions eps
+       JOIN exam_plan ep ON ep.id=eps.exam_id
+       WHERE eps.session_date=CURRENT_DATE AND NOT eps.completed
+       AND NOT EXISTS(SELECT 1 FROM notifications n WHERE n.user_id=ep.user_id AND n.title LIKE '%study session%' AND n.created_at > NOW()-INTERVAL '12 hours')`
+    ).catch(()=>({rows:[]}));
+    for (const s of sessionsToday.rows) {
+      await pool.query(
+        `INSERT INTO notifications(user_id,notification_type,title,message,scheduled_time) VALUES($1,'study_reminder',$2,$3,NOW())`,
+        [s.user_id, `📚 Study session today: ${s.subject}`, `You have a study session planned for "${s.topic}" today. Stay on track!`]
+      ).catch(()=>{});
+    }
+
+    // 3. Seed next week's challenges if current ones expire within 2 days
+    const expiringSoon = await pool.query(`SELECT COUNT(*)::int AS cnt FROM challenges WHERE end_date BETWEEN CURRENT_DATE AND CURRENT_DATE+2`).catch(()=>({rows:[{cnt:0}]}));
+    if ((expiringSoon.rows[0]?.cnt||0) > 0) {
+      const nextEnd = new Date(); nextEnd.setDate(nextEnd.getDate()+10);
+      const newChallenges = [
+        ['Note Sharer', 'Upload 3 resources to the Library', 'uploads', 3, 200],
+        ['Group Leader', 'Create or join 2 study groups', 'study_groups', 2, 150],
+        ['Marketplace Mover', 'List an item for sale', 'listing', 1, 75],
+        ['Campus Voice', 'Post 5 times on Campus Pulse', 'pulse_posts', 5, 100],
+        ['Knowledge Seeker', 'Answer 5 homework questions', 'homework_answers', 5, 200],
+        ['Focus Beast', 'Complete 10 focus sessions', 'focus_sessions', 10, 250],
+      ];
+      for (const [title,desc,type,target,xp] of newChallenges) {
+        await pool.query(
+          `INSERT INTO challenges(title,description,challenge_type,target_value,reward_xp,end_date) VALUES($1,$2,$3,$4,$5,$6)`,
+          [title,desc,type,target,xp,nextEnd.toISOString().split('T')[0]]
+        ).catch(()=>{});
+      }
+    }
+  } catch(e) { console.error('Background job error:', e.message); }
+}, 5 * 60 * 1000);
