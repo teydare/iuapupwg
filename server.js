@@ -7637,7 +7637,9 @@ app.post('/api/marketplace/services/:id/book', authMiddleware, async (req, res) 
     [req.params.id, uid, svc.rows[0].provider_id, brief, budget]).catch(()=>({ rows:[] }));
   // Send DM to provider with the brief
   const clientRes = await pool.query('SELECT full_name FROM users WHERE id=$1', [uid]).catch(()=>({ rows:[{}] }));
-  const dmContent = `📋 Service Request: "${svc.rows[0].title}"\n\n${brief || 'Hi, I'd like to hire you for this service.'}${budget ? `\n\nBudget: GH₵${budget}` : ''}`;
+    const _dmBrief = brief || "Hi, I would like to hire you for this service.";
+  const _dmBudget = budget ? ('\n\nBudget: GH\u20b5' + budget) : '';
+  const dmContent = 'Service Request: "' + svc.rows[0].title + '"\n\n' + _dmBrief + _dmBudget;
   await pool.query('INSERT INTO direct_messages(sender_id,receiver_id,content) VALUES($1,$2,$3)', [uid, svc.rows[0].provider_id, dmContent]).catch(()=>{});
   await pool.query('INSERT INTO notifications(user_id,notification_type,title,message) VALUES($1,$2,$3,$4)',
     [svc.rows[0].provider_id, 'service_booking', `New booking: ${svc.rows[0].title}`, `${clientRes.rows[0]?.full_name||'A student'} wants to hire you.`]).catch(()=>{});
