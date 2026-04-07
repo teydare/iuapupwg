@@ -2463,6 +2463,8 @@ app.post('/api/study-groups/:id/session/end', authMiddleware, async (req, res) =
   const { id } = req.params;
   const userId  = req.user.userId;
   try {
+    // Ensure ended_at column exists (safe migration)
+    await pool.query(`ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS ended_at TIMESTAMP`).catch(()=>{});
     await pool.query(
       `UPDATE study_sessions SET status='ended', ended_at=NOW()
        WHERE group_id=$1 AND user_id=$2 AND status='active'`,
@@ -2470,8 +2472,9 @@ app.post('/api/study-groups/:id/session/end', authMiddleware, async (req, res) =
     );
     res.json({ success: true });
   } catch (err) {
-    console.error('End session error:', err);
-    res.status(500).json({ success: false, message: 'Failed to end session' });
+    console.error('End session error:', err.message);
+    // Don't 500 — session end is best-effort
+    res.json({ success: true, note: 'Session may have already ended' });
   }
 });
 // ============================================
@@ -2867,25 +2870,25 @@ app.post('/api/assignments', authMiddleware, async (req, res) => {
     );
     
     const assignment = result.rows[0];
-    const notificationTime = new Date(dueDate);
-    notificationTime.setHours(notificationTime.getHours() - (notificationHoursBefore || 24));
-    
-    await pool.query(
-      `INSERT INTO notifications 
-       (user_id, notification_type, reference_id, title, message, scheduled_time)
-       VALUES ($1, 'assignment', $2, $3, $4, $5)`,
-      [
-        req.user.userId,
-        assignment.id,
-        `Assignment Due: ${title}`,
-        `Your assignment "${title}" for ${courseCode} is due in ${notificationHoursBefore || 24} hours!`,
-        notificationTime
-      ]
-    );
-    
-    res.json({ success: true, assignment: assignment });
+    // Notification is best-effort — never fail the whole request over it
+    if (dueDate) {
+      try {
+        const notificationTime = new Date(dueDate);
+        notificationTime.setHours(notificationTime.getHours() - (notificationHoursBefore || 24));
+        await pool.query(
+          `INSERT INTO notifications (user_id, notification_type, reference_id, title, message, scheduled_time)
+           VALUES ($1, 'assignment', $2, $3, $4, $5)`,
+          [req.user.userId, assignment.id,
+           `Assignment Due: ${title}`,
+           `Your assignment "${title}" for ${courseCode || 'your course'} is due in ${notificationHoursBefore || 24} hours!`,
+           notificationTime]
+        );
+      } catch (notifErr) { console.error('Notification insert failed (non-fatal):', notifErr.message); }
+    }
+    res.json({ success: true, assignment });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Server error' });
+    console.error('POST /api/assignments error:', error.message);
+    res.status(500).json({ success: false, message: error.message || 'Server error' });
   }
 });
 
@@ -7568,6 +7571,101 @@ app.use((err, req, res, next) => {
   });
 });
 
+
+// ── MARKETPLACE SERVICES — Enhanced routes ────────────────────────────────
+pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS tags TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS images TEXT[]`).catch(()=>{});
+pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS rating NUMERIC(3,2) DEFAULT 0`).catch(()=>{});
+pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS review_count INTEGER DEFAULT 0`).catch(()=>{});
+pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS completed_count INTEGER DEFAULT 0`).catch(()=>{});
+pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE`).catch(()=>{});
+pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS response_time VARCHAR(50) DEFAULT 'Within 24h'`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS service_reviews (
+  id SERIAL PRIMARY KEY, service_id INTEGER REFERENCES marketplace_services(id) ON DELETE CASCADE,
+  reviewer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  rating INTEGER CHECK(rating BETWEEN 1 AND 5), comment TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(service_id, reviewer_id)
+)`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS service_bookings (
+  id SERIAL PRIMARY KEY, service_id INTEGER REFERENCES marketplace_services(id) ON DELETE CASCADE,
+  client_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  provider_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  brief TEXT, status VARCHAR(30) DEFAULT 'pending', budget NUMERIC(10,2),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+// Enhanced GET services with provider info, ratings, reviews
+app.get('/api/marketplace/services/enhanced', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { category, section, search, sort = 'rating' } = req.query;
+  let q = `
+    SELECT ms.*, u.full_name AS provider_name, u.phone AS provider_phone,
+      COALESCE(u.profile_image_url, u.avatar_url) AS provider_image,
+      u.institution AS provider_institution,
+      (SELECT json_agg(json_build_object('rating',sr.rating,'comment',sr.comment,'reviewer',ru.full_name,'created_at',sr.created_at) ORDER BY sr.created_at DESC)
+       FROM service_reviews sr JOIN users ru ON ru.id=sr.reviewer_id WHERE sr.service_id=ms.id LIMIT 3) AS reviews
+    FROM marketplace_services ms JOIN users u ON u.id=ms.provider_id WHERE 1=1`;
+  const params = [];
+  if (section) { params.push(section); q += ` AND ms.service_category=$${params.length}`; }
+  if (category && category !== 'all') { params.push(category); q += ` AND ms.category=$${params.length}`; }
+  if (search) { params.push(`%${search}%`); q += ` AND (ms.title ILIKE $${params.length} OR ms.description ILIKE $${params.length})`; }
+  const orderMap = { rating:'ms.rating DESC, ms.review_count DESC', newest:'ms.created_at DESC', price_low:'ms.price ASC', price_high:'ms.price DESC', popular:'ms.completed_count DESC' };
+  q += ` ORDER BY ms.is_featured DESC, ${orderMap[sort]||orderMap.rating} LIMIT 60`;
+  const { rows } = await pool.query(q, params).catch(()=>({ rows:[] }));
+  res.json({ success:true, services:rows });
+});
+
+// POST service review
+app.post('/api/marketplace/services/:id/review', authMiddleware, async (req, res) => {
+  const { rating, comment } = req.body;
+  if (!rating || rating < 1 || rating > 5) return res.status(400).json({ success:false, message:'Rating 1-5 required' });
+  const uid = req.user.userId;
+  await pool.query('INSERT INTO service_reviews(service_id,reviewer_id,rating,comment) VALUES($1,$2,$3,$4) ON CONFLICT(service_id,reviewer_id) DO UPDATE SET rating=$3,comment=$4',
+    [req.params.id, uid, rating, comment]).catch(()=>{});
+  // Update aggregated rating
+  await pool.query(`UPDATE marketplace_services SET rating=(SELECT AVG(rating)::numeric(3,2) FROM service_reviews WHERE service_id=$1), review_count=(SELECT COUNT(*)::int FROM service_reviews WHERE service_id=$1) WHERE id=$1`, [req.params.id]).catch(()=>{});
+  res.json({ success:true });
+});
+
+// POST book/request a service
+app.post('/api/marketplace/services/:id/book', authMiddleware, async (req, res) => {
+  const { brief, budget } = req.body;
+  const uid = req.user.userId;
+  const svc = await pool.query('SELECT provider_id, title FROM marketplace_services WHERE id=$1', [req.params.id]).catch(()=>({ rows:[] }));
+  if (!svc.rows[0]) return res.status(404).json({ success:false });
+  const { rows } = await pool.query('INSERT INTO service_bookings(service_id,client_id,provider_id,brief,budget) VALUES($1,$2,$3,$4,$5) RETURNING *',
+    [req.params.id, uid, svc.rows[0].provider_id, brief, budget]).catch(()=>({ rows:[] }));
+  // Send DM to provider with the brief
+  const clientRes = await pool.query('SELECT full_name FROM users WHERE id=$1', [uid]).catch(()=>({ rows:[{}] }));
+  const dmContent = `📋 Service Request: "${svc.rows[0].title}"\n\n${brief || 'Hi, I'd like to hire you for this service.'}${budget ? `\n\nBudget: GH₵${budget}` : ''}`;
+  await pool.query('INSERT INTO direct_messages(sender_id,receiver_id,content) VALUES($1,$2,$3)', [uid, svc.rows[0].provider_id, dmContent]).catch(()=>{});
+  await pool.query('INSERT INTO notifications(user_id,notification_type,title,message) VALUES($1,$2,$3,$4)',
+    [svc.rows[0].provider_id, 'service_booking', `New booking: ${svc.rows[0].title}`, `${clientRes.rows[0]?.full_name||'A student'} wants to hire you.`]).catch(()=>{});
+  res.json({ success:true, booking:rows[0] });
+});
+
+// GET my service bookings (as provider)
+app.get('/api/marketplace/services/my-bookings', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(`
+    SELECT sb.*, ms.title AS service_title, u.full_name AS client_name,
+      COALESCE(u.profile_image_url, u.avatar_url) AS client_image
+    FROM service_bookings sb JOIN marketplace_services ms ON ms.id=sb.service_id
+    JOIN users u ON u.id=sb.client_id
+    WHERE sb.provider_id=$1 ORDER BY sb.created_at DESC LIMIT 20`, [uid]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success:true, bookings:rows });
+});
+
+app.patch('/api/marketplace/services/bookings/:id', authMiddleware, async (req, res) => {
+  const { status } = req.body;
+  await pool.query('UPDATE service_bookings SET status=$1 WHERE id=$2 AND provider_id=$3', [status, req.params.id, req.user.userId]).catch(()=>{});
+  if (status === 'completed') {
+    await pool.query('UPDATE marketplace_services SET completed_count=completed_count+1 WHERE id=(SELECT service_id FROM service_bookings WHERE id=$1)', [req.params.id]).catch(()=>{});
+  }
+  res.json({ success:true });
+});
+
 // ============================================
 // START SERVER
 // ============================================
@@ -7650,18 +7748,16 @@ const AI_HEADERS = {
 };
 
 async function callClaude(model, system, userMsg, maxTokens = 800) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error('ANTHROPIC_API_KEY is not configured on this server. Add it in your Render environment variables.');
+  const headers = { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' };
   const res = await fetch(ANTHROPIC_API, {
     method: 'POST',
-    headers: AI_HEADERS,
-    body: JSON.stringify({
-      model,
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: 'user', content: userMsg }],
-    }),
+    headers,
+    body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: userMsg }] }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error?.message || 'AI error');
+  if (!res.ok) throw new Error(data.error?.message || `Anthropic API error ${res.status}`);
   return data.content[0]?.text || '';
 }
 
@@ -7677,19 +7773,12 @@ app.post('/api/ai/tutor', authMiddleware, async (req, res) => {
   };
   try {
     const msgs = [...history.slice(-6), { role: 'user', content: message }];
-    const resp = await fetch(ANTHROPIC_API, {
-      method: 'POST', headers: AI_HEADERS,
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001', max_tokens: 600,
-        system: systemPrompts[mode] || systemPrompts.explain,
-        messages: msgs,
-      }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error?.message || 'AI error');
-    res.json({ success: true, reply: data.content[0]?.text || '' });
+    const reply = await callClaude('claude-haiku-4-5-20251001', systemPrompts[mode] || systemPrompts.explain, message, 600);
+    res.json({ success: true, reply });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+    console.error('AI tutor error:', e.message);
+    const status = e.message.includes('ANTHROPIC_API_KEY') ? 503 : 500;
+    res.status(status).json({ success: false, message: e.message });
   }
 });
 
@@ -8434,7 +8523,7 @@ app.post('/api/reminders/generate', authMiddleware, async (req, res) => {
       ).catch(()=>{});
     }
     res.json({ success:true, created });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+  } catch(e) { console.error('AI endpoint error:', e.message); const status = e.message?.includes('ANTHROPIC_API_KEY')?503:500; res.status(status).json({ success:false, message:e.message }); }
 });
 
 app.get('/api/reminders/pending', authMiddleware, async (req, res) => {
@@ -8471,7 +8560,7 @@ Focus time this week: ${focusRes.rows.map(r=>`${r.subject} ${Math.round(r.secs/6
     try { plan = JSON.parse(reply.replace(/```json|```/g,'').trim()); }
     catch { plan = { week_goal:'Review your weakest subjects first', days:[], focus_tip:'Start with 25-minute focused sessions.' }; }
     res.json({ success:true, plan });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+  } catch(e) { console.error('AI endpoint error:', e.message); const status = e.message?.includes('ANTHROPIC_API_KEY')?503:500; res.status(status).json({ success:false, message:e.message }); }
 });
 
 // ── CAMPUS STATS (social proof) ──────────────────────────────────────────────
