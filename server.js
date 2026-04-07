@@ -4189,38 +4189,41 @@ app.get('/api/campus-pulse', authMiddleware, async (req, res) => {
   const { category, sort = 'hot', limit = 50 } = req.query;
   const uid = req.user.userId;
   try {
-    // Get the current user's institution so we only show their campus posts
-    const instRes = await pool.query('SELECT institution FROM users WHERE id=$1', [uid]);
-    const institution = instRes.rows[0]?.institution || null;
+    const instRes = await pool.query('SELECT institution FROM users WHERE id=$1', [uid]).catch(()=>({ rows:[{}] }));
+    const institution = instRes.rows[0]?.institution?.trim() || null;
 
+    // Build base query — always returns posts, institution filter is additive not blocking
     let q = `
       SELECT p.*,
-        (SELECT COUNT(*) FROM campus_pulse_comments c WHERE c.post_id = p.id) AS comment_count,
+        (SELECT COUNT(*)::int FROM campus_pulse_comments c WHERE c.post_id = p.id) AS comment_count,
         EXISTS(SELECT 1 FROM campus_pulse_reactions WHERE post_id=p.id AND user_id=$1 AND emoji='👍') AS liked,
-        (SELECT json_agg(json_build_object('emoji',emoji,'count',cnt)) FROM
-          (SELECT emoji, COUNT(*) AS cnt FROM campus_pulse_reactions WHERE post_id=p.id GROUP BY emoji) r
+        (SELECT json_agg(json_build_object('emoji',r.emoji,'count',r.cnt)) FROM
+          (SELECT emoji, COUNT(*)::int AS cnt FROM campus_pulse_reactions WHERE post_id=p.id GROUP BY emoji) r
         ) AS reactions
       FROM campus_pulse_posts p
-      JOIN users u ON u.id = p.user_id
-      WHERE 1=1`;
+      LEFT JOIN users u ON u.id = p.user_id
+      WHERE (
+        p.user_id = $1`;               /* always include own posts */
     const params = [uid];
 
-    // Filter by institution if the user has one set
     if (institution) {
       params.push(institution);
-      q += ` AND u.institution = $${params.length}`;
+      // Include posts from same institution OR posts by the current user
+      q += ` OR LOWER(TRIM(COALESCE(u.institution,''))) = LOWER(TRIM($${params.length}))`;
     }
+    q += ')';
+
     if (category && category !== 'all') { params.push(category); q += ` AND p.category = $${params.length}`; }
 
-    if (sort === 'hot')  q += ` ORDER BY p.is_pinned DESC, (p.likes * 2 + comment_count) DESC, p.created_at DESC`;
+    if      (sort === 'hot') q += ` ORDER BY p.is_pinned DESC, (p.likes * 2 + comment_count) DESC, p.created_at DESC`;
     else if (sort === 'new') q += ` ORDER BY p.is_pinned DESC, p.created_at DESC`;
     else if (sort === 'top') q += ` ORDER BY p.is_pinned DESC, p.likes DESC`;
-    else q += ` ORDER BY p.is_pinned DESC, p.created_at DESC`;
+    else                     q += ` ORDER BY p.is_pinned DESC, p.created_at DESC`;
 
-    params.push(parseInt(limit)); q += ` LIMIT $${params.length}`;
+    params.push(Math.min(parseInt(limit) || 50, 100));
+    q += ` LIMIT $${params.length}`;
+
     const { rows } = await pool.query(q, params);
-
-    // Add no-cache headers so 304 never serves stale empty data
     res.set('Cache-Control', 'no-store');
     res.json({ success: true, posts: rows });
   } catch (e) {
