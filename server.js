@@ -2859,14 +2859,19 @@ app.post('/api/assignments', authMiddleware, async (req, res) => {
   const { courseCode, title, description, dueDate, submissionPlace, submissionType, weight, notificationHoursBefore } = req.body;
   
   try {
+    // Ensure optional columns exist before inserting
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS subject VARCHAR(100)`).catch(()=>{});
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'medium'`).catch(()=>{});
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS estimated_hours DECIMAL(5,2)`).catch(()=>{});
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0`).catch(()=>{});
     const result = await pool.query(
-      `INSERT INTO assignments 
-       (user_id, course_code, title, description, due_date, submission_place, 
-        submission_type, weight, notification_hours_before)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING *`,
-      [req.user.userId, courseCode, title, description, dueDate, submissionPlace, 
-       submissionType, weight, notificationHoursBefore || 24]
+      `INSERT INTO assignments
+       (user_id, course_code, title, description, due_date, submission_place,
+        submission_type, weight, notification_hours_before, subject, priority, estimated_hours, progress)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [req.user.userId, courseCode||null, title, description||null, dueDate||null, submissionPlace||null,
+       submissionType||'online', weight||null, notificationHoursBefore||24,
+       req.body.subject||null, req.body.priority||'medium', req.body.estimated_hours||null, req.body.progress||0]
     );
     
     const assignment = result.rows[0];
@@ -3719,6 +3724,10 @@ ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at  TIMESTAMP;
 
 -- Extend assignments with submitted_at
 ALTER TABLE assignments ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS subject VARCHAR(100);
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'medium';
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS estimated_hours NUMERIC(4,1);
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0;
 
 -- Extend timetables with notification_minutes_before
 ALTER TABLE timetables ADD COLUMN IF NOT EXISTS notification_minutes_before INTEGER DEFAULT 30;
@@ -5132,6 +5141,89 @@ app.delete('/api/notifications/:id', authMiddleware, async (req, res) => {
 // ============================================================================
 
 // GET /api/marketplace/services/:id
+app.get('/api/marketplace/services/enhanced', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { category, section, search, sort = 'rating' } = req.query;
+  // Ensure tables exist
+  await pool.query(`CREATE TABLE IF NOT EXISTS service_reviews (id SERIAL PRIMARY KEY, service_id INTEGER REFERENCES marketplace_services(id) ON DELETE CASCADE, reviewer_id INTEGER REFERENCES users(id) ON DELETE CASCADE, rating INTEGER, comment TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(service_id, reviewer_id))`).catch(()=>{});
+  await pool.query(`CREATE TABLE IF NOT EXISTS service_bookings (id SERIAL PRIMARY KEY, service_id INTEGER REFERENCES marketplace_services(id) ON DELETE CASCADE, client_id INTEGER REFERENCES users(id) ON DELETE CASCADE, provider_id INTEGER REFERENCES users(id) ON DELETE CASCADE, brief TEXT, status VARCHAR(30) DEFAULT 'pending', budget NUMERIC(10,2), created_at TIMESTAMPTZ DEFAULT NOW())`).catch(()=>{});
+  await pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS rating NUMERIC(3,2) DEFAULT 0`).catch(()=>{});
+  await pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS review_count INTEGER DEFAULT 0`).catch(()=>{});
+  await pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS completed_count INTEGER DEFAULT 0`).catch(()=>{});
+  await pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE`).catch(()=>{});
+  await pool.query(`ALTER TABLE marketplace_services ADD COLUMN IF NOT EXISTS response_time VARCHAR(50) DEFAULT 'Within 24h'`).catch(()=>{});
+  let q = `
+    SELECT ms.*, u.full_name AS provider_name, u.phone AS provider_phone,
+      COALESCE(u.profile_image_url, u.avatar_url) AS provider_image,
+      u.institution AS provider_institution,
+      (SELECT json_agg(json_build_object('rating',sr.rating,'comment',sr.comment,'reviewer',ru.full_name,'created_at',sr.created_at) ORDER BY sr.created_at DESC)
+       FROM service_reviews sr JOIN users ru ON ru.id=sr.reviewer_id WHERE sr.service_id=ms.id LIMIT 3) AS reviews
+    FROM marketplace_services ms JOIN users u ON u.id=ms.provider_id WHERE 1=1`;
+  const params = [];
+  if (section) { params.push(section); q += ` AND ms.service_category=$${params.length}`; }
+  if (category && category !== 'all') { params.push(category); q += ` AND ms.category=$${params.length}`; }
+  if (search) { params.push(`%${search}%`); q += ` AND (ms.title ILIKE $${params.length} OR ms.description ILIKE $${params.length})`; }
+  const orderMap = { rating:'ms.rating DESC, ms.review_count DESC', newest:'ms.created_at DESC', price_low:'ms.price ASC', price_high:'ms.price DESC', popular:'ms.completed_count DESC' };
+  q += ` ORDER BY ms.is_featured DESC, ${orderMap[sort]||orderMap.rating} LIMIT 60`;
+  const { rows } = await pool.query(q, params).catch(()=>({ rows:[] }));
+  res.json({ success:true, services:rows });
+});
+
+// POST service review
+app.post('/api/marketplace/services/:id/review', authMiddleware, async (req, res) => {
+  const { rating, comment } = req.body;
+  if (!rating || rating < 1 || rating > 5) return res.status(400).json({ success:false, message:'Rating 1-5 required' });
+  const uid = req.user.userId;
+  await pool.query('INSERT INTO service_reviews(service_id,reviewer_id,rating,comment) VALUES($1,$2,$3,$4) ON CONFLICT(service_id,reviewer_id) DO UPDATE SET rating=$3,comment=$4',
+    [req.params.id, uid, rating, comment]).catch(()=>{});
+  // Update aggregated rating
+  await pool.query(`UPDATE marketplace_services SET rating=(SELECT AVG(rating)::numeric(3,2) FROM service_reviews WHERE service_id=$1), review_count=(SELECT COUNT(*)::int FROM service_reviews WHERE service_id=$1) WHERE id=$1`, [req.params.id]).catch(()=>{});
+  res.json({ success:true });
+});
+
+// POST book/request a service
+app.post('/api/marketplace/services/:id/book', authMiddleware, async (req, res) => {
+  const { brief, budget } = req.body;
+  const uid = req.user.userId;
+  const svc = await pool.query('SELECT provider_id, title FROM marketplace_services WHERE id=$1', [req.params.id]).catch(()=>({ rows:[] }));
+  if (!svc.rows[0]) return res.status(404).json({ success:false });
+  const { rows } = await pool.query('INSERT INTO service_bookings(service_id,client_id,provider_id,brief,budget) VALUES($1,$2,$3,$4,$5) RETURNING *',
+    [req.params.id, uid, svc.rows[0].provider_id, brief, budget]).catch(()=>({ rows:[] }));
+  // Send DM to provider with the brief
+  const clientRes = await pool.query('SELECT full_name FROM users WHERE id=$1', [uid]).catch(()=>({ rows:[{}] }));
+    const _dmBrief = brief || "Hi, I would like to hire you for this service.";
+  const _dmBudget = budget ? ('\n\nBudget: GH\u20b5' + budget) : '';
+  const dmContent = 'Service Request: "' + svc.rows[0].title + '"\n\n' + _dmBrief + _dmBudget;
+  await pool.query('INSERT INTO direct_messages(sender_id,receiver_id,content) VALUES($1,$2,$3)', [uid, svc.rows[0].provider_id, dmContent]).catch(()=>{});
+  await pool.query('INSERT INTO notifications(user_id,notification_type,title,message) VALUES($1,$2,$3,$4)',
+    [svc.rows[0].provider_id, 'service_booking', `New booking: ${svc.rows[0].title}`, `${clientRes.rows[0]?.full_name||'A student'} wants to hire you.`]).catch(()=>{});
+  res.json({ success:true, booking:rows[0] });
+});
+
+// GET my service bookings (as provider)
+app.get('/api/marketplace/services/my-bookings', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  await pool.query(`CREATE TABLE IF NOT EXISTS service_bookings (id SERIAL PRIMARY KEY, service_id INTEGER REFERENCES marketplace_services(id) ON DELETE CASCADE, client_id INTEGER REFERENCES users(id) ON DELETE CASCADE, provider_id INTEGER REFERENCES users(id) ON DELETE CASCADE, brief TEXT, status VARCHAR(30) DEFAULT 'pending', budget NUMERIC(10,2), created_at TIMESTAMPTZ DEFAULT NOW())`).catch(()=>{});
+  const { rows } = await pool.query(`
+    SELECT sb.*, ms.title AS service_title, u.full_name AS client_name,
+      COALESCE(u.profile_image_url, u.avatar_url) AS client_image
+    FROM service_bookings sb JOIN marketplace_services ms ON ms.id=sb.service_id
+    JOIN users u ON u.id=sb.client_id
+    WHERE sb.provider_id=$1 ORDER BY sb.created_at DESC LIMIT 20`, [uid]
+  ).catch(()=>({ rows:[] }));
+  res.json({ success:true, bookings:rows });
+});
+
+app.patch('/api/marketplace/services/bookings/:id', authMiddleware, async (req, res) => {
+  const { status } = req.body;
+  await pool.query('UPDATE service_bookings SET status=$1 WHERE id=$2 AND provider_id=$3', [status, req.params.id, req.user.userId]).catch(()=>{});
+  if (status === 'completed') {
+    await pool.query('UPDATE marketplace_services SET completed_count=completed_count+1 WHERE id=(SELECT service_id FROM service_bookings WHERE id=$1)', [req.params.id]).catch(()=>{});
+  }
+  res.json({ success:true });
+});
+
+
 app.get('/api/marketplace/services/:id', authMiddleware, async (req, res) => {
   try {
     await pool.query('UPDATE marketplace_services SET views=views+1 WHERE id=$1', [req.params.id]);
@@ -5342,12 +5434,18 @@ app.post('/api/library', authMiddleware, libraryUpload.fields([
 ]), async (req, res) => {
   const { title, description, subject, category } = req.body;
   try {
-    if (!req.files || !req.files.file) {
+    const existingUrl = req.body.existingFileUrl;
+    if (!existingUrl && (!req.files || !req.files.file)) {
       return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
-    const mainFile = req.files.file[0];
-    const thumbnailFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
-    const fileUrl = await uploadToSupabase(mainFile, 'library-resources', 'documents/');
+    let fileUrl;
+    let mainFile = req.files && req.files.file ? req.files.file[0] : null;
+    const thumbnailFile = req.files && req.files.thumbnail ? req.files.thumbnail[0] : null;
+    if (existingUrl) {
+      fileUrl = existingUrl; // Re-use existing Supabase URL
+    } else {
+      fileUrl = await uploadToSupabase(mainFile, 'library-resources', 'documents/');
+    }
     let thumbnailUrl = null;
     if (thumbnailFile) {
       thumbnailUrl = await uploadToSupabase(thumbnailFile, 'library-resources', 'thumbnails/');
@@ -5358,7 +5456,8 @@ app.post('/api/library', authMiddleware, libraryUpload.fields([
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [req.user.userId, title, description, subject,
        category || 'Lecture Notes', fileUrl, thumbnailUrl,
-       mainFile.mimetype, mainFile.size]
+       mainFile ? mainFile.mimetype : (req.body.fileType || 'application/pdf'),
+       mainFile ? mainFile.size : parseInt(req.body.fileSize || 0)]
     );
     setImmediate(() => {
       awardXP(req.user.userId, 'resource_upload', `resource:${result.rows[0].id}`);
@@ -7595,77 +7694,56 @@ pool.query(`CREATE TABLE IF NOT EXISTS service_bookings (
 )`).catch(()=>{});
 
 // Enhanced GET services with provider info, ratings, reviews
-app.get('/api/marketplace/services/enhanced', authMiddleware, async (req, res) => {
-  const uid = req.user.userId;
-  const { category, section, search, sort = 'rating' } = req.query;
-  let q = `
-    SELECT ms.*, u.full_name AS provider_name, u.phone AS provider_phone,
-      COALESCE(u.profile_image_url, u.avatar_url) AS provider_image,
-      u.institution AS provider_institution,
-      (SELECT json_agg(json_build_object('rating',sr.rating,'comment',sr.comment,'reviewer',ru.full_name,'created_at',sr.created_at) ORDER BY sr.created_at DESC)
-       FROM service_reviews sr JOIN users ru ON ru.id=sr.reviewer_id WHERE sr.service_id=ms.id LIMIT 3) AS reviews
-    FROM marketplace_services ms JOIN users u ON u.id=ms.provider_id WHERE 1=1`;
-  const params = [];
-  if (section) { params.push(section); q += ` AND ms.service_category=$${params.length}`; }
-  if (category && category !== 'all') { params.push(category); q += ` AND ms.category=$${params.length}`; }
-  if (search) { params.push(`%${search}%`); q += ` AND (ms.title ILIKE $${params.length} OR ms.description ILIKE $${params.length})`; }
-  const orderMap = { rating:'ms.rating DESC, ms.review_count DESC', newest:'ms.created_at DESC', price_low:'ms.price ASC', price_high:'ms.price DESC', popular:'ms.completed_count DESC' };
-  q += ` ORDER BY ms.is_featured DESC, ${orderMap[sort]||orderMap.rating} LIMIT 60`;
-  const { rows } = await pool.query(q, params).catch(()=>({ rows:[] }));
-  res.json({ success:true, services:rows });
-});
 
-// POST service review
-app.post('/api/marketplace/services/:id/review', authMiddleware, async (req, res) => {
-  const { rating, comment } = req.body;
-  if (!rating || rating < 1 || rating > 5) return res.status(400).json({ success:false, message:'Rating 1-5 required' });
+// ── SMART RIDESHARE MATCHING ─────────────────────────────────────────────────
+app.get('/api/rideshare/matches', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
-  await pool.query('INSERT INTO service_reviews(service_id,reviewer_id,rating,comment) VALUES($1,$2,$3,$4) ON CONFLICT(service_id,reviewer_id) DO UPDATE SET rating=$3,comment=$4',
-    [req.params.id, uid, rating, comment]).catch(()=>{});
-  // Update aggregated rating
-  await pool.query(`UPDATE marketplace_services SET rating=(SELECT AVG(rating)::numeric(3,2) FROM service_reviews WHERE service_id=$1), review_count=(SELECT COUNT(*)::int FROM service_reviews WHERE service_id=$1) WHERE id=$1`, [req.params.id]).catch(()=>{});
-  res.json({ success:true });
-});
-
-// POST book/request a service
-app.post('/api/marketplace/services/:id/book', authMiddleware, async (req, res) => {
-  const { brief, budget } = req.body;
-  const uid = req.user.userId;
-  const svc = await pool.query('SELECT provider_id, title FROM marketplace_services WHERE id=$1', [req.params.id]).catch(()=>({ rows:[] }));
-  if (!svc.rows[0]) return res.status(404).json({ success:false });
-  const { rows } = await pool.query('INSERT INTO service_bookings(service_id,client_id,provider_id,brief,budget) VALUES($1,$2,$3,$4,$5) RETURNING *',
-    [req.params.id, uid, svc.rows[0].provider_id, brief, budget]).catch(()=>({ rows:[] }));
-  // Send DM to provider with the brief
-  const clientRes = await pool.query('SELECT full_name FROM users WHERE id=$1', [uid]).catch(()=>({ rows:[{}] }));
-    const _dmBrief = brief || "Hi, I would like to hire you for this service.";
-  const _dmBudget = budget ? ('\n\nBudget: GH\u20b5' + budget) : '';
-  const dmContent = 'Service Request: "' + svc.rows[0].title + '"\n\n' + _dmBrief + _dmBudget;
-  await pool.query('INSERT INTO direct_messages(sender_id,receiver_id,content) VALUES($1,$2,$3)', [uid, svc.rows[0].provider_id, dmContent]).catch(()=>{});
-  await pool.query('INSERT INTO notifications(user_id,notification_type,title,message) VALUES($1,$2,$3,$4)',
-    [svc.rows[0].provider_id, 'service_booking', `New booking: ${svc.rows[0].title}`, `${clientRes.rows[0]?.full_name||'A student'} wants to hire you.`]).catch(()=>{});
-  res.json({ success:true, booking:rows[0] });
-});
-
-// GET my service bookings (as provider)
-app.get('/api/marketplace/services/my-bookings', authMiddleware, async (req, res) => {
-  const uid = req.user.userId;
-  const { rows } = await pool.query(`
-    SELECT sb.*, ms.title AS service_title, u.full_name AS client_name,
-      COALESCE(u.profile_image_url, u.avatar_url) AS client_image
-    FROM service_bookings sb JOIN marketplace_services ms ON ms.id=sb.service_id
-    JOIN users u ON u.id=sb.client_id
-    WHERE sb.provider_id=$1 ORDER BY sb.created_at DESC LIMIT 20`, [uid]
-  ).catch(()=>({ rows:[] }));
-  res.json({ success:true, bookings:rows });
-});
-
-app.patch('/api/marketplace/services/bookings/:id', authMiddleware, async (req, res) => {
-  const { status } = req.body;
-  await pool.query('UPDATE service_bookings SET status=$1 WHERE id=$2 AND provider_id=$3', [status, req.params.id, req.user.userId]).catch(()=>{});
-  if (status === 'completed') {
-    await pool.query('UPDATE marketplace_services SET completed_count=completed_count+1 WHERE id=(SELECT service_id FROM service_bookings WHERE id=$1)', [req.params.id]).catch(()=>{});
+  try {
+    // Find users with timetable classes at the same location within 30 min of each other
+    // Only users who have opted in (have an active rideshare request)
+    const { rows } = await pool.query(`
+      SELECT DISTINCT
+        u.id, u.full_name, u.institution,
+        COALESCE(u.profile_image_url, u.avatar_url) AS profile_image,
+        t1.location_name AS shared_location,
+        t1.start_time AS my_time,
+        t2.start_time AS their_time,
+        t1.day_of_week AS day,
+        rr.pickup_location, rr.destination,
+        ABS(EXTRACT(EPOCH FROM (t1.start_time::time - t2.start_time::time))/60)::int AS time_diff_mins
+      FROM timetables t1
+      JOIN timetables t2 ON (
+        LOWER(TRIM(t1.location_name)) = LOWER(TRIM(t2.location_name))
+        AND t1.day_of_week = t2.day_of_week
+        AND t1.user_id != t2.user_id
+        AND ABS(EXTRACT(EPOCH FROM (t1.start_time::time - t2.start_time::time))/60) <= 45
+      )
+      JOIN users u ON u.id = t2.user_id
+      JOIN rideshare_requests rr ON rr.user_id = t2.user_id AND rr.status = 'open'
+      WHERE t1.user_id = $1
+        AND t1.location_name IS NOT NULL AND t1.location_name != ''
+        AND u.institution = (SELECT institution FROM users WHERE id=$1)
+      ORDER BY time_diff_mins ASC
+      LIMIT 10`, [uid]
+    );
+    res.json({ success: true, matches: rows });
+  } catch(e) {
+    console.error('Rideshare match error:', e.message);
+    res.json({ success: true, matches: [] });
   }
-  res.json({ success:true });
+});
+
+// Opt-in to rideshare matching
+app.post('/api/rideshare/opt-in', authMiddleware, async (req, res) => {
+  const { pickup, destination } = req.body;
+  await pool.query(`ALTER TABLE rideshare_requests ADD COLUMN IF NOT EXISTS opted_in_matching BOOLEAN DEFAULT TRUE`).catch(()=>{});
+  // Create a standing open request for matching
+  await pool.query(
+    `INSERT INTO rideshare_requests (user_id, pickup_location, destination, status) VALUES ($1,$2,$3,'open')
+     ON CONFLICT DO NOTHING`,
+    [req.user.userId, pickup||'Campus', destination||'City Center']
+  ).catch(()=>{});
+  res.json({ success: true });
 });
 
 // ============================================
@@ -7825,14 +7903,12 @@ app.post('/api/ai/past-paper', authMiddleware, async (req, res) => {
 app.post('/api/ai/weekly-review', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
   try {
-    const [focusRes, actRes, gradeRes] = await Promise.all([
-      pool.query(`SELECT COALESCE(SUM(duration_secs),0)::int AS secs FROM focus_sessions WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days'`, [uid]).catch(()=>({ rows:[{secs:0}] })),
-      pool.query(`SELECT COUNT(*)::int AS cnt FROM activity_log WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days'`, [uid]).catch(()=>({ rows:[{cnt:0}] })),
-      pool.query(`SELECT COUNT(*)::int AS cnt FROM assignments WHERE user_id=$1 AND status='submitted' AND updated_at > NOW()-INTERVAL '7 days'`, [uid]).catch(()=>({ rows:[{cnt:0}] })),
-    ]);
-    const focusMins = Math.round((focusRes.rows[0]?.secs || 0) / 60);
-    const actions = actRes.rows[0]?.cnt || 0;
-    const submitted = gradeRes.rows[0]?.cnt || 0;
+    const focusMins = await pool.query(`SELECT COALESCE(SUM(duration_secs),0)::int AS secs FROM focus_sessions WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days'`, [uid])
+      .then(r=>Math.round((r.rows[0]?.secs||0)/60)).catch(()=>0);
+    const actions = await pool.query(`SELECT COUNT(*)::int AS cnt FROM activity_log WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days'`, [uid])
+      .then(r=>r.rows[0]?.cnt||0).catch(()=>0);
+    const submitted = await pool.query(`SELECT COUNT(*)::int AS cnt FROM assignments WHERE user_id=$1 AND (status='submitted' OR status='completed') AND created_at > NOW()-INTERVAL '7 days'`, [uid])
+      .then(r=>r.rows[0]?.cnt||0).catch(()=>0);
     const reply = await callClaude(
       'claude-haiku-4-5-20251001',
       'You are a supportive academic coach writing a brief weekly review. Be encouraging, specific, and actionable. Max 120 words.',
