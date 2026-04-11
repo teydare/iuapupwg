@@ -5,6 +5,16 @@
 // This server uses Supabase Storage buckets for persistent file storage
 // Images and documents survive Railway container restarts
 
+// ── WEB PUSH NOTIFICATIONS ──────────────────────────────────────────────────
+let webpush;
+try {
+  webpush = require('web-push');
+  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjZJF1zGkh4Lp0Bm4e1BXHHXb5KA';
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || 'UUxI4O8-FbRouAevSmBQ6co62dvsdahsnLs3-aSl4To';
+  webpush.setVapidDetails('mailto:admin@studenthub.app', VAPID_PUBLIC, VAPID_PRIVATE);
+} catch(e) { console.log('web-push not installed — push notifications disabled. Run: npm install web-push'); }
+
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -736,7 +746,9 @@ app.get('/api/health', (req, res) => {
     status: 'ok', 
     message: 'StudentHub API is healthy',
     database: pool.totalCount > 0 ? 'connected' : 'disconnected',
-    storage: 'Supabase Storage'
+    storage: 'Supabase Storage',
+    ai_configured: !!process.env.ANTHROPIC_API_KEY,
+    node_version: process.version,
   });
 });
 
@@ -3362,32 +3374,43 @@ app.post('/api/timetable/setup-notifications', authMiddleware, async (req, res) 
 // ============================================
 
 app.post('/api/rideshare', authMiddleware, async (req, res) => {
-  const { destinationName, lat, lng, pickupTime, seatsAvailable, isDriver, notes } = req.body;
-  
+  // Accept both old field names (destinationName/pickupTime) and new (destination/departureTime)
+  const uid = req.user.userId;
+  const pickup    = req.body.pickup || req.body.pickupLocation || 'Campus';
+  const destination = req.body.destination || req.body.destinationName || '';
+  const departureTime = req.body.departureTime || req.body.pickupTime || null;
+  const seats     = parseInt(req.body.seats || req.body.seatsAvailable || 1);
+  const notes     = req.body.notes || null;
+  if (!destination.trim()) return res.status(400).json({ success:false, message:'Destination required' });
   try {
-    const result = await pool.query(
-      `INSERT INTO rideshare_requests 
-       (user_id, destination_name, destination_lat, destination_lng, pickup_time, 
-        seats_available, is_driver, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING *`,
-      [req.user.userId, destinationName, lat, lng, pickupTime, seatsAvailable, isDriver, notes]
+    // Ensure new columns exist
+    await pool.query('ALTER TABLE rideshare_requests ADD COLUMN IF NOT EXISTS pickup_location VARCHAR(255)').catch(()=>{});
+    await pool.query('ALTER TABLE rideshare_requests ADD COLUMN IF NOT EXISTS departure_time TIMESTAMPTZ').catch(()=>{});
+    await pool.query('ALTER TABLE rideshare_requests ADD COLUMN IF NOT EXISTS poster_name VARCHAR(100)').catch(()=>{});
+    const uRes = await pool.query('SELECT full_name FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{}]}));
+    const { rows } = await pool.query(
+      `INSERT INTO rideshare_requests
+       (user_id, pickup_location, destination_name, departure_time, seats_available, notes, status, poster_name)
+       VALUES ($1,$2,$3,$4,$5,$6,'open',$7) RETURNING *`,
+      [uid, pickup, destination, departureTime, seats, notes, uRes.rows[0]?.full_name||'Student']
     );
-    res.json({ success: true, request: result.rows[0] });
+    res.json({ success:true, request: { ...rows[0], pickup_location:pickup, destination:destination } });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Server error' });
+    console.error('POST /api/rideshare error:', error.message);
+    res.status(500).json({ success:false, message: error.message });
   }
 });
 
 app.get('/api/rideshare', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT rr.*, u.full_name, u.phone
+      `SELECT rr.*, 
+        COALESCE(rr.poster_name, u.full_name) AS poster_name,
+        u.phone, u.institution
        FROM rideshare_requests rr
        JOIN users u ON rr.user_id = u.id
-       WHERE rr.status = 'active'
-       AND rr.pickup_time > NOW()
-       ORDER BY rr.pickup_time ASC`
+       WHERE rr.status = 'open'
+       ORDER BY rr.created_at DESC LIMIT 50`
     );
     res.json({ success: true, requests: result.rows });
   } catch (error) {
@@ -7746,6 +7769,89 @@ app.post('/api/rideshare/opt-in', authMiddleware, async (req, res) => {
   res.json({ success: true });
 });
 
+
+// ── PUSH NOTIFICATION SUBSCRIPTION ROUTES ───────────────────────────────────
+pool.query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  subscription JSONB NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, (subscription->>'endpoint'))
+)`).catch(()=>{});
+
+// GET VAPID public key
+app.get('/api/push/vapid-public-key', (req, res) => {
+  const key = process.env.VAPID_PUBLIC_KEY || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjZJF1zGkh4Lp0Bm4e1BXHHXb5KA';
+  res.json({ key });
+});
+
+// POST /api/push/subscribe
+app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
+  const { subscription } = req.body;
+  if (!subscription?.endpoint) return res.status(400).json({ success:false, message:'Invalid subscription' });
+  await pool.query(
+    `INSERT INTO push_subscriptions (user_id, subscription) VALUES ($1,$2)
+     ON CONFLICT (user_id, (subscription->>'endpoint')) DO UPDATE SET subscription=$2`,
+    [req.user.userId, JSON.stringify(subscription)]
+  ).catch(()=>{});
+  res.json({ success:true });
+});
+
+// POST /api/push/unsubscribe  
+app.post('/api/push/unsubscribe', authMiddleware, async (req, res) => {
+  const { endpoint } = req.body;
+  await pool.query(
+    `DELETE FROM push_subscriptions WHERE user_id=$1 AND subscription->>'endpoint'=$2`,
+    [req.user.userId, endpoint]
+  ).catch(()=>{});
+  res.json({ success:true });
+});
+
+// Internal helper: send push to a user
+async function sendPushToUser(userId, title, body, data = {}) {
+  if (!webpush) return;
+  try {
+    const { rows } = await pool.query('SELECT subscription FROM push_subscriptions WHERE user_id=$1', [userId]);
+    for (const row of rows) {
+      try {
+        await webpush.sendNotification(
+          row.subscription,
+          JSON.stringify({ title, body, icon: '/logo192.png', badge: '/logo192.png', data })
+        );
+      } catch (e) {
+        // Subscription expired — clean it up
+        if (e.statusCode === 410) {
+          await pool.query(`DELETE FROM push_subscriptions WHERE user_id=$1 AND subscription->>'endpoint'=$2`,
+            [userId, row.subscription.endpoint]).catch(()=>{});
+        }
+      }
+    }
+  } catch {}
+}
+
+// Hook push notifications into existing notification creation
+// Called when a notification is inserted
+app.post('/api/notifications', authMiddleware, async (req, res) => {
+  const { userId, type, title, message } = req.body;
+  if (!title?.trim()) return res.status(400).json({ success:false });
+  const uid = userId || req.user.userId;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO notifications (user_id, notification_type, title, message, scheduled_time) VALUES ($1,$2,$3,$4,NOW()) RETURNING *`,
+      [uid, type||'general', title, message||'']
+    );
+    // Send push
+    await sendPushToUser(uid, title, message||'');
+    res.json({ success:true, notification: rows[0] });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+// Service worker manifest public key endpoint (for clients to use)
+app.get('/api/push/test', authMiddleware, async (req, res) => {
+  await sendPushToUser(req.user.userId, 'StudentHub', 'Push notifications are working! 🎉');
+  res.json({ success:true });
+});
+
 // ============================================
 // START SERVER
 // ============================================
@@ -7772,6 +7878,7 @@ app.post('/api/rideshare/opt-in', authMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🤖 AI Features: ${process.env.ANTHROPIC_API_KEY ? '✅ ANTHROPIC_API_KEY is set' : '❌ ANTHROPIC_API_KEY NOT SET — AI features will fail'}`);
   console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`💾 Storage: Supabase Storage`);
   console.log(`📊 Database: PostgreSQL (Supabase)`);
@@ -7828,17 +7935,34 @@ const AI_HEADERS = {
 };
 
 async function callClaude(model, system, userMsg, maxTokens = 800) {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error('ANTHROPIC_API_KEY is not configured on this server. Add it in your Render environment variables.');
-  const headers = { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' };
-  const res = await fetch(ANTHROPIC_API, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: userMsg }] }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error?.message || `Anthropic API error ${res.status}`);
-  return data.content[0]?.text || '';
+  const key = (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_KEY || '').trim();
+  if (!key) {
+    const err = new Error('ANTHROPIC_API_KEY not set. Add it in Render Dashboard → your service → Environment tab → ANTHROPIC_API_KEY=sk-ant-...');
+    err.statusCode = 503;
+    throw err;
+  }
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-api-key': key,
+    'anthropic-version': '2023-06-01',
+  };
+  let res, data;
+  try {
+    res = await fetch(ANTHROPIC_API, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: String(userMsg || '') }] }),
+    });
+    data = await res.json();
+  } catch (fetchErr) {
+    throw new Error('Network error reaching Anthropic: ' + fetchErr.message);
+  }
+  if (!res.ok) {
+    const msg = data?.error?.message || JSON.stringify(data) || `HTTP ${res.status}`;
+    console.error('[AI] Anthropic returned', res.status, msg);
+    throw new Error(msg);
+  }
+  return data.content?.[0]?.text || '';
 }
 
 // POST /api/ai/tutor — AI Study Tutor (Haiku — fast & cheap)
@@ -8419,7 +8543,13 @@ app.get('/api/daily-reward/status', authMiddleware, async (req, res) => {
 app.post('/api/daily-reward/claim', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
   const today = new Date().toISOString().split('T')[0];
-  const existing = await pool.query('SELECT id FROM daily_rewards WHERE user_id=$1 AND DATE(claimed_at)=$2', [uid, today]).catch(()=>({rows:[{id:1}]}));
+  // Ensure table exists first
+  await pool.query(`CREATE TABLE IF NOT EXISTS daily_rewards (
+    id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    day_number INTEGER NOT NULL, reward_type VARCHAR(50), reward_value INTEGER,
+    claimed_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(user_id, DATE(claimed_at))
+  )`).catch(()=>{});
+  const existing = await pool.query('SELECT id FROM daily_rewards WHERE user_id=$1 AND DATE(claimed_at)=$2', [uid, today]).catch(()=>({rows:[]}));
   if (existing.rows.length) return res.status(400).json({ success:false, message:'Already claimed today' });
   const totalRes = await pool.query('SELECT COUNT(*)::int AS cnt FROM daily_rewards WHERE user_id=$1', [uid]).catch(()=>({rows:[{cnt:0}]}));
   const total = (totalRes.rows[0]?.cnt || 0) + 1;
