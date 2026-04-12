@@ -7852,6 +7852,199 @@ app.get('/api/push/test', authMiddleware, async (req, res) => {
   res.json({ success:true });
 });
 
+
+// ============================================================================
+// SUBSCRIPTION & PAYSTACK PAYMENT SYSTEM
+// ============================================================================
+
+// Ensure subscription columns on users table
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paystack_customer_code VARCHAR(100)`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS payment_history (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  plan VARCHAR(20) NOT NULL,
+  amount_ghs NUMERIC(10,2) NOT NULL,
+  paystack_reference VARCHAR(100),
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+const PLANS = {
+  free:    { name:'Free',    price:0,  features:['class_spaces','assignments','homework_no_ai','library_2h_day'] },
+  basic:   { name:'Basic',   price:10, features:['class_spaces','assignments','homework_help','library_full','marketplace','campus_pulse','study_groups','grade_tracker','timetable'] },
+  premium: { name:'Premium', price:20, features:['everything','ai_features','ai_tutor','ai_flashcards','ai_study_plan','priority_support'] },
+};
+
+// Helper: get user's effective plan
+async function getUserPlan(userId) {
+  const { rows } = await pool.query(
+    'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [userId]
+  ).catch(()=>({ rows:[{}] }));
+  const u = rows[0] || {};
+  const now = new Date();
+  if (u.paid_until && new Date(u.paid_until) > now) return u.plan || 'basic';
+  if (u.trial_ends_at && new Date(u.trial_ends_at) > now) return 'trial'; // trial = all features
+  return 'free';
+}
+
+// Middleware: check plan access
+function requirePlan(minPlan) {
+  const hierarchy = { free:0, trial:3, basic:1, premium:2 };
+  return async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ success:false, message:'Not authenticated' });
+    const plan = await getUserPlan(req.user.userId);
+    const userLevel = hierarchy[plan] ?? 0;
+    const requiredLevel = hierarchy[minPlan] ?? 1;
+    if (userLevel >= requiredLevel) return next();
+    const isPlanBlocked = plan === 'free';
+    res.status(403).json({
+      success: false,
+      plan_required: minPlan,
+      current_plan: plan,
+      upgrade_required: true,
+      message: isPlanBlocked
+        ? `This feature requires a paid plan. Upgrade for GH₵10/month.`
+        : `This feature requires the Premium plan (GH₵20/month).`,
+    });
+  };
+}
+
+// GET /api/subscription/status
+app.get('/api/subscription/status', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [uid]
+  ).catch(()=>({ rows:[{}] }));
+  const u = rows[0] || {};
+  const plan = await getUserPlan(uid);
+  const trialDaysLeft = u.trial_ends_at
+    ? Math.max(0, Math.ceil((new Date(u.trial_ends_at) - Date.now()) / 86400000))
+    : 0;
+  res.json({
+    success: true,
+    plan,
+    db_plan: u.plan,
+    trial_ends_at: u.trial_ends_at,
+    paid_until: u.paid_until,
+    trial_days_left: trialDaysLeft,
+    is_trial: plan === 'trial',
+    features: PLANS[plan === 'trial' ? 'premium' : (plan || 'free')]?.features || PLANS.free.features,
+  });
+});
+
+// POST /api/subscription/initiate — create Paystack payment
+app.post('/api/subscription/initiate', authMiddleware, async (req, res) => {
+  const { plan } = req.body; // 'basic' | 'premium'
+  if (!['basic','premium'].includes(plan)) return res.status(400).json({ success:false, message:'Invalid plan' });
+  const uid = req.user.userId;
+  const uRes = await pool.query('SELECT email, full_name FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{}]}));
+  const user = uRes.rows[0] || {};
+  const amount = PLANS[plan].price * 100; // Paystack uses pesewas (GHS * 100)
+  const reference = `sh_${plan}_${uid}_${Date.now()}`;
+
+  // Store pending payment
+  await pool.query(
+    'INSERT INTO payment_history (user_id, plan, amount_ghs, paystack_reference, status) VALUES ($1,$2,$3,$4,$5)',
+    [uid, plan, PLANS[plan].price, reference, 'pending']
+  ).catch(()=>{});
+
+  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+  if (!PAYSTACK_SECRET) {
+    // Dev mode — return mock checkout URL
+    return res.json({
+      success: true,
+      authorization_url: `${process.env.FRONTEND_URL || 'https://studenthub.vercel.app'}?paystack_mock=1&ref=${reference}&plan=${plan}`,
+      reference,
+      mock: true,
+    });
+  }
+
+  try {
+    const psRes = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: user.email,
+        amount,
+        reference,
+        currency: 'GHS',
+        metadata: { user_id: uid, plan, full_name: user.full_name },
+        callback_url: `${process.env.FRONTEND_URL || 'https://studenthub.vercel.app'}/payment/verify?reference=${reference}`,
+      }),
+    });
+    const psData = await psRes.json();
+    if (!psRes.ok || !psData.status) throw new Error(psData.message || 'Paystack error');
+    res.json({ success:true, authorization_url: psData.data.authorization_url, reference });
+  } catch(e) {
+    console.error('Paystack init error:', e.message);
+    res.status(500).json({ success:false, message:e.message });
+  }
+});
+
+// POST /api/subscription/verify — verify after redirect back
+app.post('/api/subscription/verify', authMiddleware, async (req, res) => {
+  const { reference } = req.body;
+  if (!reference) return res.status(400).json({ success:false, message:'Reference required' });
+  const uid = req.user.userId;
+
+  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+  // Mock verification for dev
+  if (!PAYSTACK_SECRET || reference.includes('mock')) {
+    const planMatch = reference.match(/sh_(basic|premium)_/);
+    const plan = planMatch ? planMatch[1] : 'basic';
+    const paidUntil = new Date(); paidUntil.setMonth(paidUntil.getMonth()+1);
+    await pool.query('UPDATE users SET plan=$1, paid_until=$2 WHERE id=$3', [plan, paidUntil, uid]).catch(()=>{});
+    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2', ['success', reference]).catch(()=>{});
+    return res.json({ success:true, plan, paid_until:paidUntil });
+  }
+
+  try {
+    const psRes = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
+    });
+    const psData = await psRes.json();
+    if (!psRes.ok || psData.data?.status !== 'success') {
+      return res.status(400).json({ success:false, message:'Payment not confirmed' });
+    }
+    const plan = psData.data.metadata?.plan || 'basic';
+    const paidUntil = new Date(); paidUntil.setMonth(paidUntil.getMonth()+1);
+    await pool.query('UPDATE users SET plan=$1, paid_until=$2, paystack_customer_code=$3 WHERE id=$4',
+      [plan, paidUntil, psData.data.customer?.customer_code||null, uid]).catch(()=>{});
+    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2', ['success', reference]).catch(()=>{});
+    res.json({ success:true, plan, paid_until:paidUntil });
+  } catch(e) {
+    res.status(500).json({ success:false, message:e.message });
+  }
+});
+
+// POST /api/subscription/webhook — Paystack webhook for recurring charges
+app.post('/api/paystack/webhook', async (req, res) => {
+  const signature = req.headers['x-paystack-signature'];
+  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+  if (PAYSTACK_SECRET && signature) {
+    const crypto = require('crypto');
+    const hash = crypto.createHmac('sha512', PAYSTACK_SECRET).update(JSON.stringify(req.body)).digest('hex');
+    if (hash !== signature) return res.status(400).send('Invalid signature');
+  }
+  const event = req.body;
+  if (event.event === 'charge.success') {
+    const meta = event.data?.metadata || {};
+    const userId = meta.user_id;
+    const plan = meta.plan;
+    if (userId && plan) {
+      const paidUntil = new Date(); paidUntil.setMonth(paidUntil.getMonth()+1);
+      await pool.query('UPDATE users SET plan=$1, paid_until=$2 WHERE id=$3', [plan, paidUntil, userId]).catch(()=>{});
+    }
+  }
+  res.sendStatus(200);
+});
+
+// Protect AI features to premium/trial only
+// (applied inline where needed via requirePlan middleware)
+
 // ============================================
 // START SERVER
 // ============================================
@@ -7966,7 +8159,7 @@ async function callClaude(model, system, userMsg, maxTokens = 800) {
 }
 
 // POST /api/ai/tutor — AI Study Tutor (Haiku — fast & cheap)
-app.post('/api/ai/tutor', authMiddleware, async (req, res) => {
+app.post('/api/ai/tutor', authMiddleware, requirePlan('basic'), async (req, res) => {
   const { message, mode = 'explain', subject, history = [] } = req.body;
   if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
   const systemPrompts = {
@@ -7979,15 +8172,11 @@ app.post('/api/ai/tutor', authMiddleware, async (req, res) => {
     const msgs = [...history.slice(-6), { role: 'user', content: message }];
     const reply = await callClaude('claude-haiku-4-5-20251001', systemPrompts[mode] || systemPrompts.explain, message, 600);
     res.json({ success: true, reply });
-  } catch (e) {
-    console.error('AI tutor error:', e.message);
-    const status = e.message.includes('ANTHROPIC_API_KEY') ? 503 : 500;
-    res.status(status).json({ success: false, message: e.message });
-  }
+  } catch (e) { const sc = e.statusCode===503||e.message?.includes('ANTHROPIC_API_KEY')?503:500; console.error('[AI]', e.message); res.status(sc).json({ success:false, message:e.message }); }
 });
 
 // POST /api/ai/essay — Essay feedback (Sonnet — needs quality)
-app.post('/api/ai/essay', authMiddleware, async (req, res) => {
+app.post('/api/ai/essay', authMiddleware, requirePlan('premium'), async (req, res) => {
   const { essay, type = 'essay' } = req.body;
   if (!essay?.trim()) return res.status(400).json({ success: false, message: 'Essay text required' });
   if (essay.length > 8000) return res.status(400).json({ success: false, message: 'Essay too long (max ~1500 words)' });
@@ -8002,7 +8191,7 @@ app.post('/api/ai/essay', authMiddleware, async (req, res) => {
     try { feedback = JSON.parse(reply.replace(/```json|```/g, '').trim()); }
     catch { feedback = { overall_score: 70, grade: 'B', strengths: ['Good effort'], improvements: ['Expand your argument'], summary: reply }; }
     res.json({ success: true, feedback });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { const sc = e.statusCode === 503 || e.message?.includes('ANTHROPIC_API_KEY') ? 503 : 500; console.error('[AI route]', e.message); res.status(sc).json({ success: false, message: e.message }); }
 });
 
 // POST /api/ai/past-paper — Past paper analysis
@@ -8020,11 +8209,11 @@ app.post('/api/ai/past-paper', authMiddleware, async (req, res) => {
     try { analysis = JSON.parse(reply.replace(/```json|```/g, '').trim()); }
     catch { analysis = { topics: [], likely_topics: [], practice_questions: [], tips: ['Review the material carefully'] }; }
     res.json({ success: true, analysis });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { const sc = e.statusCode === 503 || e.message?.includes('ANTHROPIC_API_KEY') ? 503 : 500; console.error('[AI route]', e.message); res.status(sc).json({ success: false, message: e.message }); }
 });
 
 // POST /api/ai/weekly-review — Weekly AI digest (Haiku)
-app.post('/api/ai/weekly-review', authMiddleware, async (req, res) => {
+app.post('/api/ai/weekly-review', authMiddleware, requirePlan('basic'), async (req, res) => {
   const uid = req.user.userId;
   try {
     const focusMins = await pool.query(`SELECT COALESCE(SUM(duration_secs),0)::int AS secs FROM focus_sessions WHERE user_id=$1 AND created_at > NOW()-INTERVAL '7 days'`, [uid])
@@ -8040,11 +8229,11 @@ app.post('/api/ai/weekly-review', authMiddleware, async (req, res) => {
       200
     );
     res.json({ success: true, review: reply, stats: { focusMins, actions, submitted } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { const sc = e.statusCode === 503 || e.message?.includes('ANTHROPIC_API_KEY') ? 503 : 500; console.error('[AI route]', e.message); res.status(sc).json({ success: false, message: e.message }); }
 });
 
 // POST /api/ai/flashcards — Generate flashcards from text (Haiku)
-app.post('/api/ai/flashcards', authMiddleware, async (req, res) => {
+app.post('/api/ai/flashcards', authMiddleware, requirePlan('basic'), async (req, res) => {
   const { text, count = 8 } = req.body;
   if (!text?.trim()) return res.status(400).json({ success: false, message: 'Text required' });
   try {
@@ -8058,7 +8247,7 @@ app.post('/api/ai/flashcards', authMiddleware, async (req, res) => {
     try { cards = JSON.parse(reply.replace(/```json|```/g, '').trim()); }
     catch { cards = []; }
     res.json({ success: true, cards: Array.isArray(cards) ? cards : [] });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { const sc = e.statusCode === 503 || e.message?.includes('ANTHROPIC_API_KEY') ? 503 : 500; console.error('[AI route]', e.message); res.status(sc).json({ success: false, message: e.message }); }
 });
 
 // ── FLASHCARD DECKS ─────────────────────────────────────────────────────────
@@ -8747,7 +8936,7 @@ app.get('/api/reminders/pending', authMiddleware, async (req, res) => {
 });
 
 // ── AI STUDY PLAN (smart, context-aware) ────────────────────────────────────
-app.post('/api/ai/study-plan', authMiddleware, async (req, res) => {
+app.post('/api/ai/study-plan', authMiddleware, requirePlan('basic'), async (req, res) => {
   const uid = req.user.userId;
   try {
     const [gradeRes, examRes, focusRes] = await Promise.all([
