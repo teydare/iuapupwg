@@ -127,6 +127,41 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 app.use(cors({
+
+// Helper: get user's effective plan
+async function getUserPlan(userId) {
+  const { rows } = await pool.query(
+    'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [userId]
+  ).catch(()=>({ rows:[{}] }));
+  const u = rows[0] || {};
+  const now = new Date();
+  if (u.paid_until && new Date(u.paid_until) > now) return u.plan || 'basic';
+  if (u.trial_ends_at && new Date(u.trial_ends_at) > now) return 'trial'; // trial = all features
+  return 'free';
+}
+
+// Middleware: check plan access
+function requirePlan(minPlan) {
+  const hierarchy = { free:0, trial:3, basic:1, premium:2 };
+  return async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ success:false, message:'Not authenticated' });
+    const plan = await getUserPlan(req.user.userId);
+    const userLevel = hierarchy[plan] ?? 0;
+    const requiredLevel = hierarchy[minPlan] ?? 1;
+    if (userLevel >= requiredLevel) return next();
+    const isPlanBlocked = plan === 'free';
+    res.status(403).json({
+      success: false,
+      plan_required: minPlan,
+      current_plan: plan,
+      upgrade_required: true,
+      message: isPlanBlocked
+        ? `This feature requires a paid plan. Upgrade for GH₵10/month.`
+        : `This feature requires the Premium plan (GH₵20/month).`,
+    });
+  };
+}
+
   origin: function(origin, callback) {
     // allow non-browser requests (e.g. curl, server-to-server) with no origin
     if (!origin) return callback(null, true);
@@ -7877,40 +7912,6 @@ const PLANS = {
   basic:   { name:'Basic',   price:10, features:['class_spaces','assignments','homework_help','library_full','marketplace','campus_pulse','study_groups','grade_tracker','timetable'] },
   premium: { name:'Premium', price:20, features:['everything','ai_features','ai_tutor','ai_flashcards','ai_study_plan','priority_support'] },
 };
-
-// Helper: get user's effective plan
-async function getUserPlan(userId) {
-  const { rows } = await pool.query(
-    'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [userId]
-  ).catch(()=>({ rows:[{}] }));
-  const u = rows[0] || {};
-  const now = new Date();
-  if (u.paid_until && new Date(u.paid_until) > now) return u.plan || 'basic';
-  if (u.trial_ends_at && new Date(u.trial_ends_at) > now) return 'trial'; // trial = all features
-  return 'free';
-}
-
-// Middleware: check plan access
-function requirePlan(minPlan) {
-  const hierarchy = { free:0, trial:3, basic:1, premium:2 };
-  return async (req, res, next) => {
-    if (!req.user) return res.status(401).json({ success:false, message:'Not authenticated' });
-    const plan = await getUserPlan(req.user.userId);
-    const userLevel = hierarchy[plan] ?? 0;
-    const requiredLevel = hierarchy[minPlan] ?? 1;
-    if (userLevel >= requiredLevel) return next();
-    const isPlanBlocked = plan === 'free';
-    res.status(403).json({
-      success: false,
-      plan_required: minPlan,
-      current_plan: plan,
-      upgrade_required: true,
-      message: isPlanBlocked
-        ? `This feature requires a paid plan. Upgrade for GH₵10/month.`
-        : `This feature requires the Premium plan (GH₵20/month).`,
-    });
-  };
-}
 
 // GET /api/subscription/status
 app.get('/api/subscription/status', authMiddleware, async (req, res) => {
