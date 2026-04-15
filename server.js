@@ -127,6 +127,23 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 app.use(cors({
+  origin: function(origin, callback) {
+    // allow non-browser requests (e.g. curl, server-to-server) with no origin
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
+}));
+
+// Ensure preflight requests are answered
+app.options('*', cors());  
+app.use(express.json({ limit: '50mb' }));
 
 // Helper: get user's effective plan
 async function getUserPlan(userId) {
@@ -161,24 +178,6 @@ function requirePlan(minPlan) {
     });
   };
 }
-
-  origin: function(origin, callback) {
-    // allow non-browser requests (e.g. curl, server-to-server) with no origin
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      return callback(null, true);
-    } else {
-      return callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
-}));
-
-// Ensure preflight requests are answered
-app.options('*', cors());  
-app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ✅ FIXED: Rate limiter with proper proxy config
