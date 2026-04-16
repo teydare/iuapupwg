@@ -1302,6 +1302,18 @@ app.post('/api/auth/onboarding', authMiddleware, async (req, res) => {
   const intsA  = Array.isArray(interests) ? interests : (interests ? JSON.parse(interests) : []);
 
   try {
+    // Ensure optional columns exist
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20)`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS social_pref VARCHAR(50)`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[]`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS goals TEXT[]`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS study_times TEXT[]`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS study_style VARCHAR(50)`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS programme VARCHAR(100)`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ`).catch(()=>{});
+
     const { rows } = await pool.query(
       `UPDATE users SET
          programme          = COALESCE($1, programme),
@@ -7915,6 +7927,10 @@ const PLANS = {
 // GET /api/subscription/status
 app.get('/api/subscription/status', authMiddleware, async (req, res) => {
   const uid = req.user.userId;
+  // Ensure subscription columns exist first
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
   const { rows } = await pool.query(
     'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [uid]
   ).catch(()=>({ rows:[{}] }));
