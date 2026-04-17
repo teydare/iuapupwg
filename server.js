@@ -2264,7 +2264,7 @@ app.get('/api/study-groups', authMiddleware, async (req, res) => {
        FROM study_groups sg
        LEFT JOIN users u             ON u.id = sg.creator_id
        LEFT JOIN study_group_members sgm ON sgm.group_id = sg.id
-       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active'
+       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active' AND ss.created_at > NOW() - INTERVAL '4 hours'
        WHERE sg.is_private = false
        GROUP BY sg.id, u.full_name
        ORDER BY active_session_count DESC, member_count DESC, sg.created_at DESC`
@@ -2291,7 +2291,7 @@ app.get('/api/study-groups/my', authMiddleware, async (req, res) => {
        JOIN study_group_members mym  ON mym.group_id = sg.id AND mym.user_id = $1
        LEFT JOIN users u             ON u.id = sg.creator_id
        LEFT JOIN study_group_members sgm2 ON sgm2.group_id = sg.id
-       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active'
+       LEFT JOIN study_sessions ss   ON ss.group_id = sg.id AND ss.status = 'active' AND ss.created_at > NOW() - INTERVAL '4 hours'
        GROUP BY sg.id, u.full_name, mym.role
        ORDER BY sg.created_at DESC`,
       [userId]
@@ -2914,7 +2914,8 @@ app.get('/api/classroom-locations/:building/:room', authMiddleware, async (req, 
 // ============================================
 
 app.post('/api/assignments', authMiddleware, async (req, res) => {
-  const { courseCode, title, description, dueDate, submissionPlace, submissionType, weight, notificationHoursBefore } = req.body;
+  const { courseCode, title, description, submissionPlace, submissionType, weight, notificationHoursBefore } = req.body;
+  const dueDate = req.body.dueDate || req.body.due_date || null;
   
   try {
     // Ensure optional columns exist before inserting
@@ -4408,7 +4409,7 @@ app.delete('/api/campus-pulse/:id', authMiddleware, async (req, res) => {
 app.get('/api/grades/subjects', authMiddleware, async (req, res) => {
   try {
     const { rows: subjects } = await pool.query(
-      `SELECT s.*, json_agg(json_build_object('id',g.id,'name',g.name,'pct',g.pct,'weight',g.weight,'logged_at',g.logged_at) ORDER BY g.logged_at) FILTER(WHERE g.id IS NOT NULL) AS grades
+      `SELECT s.*, json_agg(json_build_object('id',g.id,'name',g.name,'pct',g.pct::float,'weight',g.weight::float,'logged_at',g.logged_at) ORDER BY g.logged_at) FILTER(WHERE g.id IS NOT NULL) AS grades
        FROM grade_subjects s LEFT JOIN grade_entries g ON g.subject_id=s.id
        WHERE s.user_id=$1 GROUP BY s.id ORDER BY s.created_at`,
       [req.user.userId]
@@ -7040,9 +7041,18 @@ app.get('/api/chat/class/:classId/messages', authMiddleware, async (req, res) =>
 
 app.post('/api/chat/class/:classId/messages', authMiddleware, async (req, res) => {
   const { classId } = req.params;
-  const { message } = req.body;
+  const { message, type } = req.body;
   const uid = req.user.userId;
   if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required' });
+  // Only course rep can post announcements
+  if (type === 'announcement') {
+    const spaceCheck = await pool.query('SELECT course_rep_id FROM class_spaces WHERE id=$1', [classId]).catch(()=>({rows:[{}]}));
+    const repId = spaceCheck.rows[0]?.course_rep_id;
+    const userCheck = await pool.query('SELECT is_course_rep FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{}]}));
+    if (repId !== uid && !userCheck.rows[0]?.is_course_rep) {
+      return res.status(403).json({ success:false, message:'Only the course rep can post announcements.' });
+    }
+  }
   try {
     await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS class_space_id INTEGER REFERENCES class_spaces(id) ON DELETE CASCADE`).catch(()=>{});
     const { rows } = await pool.query(
