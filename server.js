@@ -596,7 +596,7 @@ app.get('/', (req, res) => {
     storage: 'Supabase Storage'
   });
 });
-============================================
+// ============================================
 // STUDENTHUB - PRODUCTION SERVER
 // WITH SUPABASE STORAGE INTEGRATION
 // ============================================
