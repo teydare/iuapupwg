@@ -564,12 +564,24 @@ app.get('/', (req, res) => {
 
 // ── WEB PUSH NOTIFICATIONS ──────────────────────────────────────────────────
 let webpush;
+let VAPID_PUBLIC_KEY_CACHED = null;
 try {
   webpush = require('web-push');
-  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjZJF1zGkh4Lp0Bm4e1BXHHXb5KA';
-  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || 'UUxI4O8-FbRouAevSmBQ6co62dvsdahsnLs3-aSl4To';
-  webpush.setVapidDetails('mailto:admin@studenthub.app', VAPID_PUBLIC, VAPID_PRIVATE);
-} catch(e) { console.log('web-push not installed — push notifications disabled. Run: npm install web-push'); }
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+    // Auto-generate VAPID keys and log them — copy to Render env vars
+    const keys = webpush.generateVAPIDKeys();
+    VAPID_PUBLIC_KEY_CACHED = keys.publicKey;
+    webpush.setVapidDetails('mailto:admin@studenthub.app', keys.publicKey, keys.privateKey);
+    console.log('⚠️  VAPID keys auto-generated (ephemeral — subscriptions reset on restart)');
+    console.log('   Add these to Render env vars to persist subscriptions:');
+    console.log('   VAPID_PUBLIC_KEY=' + keys.publicKey);
+    console.log('   VAPID_PRIVATE_KEY=' + keys.privateKey);
+  } else {
+    VAPID_PUBLIC_KEY_CACHED = process.env.VAPID_PUBLIC_KEY;
+    webpush.setVapidDetails('mailto:admin@studenthub.app', process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+    console.log('✅ VAPID keys loaded from environment');
+  }
+} catch(e) { console.log('web-push not installed — run: npm install web-push'); }
 
 
 const PORT = process.env.PORT || 5000;
@@ -4466,7 +4478,8 @@ app.delete('/api/campus-pulse/:id', authMiddleware, async (req, res) => {
 app.get('/api/grades/subjects', authMiddleware, async (req, res) => {
   try {
     const { rows: subjects } = await pool.query(
-      `SELECT s.*, json_agg(json_build_object('id',g.id,'name',g.name,'pct',g.pct::float,'weight',g.weight::float,'logged_at',g.logged_at) ORDER BY g.logged_at) FILTER(WHERE g.id IS NOT NULL) AS grades
+      `SELECT s.id, s.user_id, s.name, s.code, s.credits::float AS credits, s.total_weight::float AS total_weight, s.created_at,
+       json_agg(json_build_object('id',g.id,'name',g.name,'pct',g.pct::float,'weight',g.weight::float,'logged_at',g.logged_at) ORDER BY g.logged_at) FILTER(WHERE g.id IS NOT NULL) AS grades
        FROM grade_subjects s LEFT JOIN grade_entries g ON g.subject_id=s.id
        WHERE s.user_id=$1 GROUP BY s.id ORDER BY s.created_at`,
       [req.user.userId]
@@ -7925,7 +7938,7 @@ pool.query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
 
 // GET VAPID public key
 app.get('/api/push/vapid-public-key', (req, res) => {
-  const key = process.env.VAPID_PUBLIC_KEY || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjZJF1zGkh4Lp0Bm4e1BXHHXb5KA';
+  const key = VAPID_PUBLIC_KEY_CACHED || process.env.VAPID_PUBLIC_KEY || '';
   res.json({ key });
 });
 
