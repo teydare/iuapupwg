@@ -1,281 +1,4 @@
-// ============================================
-// STUDENTHUB - PRODUCTION SERVER
-// WITH SUPABASE STORAGE INTEGRATION
-// ============================================
-// This server uses Supabase Storage buckets for persistent file storage
-// Images and documents survive Railway container restarts
-
-// ── WEB PUSH NOTIFICATIONS ──────────────────────────────────────────────────
-let webpush;
-try {
-  webpush = require('web-push');
-  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjZJF1zGkh4Lp0Bm4e1BXHHXb5KA';
-  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || 'UUxI4O8-FbRouAevSmBQ6co62dvsdahsnLs3-aSl4To';
-  webpush.setVapidDetails('mailto:admin@studenthub.app', VAPID_PUBLIC, VAPID_PRIVATE);
-} catch(e) { console.log('web-push not installed — push notifications disabled. Run: npm install web-push'); }
-
-
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const multer = require('multer');
-const { Pool } = require('pg');
-
-// Direct connection pool — used only for DDL (CREATE TABLE, ALTER TABLE).
-// Set DATABASE_DIRECT_URL on Render to the port-5432 direct connection string.
-// Falls back to DATABASE_URL if not set (works if you're already on direct).
-const directPool = new Pool({
-  connectionString: process.env.DATABASE_DIRECT_URL || process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 2,
-  connectionTimeoutMillis: 15000,
-});
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const { createClient } = require('@supabase/supabase-js');
-require('dotenv').config();
-
-const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
-const PORT = process.env.PORT || 5000;
-
-// Groq for PDF parsing (free, fast, no quota issues)
-const GROQ_API_KEY = process.env.GROQ_API_KEY || null;
-if (GROQ_API_KEY) console.log('✅ Groq ready');
-else console.log('⚠️  No GROQ_API_KEY — PDF parsing will use pattern-matching fallback');
-// ============================================
-// SUPABASE STORAGE CLIENT
-// ============================================
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY // Use service role key for server-side operations
-);
-
-// Helper to update reputation and percentile rank
-async function updateStudentRank(userId) {
-  try {
-    // 1. Calculate new reputation score
-    const scoreResult = await pool.query(
-      `SELECT (COUNT(li.id) * 10) + (SELECT COUNT(*) * 50 FROM y_resources WHERE uploader_id = $1) as total_score
-       FROM y_interactions li
-       JOIN y_resources lr ON li.resource_id = lr.id
-       WHERE lr.uploader_id = $1 AND li.interaction_type = 'upvote'`,
-      [userId]
-    );
-    
-    const newScore = scoreResult.rows[0].total_score;
-    await pool.query('UPDATE users SET reputation_score = $1 WHERE id = $2', [newScore, userId]);
-
-    // 2. Global Recalculation: Where does this student stand?
-    await pool.query(`
-      WITH ranks AS (
-        SELECT id, PERCENT_RANK() OVER (ORDER BY reputation_score DESC) as p_rank FROM users
-      )
-      UPDATE users SET rank_percentile = (1 - ranks.p_rank) * 100
-      FROM ranks WHERE users.id = ranks.id;
-    `);
-  } catch (err) {
-    console.error('Ranking update failed:', err);
-  }
-}
-// Helper function to upload files to Supabase Storage
-async function uploadToSupabase(file, bucket, folder = '') {
-  try {
-    const fileExt = path.extname(file.originalname);
-    const fileName = `${folder}${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExt}`;
-    
-    const { data, error } = await supabase.storage
-      .from(bucket)
-      .upload(fileName, file.buffer, {
-        contentType: file.mimetype,
-        cacheControl: '3600',
-        upsert: false
-      });
-
-    if (error) {
-      console.error('Supabase upload error:', error);
-      throw error;
-    }
-
-    // Get public URL
-    const { data: { publicUrl } } = supabase.storage
-      .from(bucket)
-      .getPublicUrl(fileName);
-
-    return publicUrl;
-  } catch (error) {
-    console.error('Upload to Supabase failed:', error);
-    throw error;
-  }
-}
-
-// ============================================
-// MIDDLEWARE - FIXED FOR RAILWAY DEPLOYMENT
-// ============================================
-
-// ✅ CRITICAL FIX: Enable trust proxy for Railway's X-Forwarded-For header
-app.set('trust proxy', 1);
-
-app.use(helmet());
-// allowlist + options for CORS
-const allowedOrigins = [
-  process.env.FRONTEND_URL,
-  'https://fuddystudy.vercel.app',
-  'http://localhost:3000'
-].filter(Boolean);
-
-app.use(cors({
-  origin: function(origin, callback) {
-    // allow non-browser requests (e.g. curl, server-to-server) with no origin
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      return callback(null, true);
-    } else {
-      return callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
-}));
-
-// Ensure preflight requests are answered
-app.options('*', cors());  
-app.use(express.json({ limit: '50mb' }));
-
-
-// ── SUBSCRIPTION STATUS (early registration to avoid 404) ─────────────────
-app.get('/api/subscription/status', authMiddleware, async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
-    const uid = req.user.userId;
-    const { rows } = await pool.query(
-      'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [uid]
-    ).catch(()=>({ rows:[{}] }));
-    const u = rows[0] || {};
-    const now = new Date();
-    let plan = 'free';
-    if (u.paid_until && new Date(u.paid_until) > now) plan = u.plan || 'basic';
-    else if (u.trial_ends_at && new Date(u.trial_ends_at) > now) plan = 'trial';
-    const trialDaysLeft = u.trial_ends_at
-      ? Math.max(0, Math.ceil((new Date(u.trial_ends_at) - now) / 86400000)) : 0;
-    res.json({ success:true, plan, trial_ends_at:u.trial_ends_at, paid_until:u.paid_until,
-      trial_days_left:trialDaysLeft, is_trial:plan==='trial',
-      features: plan==='free' ? ['class_spaces','assignments','homework_no_ai','library_2h_day'] :
-                plan==='basic' ? ['class_spaces','assignments','homework_help','library_full','marketplace','study_groups','grades','timetable'] :
-                ['everything'] });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post('/api/subscription/initiate', authMiddleware, async (req, res) => {
-  const { plan } = req.body;
-  if (!['basic','premium'].includes(plan)) return res.status(400).json({ success:false, message:'Invalid plan' });
-  const uid = req.user.userId;
-  const prices = { basic:10, premium:20 };
-  const reference = `sh_${plan}_${uid}_${Date.now()}`;
-  await pool.query(`CREATE TABLE IF NOT EXISTS payment_history (
-    id SERIAL PRIMARY KEY, user_id INTEGER, plan VARCHAR(20), amount_ghs NUMERIC(10,2),
-    paystack_reference VARCHAR(100), status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMPTZ DEFAULT NOW()
-  )`).catch(()=>{});
-  await pool.query('INSERT INTO payment_history (user_id,plan,amount_ghs,paystack_reference,status) VALUES ($1,$2,$3,$4,$5)',
-    [uid, plan, prices[plan], reference, 'pending']).catch(()=>{});
-  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-  if (!PAYSTACK_SECRET) {
-    return res.json({ success:true, authorization_url:`${process.env.FRONTEND_URL||'https://studenthub.vercel.app'}?mock=1&ref=${reference}&plan=${plan}`, reference, mock:true });
-  }
-  try {
-    const uRow = await pool.query('SELECT email FROM users WHERE id=$1',[uid]).catch(()=>({rows:[{}]}));
-    const resp = await fetch('https://api.paystack.co/transaction/initialize', {
-      method:'POST', headers:{Authorization:`Bearer ${PAYSTACK_SECRET}`,'Content-Type':'application/json'},
-      body:JSON.stringify({ email:uRow.rows[0]?.email, amount:prices[plan]*100, reference, currency:'GHS',
-        metadata:{user_id:uid,plan}, callback_url:`${process.env.FRONTEND_URL||''}/payment/verify?reference=${reference}` })
-    });
-    const d = await resp.json();
-    if (!d.status) throw new Error(d.message||'Paystack error');
-    res.json({ success:true, authorization_url:d.data.authorization_url, reference });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post('/api/subscription/verify', authMiddleware, async (req, res) => {
-  const { reference } = req.body;
-  if (!reference) return res.status(400).json({ success:false, message:'Reference required' });
-  const uid = req.user.userId;
-  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-  if (!PAYSTACK_SECRET || reference.includes('mock')) {
-    const m = reference.match(/sh_(basic|premium)_/);
-    const plan = m?m[1]:'basic';
-    const pd = new Date(); pd.setMonth(pd.getMonth()+1);
-    await pool.query('UPDATE users SET plan=$1,paid_until=$2 WHERE id=$3',[plan,pd,uid]).catch(()=>{});
-    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2',['success',reference]).catch(()=>{});
-    return res.json({ success:true, plan, paid_until:pd });
-  }
-  try {
-    const r = await fetch(`https://api.paystack.co/transaction/verify/${reference}`,{headers:{Authorization:`Bearer ${PAYSTACK_SECRET}`}});
-    const d = await r.json();
-    if (d.data?.status !== 'success') return res.status(400).json({ success:false, message:'Payment not confirmed' });
-    const plan = d.data.metadata?.plan||'basic';
-    const pd = new Date(); pd.setMonth(pd.getMonth()+1);
-    await pool.query('UPDATE users SET plan=$1,paid_until=$2 WHERE id=$3',[plan,pd,uid]).catch(()=>{});
-    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2',['success',reference]).catch(()=>{});
-    res.json({ success:true, plan, paid_until:pd });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// Helper: get user's effective plan
-async function getUserPlan(userId) {
-  const { rows } = await pool.query(
-    'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [userId]
-  ).catch(()=>({ rows:[{}] }));
-  const u = rows[0] || {};
-  const now = new Date();
-  if (u.paid_until && new Date(u.paid_until) > now) return u.plan || 'basic';
-  if (u.trial_ends_at && new Date(u.trial_ends_at) > now) return 'trial'; // trial = all features
-  return 'free';
-}
-
-// Middleware: check plan access
-function requirePlan(minPlan) {
-  const hierarchy = { free:0, trial:3, basic:1, premium:2 };
-  return async (req, res, next) => {
-    if (!req.user) return res.status(401).json({ success:false, message:'Not authenticated' });
-    const plan = await getUserPlan(req.user.userId);
-    const userLevel = hierarchy[plan] ?? 0;
-    const requiredLevel = hierarchy[minPlan] ?? 1;
-    if (userLevel >= requiredLevel) return next();
-    const isPlanBlocked = plan === 'free';
-    res.status(403).json({
-      success: false,
-      plan_required: minPlan,
-      current_plan: plan,
-      upgrade_required: true,
-      message: isPlanBlocked
-        ? `This feature requires a paid plan. Upgrade for GH₵10/month.`
-        : `This feature requires the Premium plan (GH₵20/month).`,
-    });
-  };
-}
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// ✅ FIXED: Rate limiter with proper proxy config
-// Generous limit for general API (300/15min ≈ 20/min — handles active multi-tab usage)
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => {
-    // Never rate-limit status poll, heartbeat, or health check
-    const exempt = ['/api/me/status', '/api/user/heartbeat', '/api/health', '/api/keep-alive'];
-    return exempt.includes(req.path);
-  },
-  message: { success: false, message: 'Too many requests, please slow down.' },
-});
-
-
+// 
 // ============================================================================
 // SUBSCRIPTION & PAYSTACK PAYMENT SYSTEM
 // ============================================================================
@@ -873,6 +596,284 @@ app.get('/', (req, res) => {
     storage: 'Supabase Storage'
   });
 });
+============================================
+// STUDENTHUB - PRODUCTION SERVER
+// WITH SUPABASE STORAGE INTEGRATION
+// ============================================
+// This server uses Supabase Storage buckets for persistent file storage
+// Images and documents survive Railway container restarts
+
+// ── WEB PUSH NOTIFICATIONS ──────────────────────────────────────────────────
+let webpush;
+try {
+  webpush = require('web-push');
+  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjZJF1zGkh4Lp0Bm4e1BXHHXb5KA';
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || 'UUxI4O8-FbRouAevSmBQ6co62dvsdahsnLs3-aSl4To';
+  webpush.setVapidDetails('mailto:admin@studenthub.app', VAPID_PUBLIC, VAPID_PRIVATE);
+} catch(e) { console.log('web-push not installed — push notifications disabled. Run: npm install web-push'); }
+
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const { Pool } = require('pg');
+
+// Direct connection pool — used only for DDL (CREATE TABLE, ALTER TABLE).
+// Set DATABASE_DIRECT_URL on Render to the port-5432 direct connection string.
+// Falls back to DATABASE_URL if not set (works if you're already on direct).
+const directPool = new Pool({
+  connectionString: process.env.DATABASE_DIRECT_URL || process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 2,
+  connectionTimeoutMillis: 15000,
+});
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
+
+const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
+const PORT = process.env.PORT || 5000;
+
+// Groq for PDF parsing (free, fast, no quota issues)
+const GROQ_API_KEY = process.env.GROQ_API_KEY || null;
+if (GROQ_API_KEY) console.log('✅ Groq ready');
+else console.log('⚠️  No GROQ_API_KEY — PDF parsing will use pattern-matching fallback');
+// ============================================
+// SUPABASE STORAGE CLIENT
+// ============================================
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY // Use service role key for server-side operations
+);
+
+// Helper to update reputation and percentile rank
+async function updateStudentRank(userId) {
+  try {
+    // 1. Calculate new reputation score
+    const scoreResult = await pool.query(
+      `SELECT (COUNT(li.id) * 10) + (SELECT COUNT(*) * 50 FROM y_resources WHERE uploader_id = $1) as total_score
+       FROM y_interactions li
+       JOIN y_resources lr ON li.resource_id = lr.id
+       WHERE lr.uploader_id = $1 AND li.interaction_type = 'upvote'`,
+      [userId]
+    );
+    
+    const newScore = scoreResult.rows[0].total_score;
+    await pool.query('UPDATE users SET reputation_score = $1 WHERE id = $2', [newScore, userId]);
+
+    // 2. Global Recalculation: Where does this student stand?
+    await pool.query(`
+      WITH ranks AS (
+        SELECT id, PERCENT_RANK() OVER (ORDER BY reputation_score DESC) as p_rank FROM users
+      )
+      UPDATE users SET rank_percentile = (1 - ranks.p_rank) * 100
+      FROM ranks WHERE users.id = ranks.id;
+    `);
+  } catch (err) {
+    console.error('Ranking update failed:', err);
+  }
+}
+// Helper function to upload files to Supabase Storage
+async function uploadToSupabase(file, bucket, folder = '') {
+  try {
+    const fileExt = path.extname(file.originalname);
+    const fileName = `${folder}${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExt}`;
+    
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .upload(fileName, file.buffer, {
+        contentType: file.mimetype,
+        cacheControl: '3600',
+        upsert: false
+      });
+
+    if (error) {
+      console.error('Supabase upload error:', error);
+      throw error;
+    }
+
+    // Get public URL
+    const { data: { publicUrl } } = supabase.storage
+      .from(bucket)
+      .getPublicUrl(fileName);
+
+    return publicUrl;
+  } catch (error) {
+    console.error('Upload to Supabase failed:', error);
+    throw error;
+  }
+}
+
+// ============================================
+// MIDDLEWARE - FIXED FOR RAILWAY DEPLOYMENT
+// ============================================
+
+// ✅ CRITICAL FIX: Enable trust proxy for Railway's X-Forwarded-For header
+app.set('trust proxy', 1);
+
+app.use(helmet());
+// allowlist + options for CORS
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'https://fuddystudy.vercel.app',
+  'http://localhost:3000'
+].filter(Boolean);
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // allow non-browser requests (e.g. curl, server-to-server) with no origin
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Accept','X-Requested-With']
+}));
+
+// Ensure preflight requests are answered
+app.options('*', cors());  
+app.use(express.json({ limit: '50mb' }));
+
+
+// ── SUBSCRIPTION STATUS (early registration to avoid 404) ─────────────────
+app.get('/api/subscription/status', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
+    const uid = req.user.userId;
+    const { rows } = await pool.query(
+      'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [uid]
+    ).catch(()=>({ rows:[{}] }));
+    const u = rows[0] || {};
+    const now = new Date();
+    let plan = 'free';
+    if (u.paid_until && new Date(u.paid_until) > now) plan = u.plan || 'basic';
+    else if (u.trial_ends_at && new Date(u.trial_ends_at) > now) plan = 'trial';
+    const trialDaysLeft = u.trial_ends_at
+      ? Math.max(0, Math.ceil((new Date(u.trial_ends_at) - now) / 86400000)) : 0;
+    res.json({ success:true, plan, trial_ends_at:u.trial_ends_at, paid_until:u.paid_until,
+      trial_days_left:trialDaysLeft, is_trial:plan==='trial',
+      features: plan==='free' ? ['class_spaces','assignments','homework_no_ai','library_2h_day'] :
+                plan==='basic' ? ['class_spaces','assignments','homework_help','library_full','marketplace','study_groups','grades','timetable'] :
+                ['everything'] });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+app.post('/api/subscription/initiate', authMiddleware, async (req, res) => {
+  const { plan } = req.body;
+  if (!['basic','premium'].includes(plan)) return res.status(400).json({ success:false, message:'Invalid plan' });
+  const uid = req.user.userId;
+  const prices = { basic:10, premium:20 };
+  const reference = `sh_${plan}_${uid}_${Date.now()}`;
+  await pool.query(`CREATE TABLE IF NOT EXISTS payment_history (
+    id SERIAL PRIMARY KEY, user_id INTEGER, plan VARCHAR(20), amount_ghs NUMERIC(10,2),
+    paystack_reference VARCHAR(100), status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMPTZ DEFAULT NOW()
+  )`).catch(()=>{});
+  await pool.query('INSERT INTO payment_history (user_id,plan,amount_ghs,paystack_reference,status) VALUES ($1,$2,$3,$4,$5)',
+    [uid, plan, prices[plan], reference, 'pending']).catch(()=>{});
+  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+  if (!PAYSTACK_SECRET) {
+    return res.json({ success:true, authorization_url:`${process.env.FRONTEND_URL||'https://studenthub.vercel.app'}?mock=1&ref=${reference}&plan=${plan}`, reference, mock:true });
+  }
+  try {
+    const uRow = await pool.query('SELECT email FROM users WHERE id=$1',[uid]).catch(()=>({rows:[{}]}));
+    const resp = await fetch('https://api.paystack.co/transaction/initialize', {
+      method:'POST', headers:{Authorization:`Bearer ${PAYSTACK_SECRET}`,'Content-Type':'application/json'},
+      body:JSON.stringify({ email:uRow.rows[0]?.email, amount:prices[plan]*100, reference, currency:'GHS',
+        metadata:{user_id:uid,plan}, callback_url:`${process.env.FRONTEND_URL||''}/payment/verify?reference=${reference}` })
+    });
+    const d = await resp.json();
+    if (!d.status) throw new Error(d.message||'Paystack error');
+    res.json({ success:true, authorization_url:d.data.authorization_url, reference });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+app.post('/api/subscription/verify', authMiddleware, async (req, res) => {
+  const { reference } = req.body;
+  if (!reference) return res.status(400).json({ success:false, message:'Reference required' });
+  const uid = req.user.userId;
+  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+  if (!PAYSTACK_SECRET || reference.includes('mock')) {
+    const m = reference.match(/sh_(basic|premium)_/);
+    const plan = m?m[1]:'basic';
+    const pd = new Date(); pd.setMonth(pd.getMonth()+1);
+    await pool.query('UPDATE users SET plan=$1,paid_until=$2 WHERE id=$3',[plan,pd,uid]).catch(()=>{});
+    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2',['success',reference]).catch(()=>{});
+    return res.json({ success:true, plan, paid_until:pd });
+  }
+  try {
+    const r = await fetch(`https://api.paystack.co/transaction/verify/${reference}`,{headers:{Authorization:`Bearer ${PAYSTACK_SECRET}`}});
+    const d = await r.json();
+    if (d.data?.status !== 'success') return res.status(400).json({ success:false, message:'Payment not confirmed' });
+    const plan = d.data.metadata?.plan||'basic';
+    const pd = new Date(); pd.setMonth(pd.getMonth()+1);
+    await pool.query('UPDATE users SET plan=$1,paid_until=$2 WHERE id=$3',[plan,pd,uid]).catch(()=>{});
+    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2',['success',reference]).catch(()=>{});
+    res.json({ success:true, plan, paid_until:pd });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+// Helper: get user's effective plan
+async function getUserPlan(userId) {
+  const { rows } = await pool.query(
+    'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [userId]
+  ).catch(()=>({ rows:[{}] }));
+  const u = rows[0] || {};
+  const now = new Date();
+  if (u.paid_until && new Date(u.paid_until) > now) return u.plan || 'basic';
+  if (u.trial_ends_at && new Date(u.trial_ends_at) > now) return 'trial'; // trial = all features
+  return 'free';
+}
+
+// Middleware: check plan access
+function requirePlan(minPlan) {
+  const hierarchy = { free:0, trial:3, basic:1, premium:2 };
+  return async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ success:false, message:'Not authenticated' });
+    const plan = await getUserPlan(req.user.userId);
+    const userLevel = hierarchy[plan] ?? 0;
+    const requiredLevel = hierarchy[minPlan] ?? 1;
+    if (userLevel >= requiredLevel) return next();
+    const isPlanBlocked = plan === 'free';
+    res.status(403).json({
+      success: false,
+      plan_required: minPlan,
+      current_plan: plan,
+      upgrade_required: true,
+      message: isPlanBlocked
+        ? `This feature requires a paid plan. Upgrade for GH₵10/month.`
+        : `This feature requires the Premium plan (GH₵20/month).`,
+    });
+  };
+}
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ✅ FIXED: Rate limiter with proper proxy config
+// Generous limit for general API (300/15min ≈ 20/min — handles active multi-tab usage)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    // Never rate-limit status poll, heartbeat, or health check
+    const exempt = ['/api/me/status', '/api/user/heartbeat', '/api/health', '/api/keep-alive'];
+    return exempt.includes(req.path);
+  },
+  message: { success: false, message: 'Too many requests, please slow down.' },
+});
+
+
 
 app.get('/api/health', (req, res) => {
   res.json({ 
