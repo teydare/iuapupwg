@@ -2537,12 +2537,16 @@ app.get('/api/study-groups/:id/session', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const userId  = req.user.userId;
   try {
+    // Auto-expire sessions older than 4 hours
+    await pool.query(
+      `UPDATE study_sessions SET status='ended', ended_at=NOW() WHERE status='active' AND created_at < NOW() - INTERVAL '4 hours'`
+    ).catch(()=>{});
     const activeCount = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM study_sessions WHERE group_id=$1 AND status='active'`,
+      `SELECT COUNT(*)::int AS count FROM study_sessions WHERE group_id=$1 AND status='active' AND (ended_at IS NULL OR ended_at > NOW() - INTERVAL '10 minutes')`,
       [id]
     );
     const userSess = await pool.query(
-      `SELECT id FROM study_sessions WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+      `SELECT id FROM study_sessions WHERE group_id=$1 AND user_id=$2 AND status='active' AND ended_at IS NULL`,
       [id, userId]
     );
     res.json({
@@ -2588,7 +2592,7 @@ app.post('/api/study-groups/:id/session/end', authMiddleware, async (req, res) =
     await pool.query(`ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS ended_at TIMESTAMP`).catch(()=>{});
     await pool.query(
       `UPDATE study_sessions SET status='ended', ended_at=NOW()
-       WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+       WHERE group_id=$1 AND user_id=$2 AND (status='active' OR ended_at IS NULL)`,
       [id, userId]
     );
     res.json({ success: true });
@@ -3071,6 +3075,8 @@ app.patch('/api/assignments/:id', authMiddleware, async (req, res) => {
       values
     );
     
+    // Send push notification
+    if (result.rows[0]?.due_date) sendPushToUser(req.user.userId,'📋 Assignment Added',result.rows[0].title+' — tap to view',{url:'/assignments'}).catch(()=>{});
     res.json({ success: true, assignment: result.rows[0] });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Server error' });
@@ -5109,6 +5115,8 @@ app.post('/api/messages', authMiddleware, async (req, res) => {
       `New message from ${sender.rows[0]?.full_name || 'Someone'}`,
       text.slice(0, 80), uid
     );
+    // Push notification
+    sendPushToUser(parseInt(receiverId), `💬 ${sender.rows[0]?.full_name || 'New message'}`, text.slice(0,80), { url: '/messages' }).catch(()=>{});
     res.json({ success: true, message: result.rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error' });
