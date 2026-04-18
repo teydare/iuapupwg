@@ -145,6 +145,86 @@ app.use(cors({
 app.options('*', cors());  
 app.use(express.json({ limit: '50mb' }));
 
+
+// ── SUBSCRIPTION STATUS (early registration to avoid 404) ─────────────────
+app.get('/api/subscription/status', authMiddleware, async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
+    const uid = req.user.userId;
+    const { rows } = await pool.query(
+      'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [uid]
+    ).catch(()=>({ rows:[{}] }));
+    const u = rows[0] || {};
+    const now = new Date();
+    let plan = 'free';
+    if (u.paid_until && new Date(u.paid_until) > now) plan = u.plan || 'basic';
+    else if (u.trial_ends_at && new Date(u.trial_ends_at) > now) plan = 'trial';
+    const trialDaysLeft = u.trial_ends_at
+      ? Math.max(0, Math.ceil((new Date(u.trial_ends_at) - now) / 86400000)) : 0;
+    res.json({ success:true, plan, trial_ends_at:u.trial_ends_at, paid_until:u.paid_until,
+      trial_days_left:trialDaysLeft, is_trial:plan==='trial',
+      features: plan==='free' ? ['class_spaces','assignments','homework_no_ai','library_2h_day'] :
+                plan==='basic' ? ['class_spaces','assignments','homework_help','library_full','marketplace','study_groups','grades','timetable'] :
+                ['everything'] });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+app.post('/api/subscription/initiate', authMiddleware, async (req, res) => {
+  const { plan } = req.body;
+  if (!['basic','premium'].includes(plan)) return res.status(400).json({ success:false, message:'Invalid plan' });
+  const uid = req.user.userId;
+  const prices = { basic:10, premium:20 };
+  const reference = `sh_${plan}_${uid}_${Date.now()}`;
+  await pool.query(`CREATE TABLE IF NOT EXISTS payment_history (
+    id SERIAL PRIMARY KEY, user_id INTEGER, plan VARCHAR(20), amount_ghs NUMERIC(10,2),
+    paystack_reference VARCHAR(100), status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMPTZ DEFAULT NOW()
+  )`).catch(()=>{});
+  await pool.query('INSERT INTO payment_history (user_id,plan,amount_ghs,paystack_reference,status) VALUES ($1,$2,$3,$4,$5)',
+    [uid, plan, prices[plan], reference, 'pending']).catch(()=>{});
+  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+  if (!PAYSTACK_SECRET) {
+    return res.json({ success:true, authorization_url:`${process.env.FRONTEND_URL||'https://studenthub.vercel.app'}?mock=1&ref=${reference}&plan=${plan}`, reference, mock:true });
+  }
+  try {
+    const uRow = await pool.query('SELECT email FROM users WHERE id=$1',[uid]).catch(()=>({rows:[{}]}));
+    const resp = await fetch('https://api.paystack.co/transaction/initialize', {
+      method:'POST', headers:{Authorization:`Bearer ${PAYSTACK_SECRET}`,'Content-Type':'application/json'},
+      body:JSON.stringify({ email:uRow.rows[0]?.email, amount:prices[plan]*100, reference, currency:'GHS',
+        metadata:{user_id:uid,plan}, callback_url:`${process.env.FRONTEND_URL||''}/payment/verify?reference=${reference}` })
+    });
+    const d = await resp.json();
+    if (!d.status) throw new Error(d.message||'Paystack error');
+    res.json({ success:true, authorization_url:d.data.authorization_url, reference });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+app.post('/api/subscription/verify', authMiddleware, async (req, res) => {
+  const { reference } = req.body;
+  if (!reference) return res.status(400).json({ success:false, message:'Reference required' });
+  const uid = req.user.userId;
+  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+  if (!PAYSTACK_SECRET || reference.includes('mock')) {
+    const m = reference.match(/sh_(basic|premium)_/);
+    const plan = m?m[1]:'basic';
+    const pd = new Date(); pd.setMonth(pd.getMonth()+1);
+    await pool.query('UPDATE users SET plan=$1,paid_until=$2 WHERE id=$3',[plan,pd,uid]).catch(()=>{});
+    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2',['success',reference]).catch(()=>{});
+    return res.json({ success:true, plan, paid_until:pd });
+  }
+  try {
+    const r = await fetch(`https://api.paystack.co/transaction/verify/${reference}`,{headers:{Authorization:`Bearer ${PAYSTACK_SECRET}`}});
+    const d = await r.json();
+    if (d.data?.status !== 'success') return res.status(400).json({ success:false, message:'Payment not confirmed' });
+    const plan = d.data.metadata?.plan||'basic';
+    const pd = new Date(); pd.setMonth(pd.getMonth()+1);
+    await pool.query('UPDATE users SET plan=$1,paid_until=$2 WHERE id=$3',[plan,pd,uid]).catch(()=>{});
+    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2',['success',reference]).catch(()=>{});
+    res.json({ success:true, plan, paid_until:pd });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
 // Helper: get user's effective plan
 async function getUserPlan(userId) {
   const { rows } = await pool.query(
@@ -195,14 +275,33 @@ const limiter = rateLimit({
   message: { success: false, message: 'Too many requests, please slow down.' },
 });
 
-// Strict limit for auth endpoints (20/15min — prevents brute force)
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: 'Too many auth attempts, please wait.' },
-});
+
+// ============================================================================
+// SUBSCRIPTION & PAYSTACK PAYMENT SYSTEM
+// ============================================================================
+
+// Ensure subscription columns on users table
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paystack_customer_code VARCHAR(100)`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS payment_history (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  plan VARCHAR(20) NOT NULL,
+  amount_ghs NUMERIC(10,2) NOT NULL,
+  paystack_reference VARCHAR(100),
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+const PLANS = {
+  free:    { name:'Free',    price:0,  features:['class_spaces','assignments','homework_no_ai','library_2h_day'] },
+  basic:   { name:'Basic',   price:10, features:['class_spaces','assignments','homework_help','library_full','marketplace','campus_pulse','study_groups','grade_tracker','timetable'] },
+  premium: { name:'Premium', price:20, features:['everything','ai_features','ai_tutor','ai_flashcards','ai_study_plan','priority_support'] },
+};
+
+
 
 app.use('/api/', limiter);
 app.use('/api/auth/login', authLimiter);
@@ -2255,6 +2354,19 @@ app.post('/api/library/:id/downvote', authMiddleware, async (req, res) => {
 // Replaces the existing route — includes program, study_mode, active_session_count
 app.get('/api/study-groups', authMiddleware, async (req, res) => {
   try {
+    // Ensure study_sessions table has required columns
+    await pool.query(`CREATE TABLE IF NOT EXISTS study_sessions (
+      id SERIAL PRIMARY KEY, group_id INTEGER REFERENCES study_groups(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      status VARCHAR(20) DEFAULT 'active',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      ended_at TIMESTAMPTZ
+    )`).catch(()=>{});
+    await pool.query(`ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ`).catch(()=>{});
+    await pool.query(`ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`).catch(()=>{});
+    await pool.query(`ALTER TABLE study_groups ADD COLUMN IF NOT EXISTS is_private BOOLEAN DEFAULT false`).catch(()=>{});
+    await pool.query(`ALTER TABLE study_groups ADD COLUMN IF NOT EXISTS subject VARCHAR(100)`).catch(()=>{});
+    await pool.query(`ALTER TABLE study_groups ADD COLUMN IF NOT EXISTS max_members INTEGER DEFAULT 50`).catch(()=>{});
     const result = await pool.query(
       `SELECT
          sg.*,
@@ -4985,6 +5097,37 @@ app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
 });
 
 // POST /api/messages — send a DM
+app.get('/api/messages', authMiddleware, async (req, res) => {
+  // Alias to inbox
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS direct_messages (
+      id SERIAL PRIMARY KEY,
+      sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      content TEXT, read_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW()
+    )`).catch(()=>{});
+    await pool.query(`ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS content TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`).catch(()=>{});
+    const uid = req.user.userId;
+    const { rows } = await pool.query(`
+      SELECT DISTINCT ON (other_id)
+        other_id, other_name, last_msg, last_at, unread
+      FROM (
+        SELECT
+          CASE WHEN dm.sender_id=$1 THEN dm.receiver_id ELSE dm.sender_id END AS other_id,
+          CASE WHEN dm.sender_id=$1 THEN ru.full_name ELSE su.full_name END AS other_name,
+          dm.content AS last_msg, dm.created_at AS last_at,
+          COUNT(*) FILTER(WHERE dm.receiver_id=$1 AND dm.read_at IS NULL) OVER(PARTITION BY dm.sender_id) AS unread
+        FROM direct_messages dm
+        LEFT JOIN users su ON su.id=dm.sender_id
+        LEFT JOIN users ru ON ru.id=dm.receiver_id
+        WHERE dm.sender_id=$1 OR dm.receiver_id=$1
+      ) t ORDER BY other_id, last_at DESC
+    `, [uid]).catch(()=>({rows:[]}));
+    res.json({ success:true, conversations: rows });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
 app.post('/api/messages', authMiddleware, async (req, res) => {
   const { receiverId, content, message } = req.body;
   const text = (content || message || '').trim();
@@ -7909,167 +8052,37 @@ app.get('/api/push/test', authMiddleware, async (req, res) => {
 });
 
 
-// ============================================================================
-// SUBSCRIPTION & PAYSTACK PAYMENT SYSTEM
-// ============================================================================
 
-// Ensure subscription columns on users table
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paystack_customer_code VARCHAR(100)`).catch(()=>{});
-pool.query(`CREATE TABLE IF NOT EXISTS payment_history (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  plan VARCHAR(20) NOT NULL,
-  amount_ghs NUMERIC(10,2) NOT NULL,
-  paystack_reference VARCHAR(100),
-  status VARCHAR(20) DEFAULT 'pending',
-  created_at TIMESTAMPTZ DEFAULT NOW()
-)`).catch(()=>{});
 
-const PLANS = {
-  free:    { name:'Free',    price:0,  features:['class_spaces','assignments','homework_no_ai','library_2h_day'] },
-  basic:   { name:'Basic',   price:10, features:['class_spaces','assignments','homework_help','library_full','marketplace','campus_pulse','study_groups','grade_tracker','timetable'] },
-  premium: { name:'Premium', price:20, features:['everything','ai_features','ai_tutor','ai_flashcards','ai_study_plan','priority_support'] },
-};
-
-// GET /api/subscription/status
-app.get('/api/subscription/status', authMiddleware, async (req, res) => {
+// POST /api/auth/change-password
+app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
   const uid = req.user.userId;
-  // Ensure subscription columns exist first
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
-  const { rows } = await pool.query(
-    'SELECT plan, trial_ends_at, paid_until FROM users WHERE id=$1', [uid]
-  ).catch(()=>({ rows:[{}] }));
-  const u = rows[0] || {};
-  const plan = await getUserPlan(uid);
-  const trialDaysLeft = u.trial_ends_at
-    ? Math.max(0, Math.ceil((new Date(u.trial_ends_at) - Date.now()) / 86400000))
-    : 0;
-  res.json({
-    success: true,
-    plan,
-    db_plan: u.plan,
-    trial_ends_at: u.trial_ends_at,
-    paid_until: u.paid_until,
-    trial_days_left: trialDaysLeft,
-    is_trial: plan === 'trial',
-    features: PLANS[plan === 'trial' ? 'premium' : (plan || 'free')]?.features || PLANS.free.features,
-  });
+  if (!currentPassword || !newPassword || newPassword.length < 6)
+    return res.status(400).json({ success:false, message:'New password must be at least 6 characters' });
+  const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [uid]);
+  if (!rows[0]) return res.status(404).json({ success:false, message:'User not found' });
+  const bcrypt = require('bcryptjs');
+  const match = await bcrypt.compare(currentPassword, rows[0].password_hash);
+  if (!match) return res.status(400).json({ success:false, message:'Current password is incorrect' });
+  const hash = await bcrypt.hash(newPassword, 10);
+  await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, uid]);
+  res.json({ success:true, message:'Password updated successfully' });
 });
 
-// POST /api/subscription/initiate — create Paystack payment
-app.post('/api/subscription/initiate', authMiddleware, async (req, res) => {
-  const { plan } = req.body; // 'basic' | 'premium'
-  if (!['basic','premium'].includes(plan)) return res.status(400).json({ success:false, message:'Invalid plan' });
+// DELETE /api/auth/delete-account
+app.delete('/api/auth/delete-account', authMiddleware, async (req, res) => {
+  const { password } = req.body;
   const uid = req.user.userId;
-  const uRes = await pool.query('SELECT email, full_name FROM users WHERE id=$1', [uid]).catch(()=>({rows:[{}]}));
-  const user = uRes.rows[0] || {};
-  const amount = PLANS[plan].price * 100; // Paystack uses pesewas (GHS * 100)
-  const reference = `sh_${plan}_${uid}_${Date.now()}`;
-
-  // Store pending payment
-  await pool.query(
-    'INSERT INTO payment_history (user_id, plan, amount_ghs, paystack_reference, status) VALUES ($1,$2,$3,$4,$5)',
-    [uid, plan, PLANS[plan].price, reference, 'pending']
-  ).catch(()=>{});
-
-  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-  if (!PAYSTACK_SECRET) {
-    // Dev mode — return mock checkout URL
-    return res.json({
-      success: true,
-      authorization_url: `${process.env.FRONTEND_URL || 'https://studenthub.vercel.app'}?paystack_mock=1&ref=${reference}&plan=${plan}`,
-      reference,
-      mock: true,
-    });
-  }
-
-  try {
-    const psRes = await fetch('https://api.paystack.co/transaction/initialize', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email: user.email,
-        amount,
-        reference,
-        currency: 'GHS',
-        metadata: { user_id: uid, plan, full_name: user.full_name },
-        callback_url: `${process.env.FRONTEND_URL || 'https://studenthub.vercel.app'}/payment/verify?reference=${reference}`,
-      }),
-    });
-    const psData = await psRes.json();
-    if (!psRes.ok || !psData.status) throw new Error(psData.message || 'Paystack error');
-    res.json({ success:true, authorization_url: psData.data.authorization_url, reference });
-  } catch(e) {
-    console.error('Paystack init error:', e.message);
-    res.status(500).json({ success:false, message:e.message });
-  }
+  if (!password) return res.status(400).json({ success:false, message:'Password required to confirm deletion' });
+  const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [uid]);
+  if (!rows[0]) return res.status(404).json({ success:false, message:'User not found' });
+  const bcrypt = require('bcryptjs');
+  const match = await bcrypt.compare(password, rows[0].password_hash);
+  if (!match) return res.status(400).json({ success:false, message:'Incorrect password' });
+  await pool.query('DELETE FROM users WHERE id=$1', [uid]);
+  res.json({ success:true, message:'Account deleted' });
 });
-
-// POST /api/subscription/verify — verify after redirect back
-app.post('/api/subscription/verify', authMiddleware, async (req, res) => {
-  const { reference } = req.body;
-  if (!reference) return res.status(400).json({ success:false, message:'Reference required' });
-  const uid = req.user.userId;
-
-  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-  // Mock verification for dev
-  if (!PAYSTACK_SECRET || reference.includes('mock')) {
-    const planMatch = reference.match(/sh_(basic|premium)_/);
-    const plan = planMatch ? planMatch[1] : 'basic';
-    const paidUntil = new Date(); paidUntil.setMonth(paidUntil.getMonth()+1);
-    await pool.query('UPDATE users SET plan=$1, paid_until=$2 WHERE id=$3', [plan, paidUntil, uid]).catch(()=>{});
-    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2', ['success', reference]).catch(()=>{});
-    return res.json({ success:true, plan, paid_until:paidUntil });
-  }
-
-  try {
-    const psRes = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
-    });
-    const psData = await psRes.json();
-    if (!psRes.ok || psData.data?.status !== 'success') {
-      return res.status(400).json({ success:false, message:'Payment not confirmed' });
-    }
-    const plan = psData.data.metadata?.plan || 'basic';
-    const paidUntil = new Date(); paidUntil.setMonth(paidUntil.getMonth()+1);
-    await pool.query('UPDATE users SET plan=$1, paid_until=$2, paystack_customer_code=$3 WHERE id=$4',
-      [plan, paidUntil, psData.data.customer?.customer_code||null, uid]).catch(()=>{});
-    await pool.query('UPDATE payment_history SET status=$1 WHERE paystack_reference=$2', ['success', reference]).catch(()=>{});
-    res.json({ success:true, plan, paid_until:paidUntil });
-  } catch(e) {
-    res.status(500).json({ success:false, message:e.message });
-  }
-});
-
-// POST /api/subscription/webhook — Paystack webhook for recurring charges
-app.post('/api/paystack/webhook', async (req, res) => {
-  const signature = req.headers['x-paystack-signature'];
-  const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-  if (PAYSTACK_SECRET && signature) {
-    const crypto = require('crypto');
-    const hash = crypto.createHmac('sha512', PAYSTACK_SECRET).update(JSON.stringify(req.body)).digest('hex');
-    if (hash !== signature) return res.status(400).send('Invalid signature');
-  }
-  const event = req.body;
-  if (event.event === 'charge.success') {
-    const meta = event.data?.metadata || {};
-    const userId = meta.user_id;
-    const plan = meta.plan;
-    if (userId && plan) {
-      const paidUntil = new Date(); paidUntil.setMonth(paidUntil.getMonth()+1);
-      await pool.query('UPDATE users SET plan=$1, paid_until=$2 WHERE id=$3', [plan, paidUntil, userId]).catch(()=>{});
-    }
-  }
-  res.sendStatus(200);
-});
-
-// Protect AI features to premium/trial only
-// (applied inline where needed via requirePlan middleware)
 
 // ============================================
 // START SERVER
