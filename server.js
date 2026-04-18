@@ -2329,6 +2329,8 @@ app.get('/api/study-groups', authMiddleware, async (req, res) => {
 app.get('/api/study-groups/my', authMiddleware, async (req, res) => {
   const userId = req.user.userId;
   try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS study_sessions (id SERIAL PRIMARY KEY, group_id INTEGER, user_id INTEGER, status VARCHAR(20) DEFAULT 'active', created_at TIMESTAMPTZ DEFAULT NOW(), ended_at TIMESTAMPTZ)`).catch(()=>{});
+    await pool.query(`ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`).catch(()=>{});
     const result = await pool.query(
       `SELECT
          sg.*,
@@ -2967,11 +2969,16 @@ app.post('/api/assignments', authMiddleware, async (req, res) => {
   const dueDate = req.body.dueDate || req.body.due_date || null;
   
   try {
-    // Ensure optional columns exist before inserting
+    // Ensure all columns exist before inserting
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS course_code VARCHAR(50)`).catch(()=>{});
     await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS subject VARCHAR(100)`).catch(()=>{});
     await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'medium'`).catch(()=>{});
     await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS estimated_hours DECIMAL(5,2)`).catch(()=>{});
     await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0`).catch(()=>{});
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS submission_place TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS submission_type VARCHAR(50) DEFAULT 'online'`).catch(()=>{});
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS weight DECIMAL(5,2)`).catch(()=>{});
+    await pool.query(`ALTER TABLE assignments ADD COLUMN IF NOT EXISTS notification_hours_before INTEGER DEFAULT 24`).catch(()=>{});
     const result = await pool.query(
       `INSERT INTO assignments
        (user_id, course_code, title, description, due_date, submission_place,
@@ -3362,6 +3369,7 @@ app.get('/api/exams/:examId/study-plan', authMiddleware, async (req, res) => {
 // ============================================
 
 app.get('/api/notifications', authMiddleware, async (req, res) => {
+  await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT false`).catch(()=>{});
   try {
     const result = await pool.query(
       `SELECT * FROM notifications
@@ -4346,7 +4354,7 @@ app.get('/api/campus-pulse', authMiddleware, async (req, res) => {
 
     if (category && category !== 'all') { params.push(category); q += ` AND p.category = $${params.length}`; }
 
-    if      (sort === 'hot') q += ` ORDER BY p.is_pinned DESC, (p.likes * 2 + comment_count) DESC, p.created_at DESC`;
+    if      (sort === 'hot') q += ` ORDER BY p.is_pinned DESC, (p.likes * 2 + (SELECT COUNT(*) FROM campus_pulse_comments c2 WHERE c2.post_id = p.id)) DESC, p.created_at DESC`;
     else if (sort === 'new') q += ` ORDER BY p.is_pinned DESC, p.created_at DESC`;
     else if (sort === 'top') q += ` ORDER BY p.is_pinned DESC, p.likes DESC`;
     else                     q += ` ORDER BY p.is_pinned DESC, p.created_at DESC`;
