@@ -1,93 +1,26 @@
-// 
-// ============================================================================
-// SUBSCRIPTION & PAYSTACK PAYMENT SYSTEM
-// ============================================================================
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const { Pool } = require('pg');
 
-// Ensure subscription columns on users table
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'`).catch(()=>{});
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '14 days')`).catch(()=>{});
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_until TIMESTAMPTZ`).catch(()=>{});
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paystack_customer_code VARCHAR(100)`).catch(()=>{});
-pool.query(`CREATE TABLE IF NOT EXISTS payment_history (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  plan VARCHAR(20) NOT NULL,
-  amount_ghs NUMERIC(10,2) NOT NULL,
-  paystack_reference VARCHAR(100),
-  status VARCHAR(20) DEFAULT 'pending',
-  created_at TIMESTAMPTZ DEFAULT NOW()
-)`).catch(()=>{});
-
-const PLANS = {
-  free:    { name:'Free',    price:0,  features:['class_spaces','assignments','homework_no_ai','library_2h_day'] },
-  basic:   { name:'Basic',   price:10, features:['class_spaces','assignments','homework_help','library_full','marketplace','campus_pulse','study_groups','grade_tracker','timetable'] },
-  premium: { name:'Premium', price:20, features:['everything','ai_features','ai_tutor','ai_flashcards','ai_study_plan','priority_support'] },
-};
-
-
-
-app.use('/api/', limiter);
-app.use('/api/auth/login', authLimiter);
-app.use('/api/auth/register', authLimiter);
-
-// ============================================
-// FILE UPLOAD SETUP - MEMORY STORAGE
-// ============================================
-// Using memory storage since files go directly to Supabase Storage
-
-const imageUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB for images
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif|webp/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-    if (extname && mimetype) {
-      return cb(null, true);
-    }
-    cb(new Error('Only image files are allowed (JPEG, PNG, GIF, WebP)'));
-  }
+// Direct connection pool — used only for DDL (CREATE TABLE, ALTER TABLE).
+// Set DATABASE_DIRECT_URL on Render to the port-5432 direct connection string.
+// Falls back to DATABASE_URL if not set (works if you're already on direct).
+const directPool = new Pool({
+  connectionString: process.env.DATABASE_DIRECT_URL || process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 2,
+  connectionTimeoutMillis: 15000,
 });
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
-const documentUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
-  // Accept any file — class spaces need images, videos, PDFs, slides etc.
-  fileFilter: (req, file, cb) => cb(null, true),
-});
-
-const libraryUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB per file
-  fileFilter: (req, file, cb) => {
-    if (file.fieldname === 'file') {
-      const allowedTypes = /pdf|doc|docx|epub|mobi|txt/;
-      const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-      const mimetype = allowedTypes.test(file.mimetype);
-      if (extname && mimetype) return cb(null, true);
-      cb(new Error('Only document files allowed (PDF, DOC, DOCX, EPUB, MOBI, TXT)'));
-    } else if (file.fieldname === 'thumbnail') {
-      const allowedTypes = /jpeg|jpg|png|gif|webp/;
-      const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-      const mimetype = allowedTypes.test(file.mimetype);
-      if (extname && mimetype) return cb(null, true);
-      cb(new Error('Only image files allowed for thumbnail'));
-    } else {
-      cb(null, true); // folder upload uses different field names
-    }
-  }
-});
-
-// Multer for folder uploads — accepts any field name, up to 200 files, 50MB each
-const folderUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024, files: 200 },
-});
-
-// ============================================
-// DATABASE CONNECTION
-// ============================================
-
+const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
@@ -613,29 +546,6 @@ try {
 } catch(e) { console.log('web-push not installed — push notifications disabled. Run: npm install web-push'); }
 
 
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const multer = require('multer');
-const { Pool } = require('pg');
-
-// Direct connection pool — used only for DDL (CREATE TABLE, ALTER TABLE).
-// Set DATABASE_DIRECT_URL on Render to the port-5432 direct connection string.
-// Falls back to DATABASE_URL if not set (works if you're already on direct).
-const directPool = new Pool({
-  connectionString: process.env.DATABASE_DIRECT_URL || process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 2,
-  connectionTimeoutMillis: 15000,
-});
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const { createClient } = require('@supabase/supabase-js');
-require('dotenv').config();
-
-const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
 const PORT = process.env.PORT || 5000;
 
 // Groq for PDF parsing (free, fast, no quota issues)
