@@ -21,6 +21,32 @@ require('dotenv').config();
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
+
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/jpeg|jpg|png|gif|webp/.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only image files allowed'));
+  }
+});
+
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, true),
+});
+
+const libraryUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, true),
+});
+
+const folderUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024, files: 200 },
+});
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
