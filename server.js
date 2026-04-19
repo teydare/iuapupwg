@@ -2542,7 +2542,7 @@ app.get('/api/study-groups/:id/session', authMiddleware, async (req, res) => {
       `UPDATE study_sessions SET status='ended', ended_at=NOW() WHERE status='active' AND created_at < NOW() - INTERVAL '4 hours'`
     ).catch(()=>{});
     const activeCount = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM study_sessions WHERE group_id=$1 AND status='active' AND (ended_at IS NULL OR ended_at > NOW() - INTERVAL '10 minutes')`,
+      `SELECT COUNT(*)::int AS count FROM study_sessions WHERE group_id=$1 AND status='active' AND ended_at IS NULL`,
       [id]
     );
     const userSess = await pool.query(
@@ -2570,10 +2570,13 @@ app.post('/api/study-groups/:id/session/start', authMiddleware, async (req, res)
     const mem = await pool.query('SELECT id FROM study_group_members WHERE group_id=$1 AND user_id=$2', [id, userId]);
     if (mem.rows.length === 0) return res.status(403).json({ success: false, message: 'Not a member' });
 
+    // End any existing active session first, then create fresh one
     await pool.query(
-      `INSERT INTO study_sessions (group_id, user_id, status)
-       VALUES ($1,$2,'active')
-       ON CONFLICT (group_id, user_id, status) DO NOTHING`,
+      `UPDATE study_sessions SET status='ended', ended_at=NOW() WHERE group_id=$1 AND user_id=$2 AND status='active'`,
+      [id, userId]
+    );
+    await pool.query(
+      `INSERT INTO study_sessions (group_id, user_id, status, created_at) VALUES ($1,$2,'active',NOW())`,
       [id, userId]
     );
     res.json({ success: true });
@@ -8076,6 +8079,8 @@ app.delete('/api/auth/delete-account', authMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  // Clean up zombie sessions from previous deploys
+  pool.query(`UPDATE study_sessions SET status='ended', ended_at=NOW() WHERE status='active' AND created_at < NOW() - INTERVAL '8 hours'`).catch(()=>{});
   console.log(`🤖 AI Features: ${process.env.ANTHROPIC_API_KEY ? '✅ ANTHROPIC_API_KEY is set' : '❌ ANTHROPIC_API_KEY NOT SET — AI features will fail'}`);
   console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`💾 Storage: Supabase Storage`);
