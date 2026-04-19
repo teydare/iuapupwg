@@ -4433,6 +4433,7 @@ app.post('/api/campus-pulse/:id/like', authMiddleware, async (req, res) => {
     }
     await pool.query(`INSERT INTO campus_pulse_reactions(post_id,user_id,emoji) VALUES($1,$2,'👍')`, [req.params.id, req.user.userId]);
     await pool.query(`UPDATE campus_pulse_posts SET likes=likes+1 WHERE id=$1`, [req.params.id]);
+    if(global.logEvent)global.logEvent(req.user.userId,'like_post','post',parseInt(req.params.id),{}).catch(()=>{});
     res.json({ success: true, action: 'liked' });
   } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
@@ -6103,6 +6104,7 @@ app.post('/api/study-groups/:id/join', authMiddleware, async (req, res) => {
       [id, uid, 'member']
     );
     setImmediate(() => awardXP(uid, 'study_group_joined', `group:${id}`));
+    if(global.logEvent)global.logEvent(uid,'join_group','group',parseInt(id),{}).catch(()=>{});
     res.json({ success: true, message: 'Joined group' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error' });
@@ -8052,6 +8054,499 @@ app.delete('/api/auth/delete-account', authMiddleware, async (req, res) => {
   await pool.query('DELETE FROM users WHERE id=$1', [uid]);
   res.json({ success:true, message:'Account deleted' });
 });
+
+
+// ============================================================================
+// RECOMMENDATION ENGINE
+// ============================================================================
+
+// Schema setup
+pool.query(`
+  CREATE TABLE IF NOT EXISTS user_events (
+    id BIGSERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    event_type VARCHAR(60) NOT NULL, entity_type VARCHAR(40), entity_id INTEGER,
+    entity_meta JSONB, session_id VARCHAR(40), page VARCHAR(60), referrer VARCHAR(60),
+    dwell_ms INTEGER, days_to_exam INTEGER, week_of_sem SMALLINT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS idx_ue_user_time ON user_events(user_id, created_at DESC)`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS idx_ue_entity ON user_events(entity_type, entity_id)`).catch(()=>{});
+pool.query(`
+  CREATE TABLE IF NOT EXISTS user_affinities (
+    id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    dimension VARCHAR(120) NOT NULL, score FLOAT DEFAULT 0, event_count INTEGER DEFAULT 0,
+    last_updated TIMESTAMPTZ DEFAULT NOW(), UNIQUE(user_id, dimension)
+  )
+`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS idx_ua_user_score ON user_affinities(user_id, score DESC)`).catch(()=>{});
+pool.query(`
+  CREATE TABLE IF NOT EXISTS recommendation_cache (
+    id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    rec_type VARCHAR(40) NOT NULL, entity_id INTEGER NOT NULL, score FLOAT NOT NULL,
+    reason TEXT NOT NULL, computed_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, rec_type, entity_id)
+  )
+`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS idx_rc_user_type ON recommendation_cache(user_id, rec_type, score DESC)`).catch(()=>{});
+pool.query(`
+  CREATE TABLE IF NOT EXISTS user_similarity (
+    user_id_a INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    user_id_b INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    similarity FLOAT NOT NULL, computed_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY(user_id_a, user_id_b)
+  )
+`).catch(()=>{});
+
+// ── Core weights ───────────────────────────────────────────────────────────────
+const EVENT_WEIGHTS = {
+  view:0.5, impression:0.1, scroll_past:0.05,
+  search_result_click:0.8, open:1.0, dwell_30s:1.5, dwell_2min:2.5, dwell_5min:4.0,
+  download:3.0, bookmark:3.5, upvote:2.5, share:3.0, hub_navigate_to:2.0,
+  join_group:4.0, message_user:3.5, follow_seller:4.0, purchase:5.0,
+  answer_question:4.5, like_post:2.0, comment_post:3.0, react_post:1.5,
+  dismiss:-2.0, report:-5.0
+};
+
+function temporalDecay(dateStr) {
+  const ageDays = (Date.now() - new Date(dateStr).getTime()) / 86400000;
+  return Math.pow(0.5, ageDays / 7); // half-life 7 days
+}
+
+function urgencyBoost(daysToExam) {
+  if (!daysToExam || daysToExam > 14) return 1;
+  if (daysToExam <= 1) return 4; if (daysToExam <= 3) return 3;
+  if (daysToExam <= 7) return 2; return 1.5;
+}
+
+// ── Log an event ───────────────────────────────────────────────────────────────
+async function logEvent(userId, eventType, entityType, entityId, meta = {}) {
+  if (!userId || !eventType) return;
+  try {
+    // Get nearest exam for context
+    const examRes = await pool.query(
+      `SELECT MIN(EXTRACT(DAY FROM (exam_date - NOW()))) AS days FROM exam_plan WHERE user_id=$1 AND exam_date > NOW()`,
+      [userId]
+    ).catch(()=>({rows:[{}]}));
+    const daysToExam = parseInt(examRes.rows[0]?.days) || null;
+
+    await pool.query(
+      `INSERT INTO user_events(user_id,event_type,entity_type,entity_id,entity_meta,days_to_exam,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,NOW())`,
+      [userId, eventType, entityType||null, entityId||null, JSON.stringify(meta), daysToExam]
+    );
+
+    // Update affinity score immediately (async, don't await)
+    updateAffinities(userId, eventType, entityType, entityId, meta, daysToExam).catch(()=>{});
+  } catch {}
+}
+
+// ── Update affinity dimensions ────────────────────────────────────────────────
+async function updateAffinities(userId, eventType, entityType, entityId, meta, daysToExam) {
+  const baseWeight = EVENT_WEIGHTS[eventType] || 0.5;
+  const urgency    = urgencyBoost(daysToExam);
+  const score      = baseWeight * urgency;
+  if (score === 0) return;
+
+  const dims = [];
+
+  // Content-based dimensions from meta
+  if (meta.subject)   dims.push(`subject:${meta.subject.toLowerCase()}`);
+  if (meta.category)  dims.push(`category:${meta.category.toLowerCase()}`);
+  if (meta.institution) dims.push(`inst:${meta.institution}`);
+  if (meta.course_code) dims.push(`course:${meta.course_code.toLowerCase()}`);
+  if (meta.tags && Array.isArray(meta.tags)) meta.tags.forEach(t => dims.push(`tag:${t}`));
+
+  // Entity-based dimensions
+  if (entityType && entityId) dims.push(`${entityType}:${entityId}`);
+
+  // For social events, track which users the person engages with
+  if (meta.target_user_id) dims.push(`user:${meta.target_user_id}`);
+
+  for (const dim of dims) {
+    await pool.query(
+      `INSERT INTO user_affinities(user_id,dimension,score,event_count,last_updated)
+       VALUES($1,$2,$3,1,NOW())
+       ON CONFLICT(user_id,dimension) DO UPDATE
+       SET score = user_affinities.score * 0.9 + EXCLUDED.score,
+           event_count = user_affinities.event_count + 1,
+           last_updated = NOW()`,
+      [userId, dim, score]
+    ).catch(()=>{});
+  }
+}
+
+// ── Compute user-user similarity (cosine on affinity vectors) ─────────────────
+async function computeSimilarity(userId) {
+  try {
+    // Get this user's top 50 affinity dimensions
+    const { rows: myDims } = await pool.query(
+      `SELECT dimension, score FROM user_affinities WHERE user_id=$1 ORDER BY score DESC LIMIT 50`,
+      [userId]
+    );
+    if (myDims.length < 3) return;
+
+    const dimList = myDims.map(d => d.dimension);
+    const myMap   = Object.fromEntries(myDims.map(d => [d.dimension, d.score]));
+
+    // Find other users who share at least 3 dimensions
+    const { rows: others } = await pool.query(
+      `SELECT user_id, dimension, score
+       FROM user_affinities
+       WHERE dimension = ANY($1) AND user_id != $2
+       ORDER BY user_id`,
+      [dimList, userId]
+    );
+
+    // Group by user
+    const byUser = {};
+    for (const row of others) {
+      if (!byUser[row.user_id]) byUser[row.user_id] = {};
+      byUser[row.user_id][row.dimension] = parseFloat(row.score);
+    }
+
+    // Compute cosine similarity for each candidate
+    const myNorm = Math.sqrt(myDims.reduce((s, d) => s + d.score * d.score, 0));
+
+    for (const [otherId, otherMap] of Object.entries(byUser)) {
+      let dot = 0, otherNorm = 0;
+      for (const [dim, score] of Object.entries(otherMap)) {
+        dot += (myMap[dim] || 0) * score;
+        otherNorm += score * score;
+      }
+      otherNorm = Math.sqrt(otherNorm);
+      const sim = myNorm > 0 && otherNorm > 0 ? dot / (myNorm * otherNorm) : 0;
+      if (sim > 0.1) {
+        await pool.query(
+          `INSERT INTO user_similarity(user_id_a,user_id_b,similarity,computed_at)
+           VALUES($1,$2,$3,NOW()) ON CONFLICT(user_id_a,user_id_b) DO UPDATE
+           SET similarity=$3, computed_at=NOW()`,
+          [userId, parseInt(otherId), sim]
+        ).catch(()=>{});
+      }
+    }
+  } catch {}
+}
+
+// ── Main recommendation function ──────────────────────────────────────────────
+async function computeRecommendations(userId) {
+  try {
+    const [userRes, affinityRes, simRes, examRes, memberRes] = await Promise.all([
+      pool.query('SELECT institution, year_of_study, subjects, programme FROM users WHERE id=$1', [userId]).catch(()=>({rows:[{}]})),
+      pool.query('SELECT dimension, score FROM user_affinities WHERE user_id=$1 ORDER BY score DESC LIMIT 100', [userId]).catch(()=>({rows:[]})),
+      pool.query('SELECT user_id_b, similarity FROM user_similarity WHERE user_id_a=$1 ORDER BY similarity DESC LIMIT 20', [userId]).catch(()=>({rows:[]})),
+      pool.query(`SELECT subject, EXTRACT(DAY FROM exam_date - NOW())::int AS days FROM exam_plan WHERE user_id=$1 AND exam_date > NOW() ORDER BY exam_date LIMIT 5`, [userId]).catch(()=>({rows:[]})),
+      pool.query(`SELECT cs.course_code FROM class_space_members csm JOIN class_spaces cs ON cs.id=csm.class_space_id WHERE csm.user_id=$1`, [userId]).catch(()=>({rows:[]})),
+    ]);
+
+    const user      = userRes.rows[0] || {};
+    const affinities = Object.fromEntries(affinityRes.rows.map(r => [r.dimension, parseFloat(r.score)]));
+    const similarUsers = simRes.rows.map(r => r.user_id_b);
+    const upcomingExams = examRes.rows;
+    const myCourses = new Set(memberRes.rows.map(r => r.course_code));
+    const urgentSubjects = new Set(upcomingExams.filter(e => e.days <= 7).map(e => e.subject?.toLowerCase()));
+
+    // ── LIBRARY RECOMMENDATIONS ───────────────────────────────────────────────
+    await computeLibraryRecs(userId, affinities, similarUsers, urgentSubjects, myCourses, user);
+
+    // ── STUDY GROUP RECOMMENDATIONS ────────────────────────────────────────────
+    await computeGroupRecs(userId, affinities, similarUsers, urgentSubjects, myCourses, user);
+
+    // ── CAMPUS PULSE RECOMMENDATIONS ──────────────────────────────────────────
+    await computePulseRecs(userId, affinities, similarUsers, user);
+
+    // ── SERVICES RECOMMENDATIONS ───────────────────────────────────────────────
+    await computeServicesRecs(userId, affinities, similarUsers, urgentSubjects);
+
+    // ── PEOPLE YOU MAY KNOW ────────────────────────────────────────────────────
+    await computePeopleRecs(userId, similarUsers, user);
+
+  } catch (e) {
+    console.error('computeRecommendations error:', e.message);
+  }
+}
+
+async function computeLibraryRecs(userId, affinities, similarUsers, urgentSubjects, myCourses, user) {
+  // Get candidate resources not yet seen/downloaded by this user
+  const { rows: candidates } = await pool.query(
+    `SELECT lr.id, lr.title, lr.subject, lr.category, lr.upvotes, lr.download_count,
+            lr.created_at, lr.uploader_id,
+            COALESCE((SELECT AVG(rating) FROM library_comments WHERE resource_id=lr.id AND rating IS NOT NULL),0) AS avg_rating
+     FROM library_resources lr
+     WHERE lr.uploader_id != $1
+       AND lr.id NOT IN (
+         SELECT entity_id FROM user_events WHERE user_id=$1 AND entity_type='resource'
+         AND event_type IN ('download','bookmark','view') AND created_at > NOW() - INTERVAL '30 days'
+       )
+     ORDER BY lr.created_at DESC LIMIT 200`,
+    [userId]
+  ).catch(()=>({rows:[]}));
+
+  const scored = [];
+  for (const r of candidates) {
+    let score = 0;
+    let reasons = [];
+
+    // Content affinity
+    const subjectAff = affinities[`subject:${r.subject?.toLowerCase()}`] || 0;
+    const catAff     = affinities[`category:${r.category?.toLowerCase()}`] || 0;
+    const courseAff  = r.subject && myCourses.has(r.subject) ? 3 : 0;
+    score += subjectAff * 0.4 + catAff * 0.3 + courseAff;
+
+    // Exam urgency — huge boost if subject matches upcoming exam
+    if (r.subject && urgentSubjects.has(r.subject?.toLowerCase())) {
+      score += 5;
+      reasons.push(`📅 You have an exam in ${r.subject} soon`);
+    }
+
+    // Similar users engaged with this
+    if (similarUsers.length > 0) {
+      const { rows: simEngaged } = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM user_events
+         WHERE user_id = ANY($1) AND entity_type='resource' AND entity_id=$2
+         AND event_type IN ('download','bookmark','upvote')`,
+        [similarUsers, r.id]
+      ).catch(()=>({rows:[{n:0}]}));
+      const simScore = Math.min(simEngaged.rows[0]?.n || 0, 5) * 0.8;
+      score += simScore;
+      if (simScore > 1) reasons.push(`👥 Students like you found this useful`);
+    }
+
+    // Quality signals
+    const qualScore = (parseFloat(r.avg_rating) / 5) * 2 + Math.log1p(r.upvotes || 0) * 0.3;
+    score += qualScore;
+
+    // Recency
+    const ageDays = (Date.now() - new Date(r.created_at).getTime()) / 86400000;
+    score += ageDays < 3 ? 1.5 : ageDays < 7 ? 0.8 : 0;
+
+    if (score > 0.5) {
+      if (!reasons.length) {
+        if (subjectAff > 2) reasons.push(`📚 Matches your ${r.subject} interest`);
+        else if (catAff > 2) reasons.push(`🗂️ Based on your ${r.category} usage`);
+        else reasons.push(`⭐ Popular with students at ${user.institution || 'your institution'}`);
+      }
+      scored.push({ id: r.id, score, reason: reasons[0] });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  for (const item of scored.slice(0, 20)) {
+    await pool.query(
+      `INSERT INTO recommendation_cache(user_id,rec_type,entity_id,score,reason,computed_at)
+       VALUES($1,'library',$2,$3,$4,NOW())
+       ON CONFLICT(user_id,rec_type,entity_id) DO UPDATE SET score=$3,reason=$4,computed_at=NOW()`,
+      [userId, item.id, item.score, item.reason]
+    ).catch(()=>{});
+  }
+}
+
+async function computeGroupRecs(userId, affinities, similarUsers, urgentSubjects, myCourses, user) {
+  const { rows: groups } = await pool.query(
+    `SELECT sg.id, sg.name, sg.subject, sg.description,
+            COUNT(sgm.user_id)::int AS member_count,
+            MAX(ss.created_at) AS last_active
+     FROM study_groups sg
+     LEFT JOIN study_group_members sgm ON sgm.group_id=sg.id
+     LEFT JOIN study_sessions ss ON ss.group_id=sg.id AND ss.status='active'
+     WHERE sg.id NOT IN (SELECT group_id FROM study_group_members WHERE user_id=$1)
+       AND sg.is_private=false
+     GROUP BY sg.id ORDER BY member_count DESC LIMIT 100`,
+    [userId]
+  ).catch(()=>({rows:[]}));
+
+  const scored = groups.map(g => {
+    let score = 0;
+    let reason = '';
+    const subAff = affinities[`subject:${g.subject?.toLowerCase()}`] || 0;
+    score += subAff * 0.5;
+    if (g.subject && urgentSubjects.has(g.subject?.toLowerCase())) {
+      score += 6; reason = `🎯 Exam prep group for ${g.subject}`;
+    }
+    if (g.subject && myCourses.has(g.subject)) { score += 3; reason = reason || `📚 Matches your course: ${g.subject}`; }
+    score += Math.log1p(g.member_count || 0) * 0.5;
+    if (g.last_active) {
+      const minAgo = (Date.now() - new Date(g.last_active).getTime()) / 60000;
+      if (minAgo < 30) { score += 2; reason = reason || `🟢 Live session happening now`; }
+    }
+    // Same institution boost
+    reason = reason || `👥 ${g.member_count} members studying ${g.subject || 'together'}`;
+    return { id: g.id, score, reason };
+  }).filter(g => g.score > 0.3).sort((a, b) => b.score - a.score).slice(0, 15);
+
+  for (const item of scored) {
+    await pool.query(
+      `INSERT INTO recommendation_cache(user_id,rec_type,entity_id,score,reason,computed_at)
+       VALUES($1,'group',$2,$3,$4,NOW())
+       ON CONFLICT(user_id,rec_type,entity_id) DO UPDATE SET score=$3,reason=$4,computed_at=NOW()`,
+      [userId, item.id, item.score, item.reason]
+    ).catch(()=>{});
+  }
+}
+
+async function computePulseRecs(userId, affinities, similarUsers, user) {
+  // Get posts from last 48h not yet seen
+  const { rows: posts } = await pool.query(
+    `SELECT p.id, p.text, p.category, p.likes, p.user_id AS poster_id,
+            p.created_at,
+            (SELECT COUNT(*) FROM campus_pulse_comments c WHERE c.post_id=p.id)::int AS cmts
+     FROM campus_pulse_posts p
+     WHERE p.user_id != $1
+       AND p.created_at > NOW() - INTERVAL '48 hours'
+       AND p.id NOT IN (SELECT entity_id FROM user_events WHERE user_id=$1 AND entity_type='post' AND created_at > NOW() - INTERVAL '48 hours')
+     ORDER BY p.created_at DESC LIMIT 100`,
+    [userId]
+  ).catch(()=>({rows:[]}));
+
+  const scored = posts.map(p => {
+    let score = 0;
+    let reason = '';
+    // Engagement velocity
+    const ageMins = (Date.now() - new Date(p.created_at).getTime()) / 60000;
+    const velocity = ((p.likes || 0) + (p.cmts || 0) * 2) / Math.max(ageMins / 60, 0.1);
+    score += Math.min(velocity * 0.5, 4);
+    if (velocity > 5) reason = `🔥 Trending at your campus`;
+    // Category affinity
+    const catAff = affinities[`category:${p.category?.toLowerCase()}`] || 0;
+    score += catAff * 0.3;
+    // Posts from similar users
+    if (similarUsers.includes(p.poster_id)) { score += 2; reason = reason || `👤 From someone with similar interests`; }
+    reason = reason || `📡 Popular on Campus Pulse`;
+    return { id: p.id, score, reason };
+  }).filter(p => p.score > 0.2).sort((a, b) => b.score - a.score).slice(0, 20);
+
+  for (const item of scored) {
+    await pool.query(
+      `INSERT INTO recommendation_cache(user_id,rec_type,entity_id,score,reason,computed_at)
+       VALUES($1,'pulse',$2,$3,$4,NOW())
+       ON CONFLICT(user_id,rec_type,entity_id) DO UPDATE SET score=$3,reason=$4,computed_at=NOW()`,
+      [userId, item.id, item.score, item.reason]
+    ).catch(()=>{});
+  }
+}
+
+async function computeServicesRecs(userId, affinities, similarUsers, urgentSubjects) {
+  const { rows: services } = await pool.query(
+    `SELECT ms.id, ms.title, ms.category, ms.price, ms.rating, ms.review_count, ms.provider_id
+     FROM marketplace_services ms WHERE ms.provider_id != $1 LIMIT 80`,
+    [userId]
+  ).catch(()=>({rows:[]}));
+
+  const scored = services.map(s => {
+    let score = 0, reason = '';
+    const catAff = affinities[`category:${s.category?.toLowerCase()}`] || 0;
+    score += catAff * 0.4 + (parseFloat(s.rating)||0) * 0.5;
+    if (s.category?.toLowerCase().includes('tutor') && urgentSubjects.size > 0) {
+      score += 3; reason = `🎓 Tutoring — you have exams coming up`;
+    }
+    if (similarUsers.includes(s.provider_id)) { score += 1.5; reason = reason || `👥 Used by students like you`; }
+    reason = reason || `⭐ Highly rated ${s.category}`;
+    return { id: s.id, score, reason };
+  }).filter(s => s.score > 0.3).sort((a, b) => b.score - a.score).slice(0, 10);
+
+  for (const item of scored) {
+    await pool.query(
+      `INSERT INTO recommendation_cache(user_id,rec_type,entity_id,score,reason,computed_at)
+       VALUES($1,'service',$2,$3,$4,NOW())
+       ON CONFLICT(user_id,rec_type,entity_id) DO UPDATE SET score=$3,reason=$4,computed_at=NOW()`,
+      [userId, item.id, item.score, item.reason]
+    ).catch(()=>{});
+  }
+}
+
+async function computePeopleRecs(userId, similarUsers, user) {
+  if (similarUsers.length === 0) return;
+  const { rows: people } = await pool.query(
+    `SELECT u.id, u.full_name, u.institution, u.programme, u.year_of_study
+     FROM users u
+     WHERE u.id = ANY($1)
+       AND u.id NOT IN (SELECT CASE WHEN user_id=$2 THEN friend_id ELSE user_id END FROM friendships WHERE $2 IN (user_id, friend_id))
+     LIMIT 10`,
+    [similarUsers, userId]
+  ).catch(()=>({rows:[]}));
+
+  for (const p of people) {
+    const sim = 1.5;
+    const reason = p.programme === user.programme
+      ? `📚 Also studying ${p.programme}` : `🤝 Similar study patterns`;
+    await pool.query(
+      `INSERT INTO recommendation_cache(user_id,rec_type,entity_id,score,reason,computed_at)
+       VALUES($1,'people',$2,$3,$4,NOW())
+       ON CONFLICT(user_id,rec_type,entity_id) DO UPDATE SET score=$3,reason=$4,computed_at=NOW()`,
+      [userId, p.id, sim, reason]
+    ).catch(()=>{});
+  }
+}
+
+// ── Scheduled refresh every 15 minutes ────────────────────────────────────────
+setInterval(async () => {
+  try {
+    // Re-compute for active users (logged in within last 24h)
+    const { rows: active } = await pool.query(
+      `SELECT DISTINCT user_id FROM user_events WHERE created_at > NOW() - INTERVAL '24 hours' LIMIT 100`
+    ).catch(()=>({rows:[]}));
+    for (const { user_id } of active) {
+      await computeSimilarity(user_id);
+      await computeRecommendations(user_id);
+    }
+  } catch {}
+}, 15 * 60 * 1000);
+
+// ── API: Get recommendations ───────────────────────────────────────────────────
+app.get('/api/recommendations/:type', authMiddleware, async (req, res) => {
+  const uid  = req.user.userId;
+  const type = req.params.type; // library|group|pulse|service|people
+
+  // Trigger async recompute if cache is stale (>15min)
+  pool.query(
+    `SELECT MAX(computed_at) AS last FROM recommendation_cache WHERE user_id=$1 AND rec_type=$2`,
+    [uid, type]
+  ).then(({ rows }) => {
+    const last = rows[0]?.last;
+    const stale = !last || (Date.now() - new Date(last).getTime()) > 15 * 60 * 1000;
+    if (stale) {
+      computeSimilarity(uid).then(() => computeRecommendations(uid)).catch(()=>{});
+    }
+  }).catch(()=>{});
+
+  const { rows } = await pool.query(
+    `SELECT rc.entity_id, rc.score, rc.reason, rc.computed_at FROM recommendation_cache rc
+     WHERE rc.user_id=$1 AND rc.rec_type=$2 ORDER BY rc.score DESC LIMIT 20`,
+    [uid, type]
+  ).catch(()=>({rows:[]}));
+
+  res.json({ success: true, recommendations: rows });
+});
+
+// ── API: Log a behavioural event ───────────────────────────────────────────────
+app.post('/api/events', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { event_type, entity_type, entity_id, meta = {}, dwell_ms } = req.body;
+  if (!event_type) return res.status(400).json({ success: false });
+  await logEvent(uid, event_type, entity_type, entity_id, { ...meta, dwell_ms });
+  res.json({ success: true });
+});
+
+// ── API: Get personalised feed (unified across all types) ──────────────────────
+app.get('/api/recommendations/feed/unified', authMiddleware, async (req, res) => {
+  const uid = req.user.userId;
+  const { rows } = await pool.query(
+    `SELECT rc.rec_type, rc.entity_id, rc.score, rc.reason
+     FROM recommendation_cache rc
+     WHERE rc.user_id=$1
+     ORDER BY rc.score DESC LIMIT 40`,
+    [uid]
+  ).catch(()=>({rows:[]}));
+  res.json({ success: true, feed: rows });
+});
+
+// ── Expose logEvent for use in other routes ────────────────────────────────────
+global.logEvent = logEvent;
+global.computeRecommendations = computeRecommendations;
+
+// ============================================================================
+// END RECOMMENDATION ENGINE
+// ============================================================================
 
 // ============================================
 // START SERVER
